@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>个人事务管理</title>
+  <desc>深蓝圆角底上的计划卡片与蓝色完成勾。</desc>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#315db9"/>
+      <stop offset="0.58" stop-color="#203e76"/>
+      <stop offset="1" stop-color="#14253e"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0.25" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e8f0ff"/>
+    </linearGradient>
+    <linearGradient id="check" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#275bd0"/>
+      <stop offset="1" stop-color="#4688f5"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="976" height="976" rx="214" fill="url(#tile)"/>
+  <rect x="26" y="26" width="972" height="972" rx="212" fill="none" stroke="#90b6ff" stroke-opacity="0.26" stroke-width="4"/>
+  <path d="M306 211 H634 L796 373 V769 Q796 847 718 847 H306 Q228 847 228 769 V289 Q228 211 306 211 Z" fill="#071324" opacity="0.3"/>
+  <path d="M306 194 H634 L796 356 V752 Q796 830 718 830 H306 Q228 830 228 752 V272 Q228 194 306 194 Z" fill="url(#paper)"/>
+  <path d="M634 194 L796 356 H682 Q634 356 634 308 Z" fill="#b0caf6"/>
+  <rect x="314" y="332" width="248" height="42" rx="21" fill="#7999d2"/>
+  <rect x="314" y="428" width="144" height="42" rx="21" fill="#7999d2"/>
+  <path d="M336 609 L458 724 L696 493" fill="none" stroke="url(#check)" stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

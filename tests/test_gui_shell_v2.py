@@ -61,9 +61,9 @@ def text_in(widget):
     return "\n".join(label.text() for label in widget.findChildren(QLabel)) + "\n" + "\n".join(button.text() for button in widget.findChildren(QPushButton))
 
 def test_three_sections_six_creation_types_and_removed_toolbar(app_v2, shell):
-    assert list(shell.nav_buttons) == ["today", "projects", "reviews"]
-    assert [widget.text().split("  ")[0] for widget in shell.nav_buttons.values()] == ["今天", "项目与课程", "复盘"]
-    assert shell.review_attention and not shell.review_pending
+    assert list(shell.nav_buttons) == ["dashboard", "today", "projects", "reviews"]
+    assert [widget.text().split("  ")[0] for widget in shell.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
+    assert shell.section == "dashboard" and not shell.review_pending
     assert [action.text() for action in shell.create_menu.actions()] == ["任务", "项目", "课程", "活动", "分类", "目标"]
     buttons = {button.text() for button in shell.findChildren(QPushButton)}
     assert not {"快速记录", "后台结果", "通知", "收藏", "更多操作", "写下本期回顾"} & buttons
@@ -94,7 +94,7 @@ def test_today_plan_to_review_has_two_choices_and_no_duplicate_questionnaires(ap
     shell.navigate("today")
     wait(app_v2, lambda: shell.today_page.has_plan and not shell.bridge.callbacks)
     assert first["title"] in text_in(shell.today_page)
-    assert not {"完成", "未完成"} & {b.text() for b in shell.today_page.findChildren(QPushButton)}
+    assert {"完成", "未完成"} <= {b.text() for b in shell.today_page.findChildren(QPushButton)}
     shell.open_review(day)
     wait(app_v2, lambda: first["id"] in shell.review_page.item_buttons and not shell.bridge.callbacks)
     buttons = shell.review_page.item_buttons[first["id"]]
@@ -277,6 +277,8 @@ def test_files_paginate_inside_the_owner_and_do_not_displace_tasks(app_v2, shell
     assert first["children_total"] == 1 and first["children"][0]["id"] == task["id"]
     assert len(first["files"]) == 50 and first["files_next_offset"] == 50
     next_button = next(button for button in shell.workspace_page.content.findChildren(QPushButton) if button.text() == "下一页文件")
+    # Task groups load independently; network-idle can precede Qt layout.
+    wait(app_v2, lambda: next_button.height() > 0)
     QTest.mouseClick(next_button, Qt.MouseButton.LeftButton)
     wait(app_v2, lambda: shell.workspace_page.files_offset == 50 and not shell.bridge.callbacks)
     text = text_in(shell.workspace_page.content)

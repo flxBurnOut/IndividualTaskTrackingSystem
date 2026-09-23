@@ -5,7 +5,10 @@ from .runtime import default_data_dir
 
 
 def choose_data_dir():
+    from .branding import set_windows_identity, configure_application
+    set_windows_identity()
     app = QApplication.instance() or QApplication([])
+    configure_application(app)
     dialog = QDialog()
     dialog.setWindowTitle('选择数据空间')
     dialog.resize(570, 260)

@@ -78,11 +78,11 @@ class Client:
 
     def query(self, name, **params):
         try:
-            return self._remember(self._request('query', name, params))
+            return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 35))
         except ClientError as error:
             if error.code == 'connection_lost' and self.autostart:
                 self._connect()
-                return self._remember(self._request('query', name, params))
+                return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 35))
             raise
 
     def state(self):
@@ -93,7 +93,7 @@ class Client:
             self.state()
         envelope = {'request_id': request_id or str(uuid.uuid4()), 'epoch': epoch if epoch is not None else self.epoch, 'expected_revision': expected_revision if expected_revision is not None else self.revision, 'payload': payload}
         try:
-            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'add_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
+            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'configure_codex', 'add_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
         except ClientError as error:
             error.details['request_id'] = envelope['request_id']
             # Never silently retry a write or discard the caller's old version.

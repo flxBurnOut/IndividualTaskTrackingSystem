@@ -98,30 +98,20 @@ def prepare_local_file(p):
 
 
 def object_workspace(core,c,p):
-    entity=core.store.get(c,p['id'])
+    from .presentation import Presenter
+    presenter=Presenter(core,c)
+    entity=presenter.entity(core.store.get(c,p['id']))
     offset=max(0,int(p.get('offset',0)))
     limit=max(1,min(100,int(p.get('limit',50))))
-    child_total=c.execute("SELECT count(*) FROM entities WHERE parent_id=? AND archived=0 AND type!='file_reference'",(entity['id'],)).fetchone()[0]
-    child_rows=c.execute("SELECT * FROM entities WHERE parent_id=? AND archived=0 AND type!='file_reference' ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",(entity['id'],limit,offset))
-    children={'items':[core.store.entity(r) for r in child_rows],'total':child_total,'next_offset':offset+limit if offset+limit<child_total else None}
-    # Unary + removes column affinity so SQLite can use feedback_target_date
-    # for the correlated JSON expression; IDs remain the same text values.
-    evidence = """WITH RECURSIVE scope(id) AS (SELECT ? UNION SELECT e.id FROM entities e JOIN scope s ON e.parent_id=s.id WHERE e.archived=0),
-      evidence AS (SELECT e.id,e.status,
-        (SELECT json_extract(f.data,'$.dimensions.completion') FROM entities f WHERE f.type='feedback' AND f.archived=0 AND json_extract(f.data,'$.target_id')=+e.id AND json_extract(f.data,'$.dimensions.completion') IS NOT NULL ORDER BY json_extract(f.data,'$.business_date') DESC,f.created_at DESC,f.rowid DESC LIMIT 1) AS result
-        FROM entities e JOIN scope ON e.id=scope.id WHERE e.type='task' AND e.archived=0 AND e.status!='cancelled')
-        SELECT count(*) AS total,
-          coalesce(sum(CASE WHEN result='done' OR result IS NULL AND status='done' THEN 1 ELSE 0 END),0) AS done,
-          coalesce(sum(CASE WHEN result IN ('incomplete','partial','not_started','blocked') THEN 1 ELSE 0 END),0) AS incomplete FROM evidence"""
-    aggregate=c.execute(evidence,(entity['id'],)).fetchone()
-    total,done,incomplete=aggregate['total'],aggregate['done'],aggregate['incomplete']
+    separate=bool(p.get('separate_tasks',False))
+    condition="parent_id=? AND archived=0 AND type!='file_reference'"+(" AND type!='task'" if separate else '')
+    child_total=c.execute('SELECT count(*) FROM entities WHERE '+condition,(entity['id'],)).fetchone()[0]
+    child_rows=c.execute('SELECT * FROM entities WHERE '+condition+' ORDER BY updated_at DESC,id LIMIT ? OFFSET ?',(entity['id'],limit,offset))
+    children={'items':[presenter.entity(core.store.entity(r)) for r in child_rows],'total':child_total,'next_offset':offset+limit if offset+limit<child_total else None}
+    from .task_views import summary as task_summary, state as task_state
+    total,done,incomplete=task_summary(core,c,entity['id'])
     unknown=total-done-incomplete
-    task_states={}
-    for item in [entity,*children['items']]:
-        if item['type']!='task':
-            continue
-        feedback=c.execute("SELECT json_extract(data,'$.dimensions.completion') FROM entities WHERE type='feedback' AND archived=0 AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.dimensions.completion') IS NOT NULL ORDER BY json_extract(data,'$.business_date') DESC,created_at DESC,rowid DESC LIMIT 1",(item['id'],)).fetchone()
-        task_states[item['id']]=feedback[0] if feedback else ('done' if item['status']=='done' else None)
+    task_states={item['id']:task_state(core,c,item['id']) for item in [entity,*children['items']] if item['type']=='task'}
     files_offset=max(0,int(p.get('files_offset',0)))
     files_limit=max(1,min(100,int(p.get('files_limit',50))))
     file_sql="""SELECT e.* FROM entities e WHERE e.archived=0 AND
@@ -146,7 +136,7 @@ def object_workspace(core,c,p):
             groups[key]=[core.store.entity(row) for row in c.execute("SELECT * FROM entities WHERE type=? AND archived=0 AND "+where+" ORDER BY title,id LIMIT 100",(kind,entity['id']))]
         groups['complete']=groups['assessments_total']<=100 and groups['events_total']<=100
         course_info=groups
-    return {'entity':entity,'course_info':course_info,'children':[x for x in children['items'] if x['type']!='file_reference'],'children_total':children['total'],'next_offset':children['next_offset'],'files':files,'files_offset':files_offset,'files_next_offset':files_next_offset,'files_has_more':files_next_offset is not None,'summary':{'total_tasks':total,'done_tasks':done,'incomplete_tasks':incomplete,'unknown_tasks':unknown,'active_tasks':total-done,'coverage_label':'任务条目完成情况'},'task_states':task_states}
+    return {'entity':entity,'tasks_separated':separate,'course_info':course_info,'children':[x for x in children['items'] if x['type']!='file_reference'],'children_total':children['total'],'next_offset':children['next_offset'],'files':files,'files_offset':files_offset,'files_next_offset':files_next_offset,'files_has_more':files_next_offset is not None,'summary':{'total_tasks':total,'done_tasks':done,'incomplete_tasks':incomplete,'unknown_tasks':unknown,'active_tasks':total-done,'coverage_label':'任务条目完成情况'},'task_states':task_states}
 
 
 def open_resource(core,p):
@@ -154,6 +144,9 @@ def open_resource(core,p):
     with core.store.connect() as c:
         entity=core.store.get(c,p['id'])
     d=entity['data']
+    if entity['type']=='asset' and d.get('source_kind')!='web':
+        from .library import materialize
+        return materialize(core,entity)
     if d.get('source_kind')=='web':
         sha=d.get('extraction',{}).get('text_sha256')
         if not sha:

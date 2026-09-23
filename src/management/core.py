@@ -16,8 +16,8 @@ from .schemas import BusinessError, TYPES, RESERVED_TYPES, validate_dimensions, 
 from .storage import Store, encode, new_id, now
 
 
-COMMANDS = ["delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
-            "create_checkin", "respond_checkin", "save_review", "settings", "install_module", "disable_module",
+COMMANDS = ["correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
+            "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "install_module", "disable_module",
             "create_job", "cancel_job", "apply_proposal", "promote_checklist", "run_workflow", "undo",
             "import_asset", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
 
@@ -71,12 +71,17 @@ class Core:
         return definitions
 
     def query(self, name, **p):
+        if name == 'library_folder':
+            from .library import browse
+            result = browse(self,p)
+            with self.store.connect() as c:return {**result,**self.store.state(c)}
         if name == 'codex_models':
             from .model_catalog import list_models
             with self.store.connect() as c:
                 settings = copy.deepcopy(self.store.meta(c, 'settings'))
             if 'executable' in p:
                 settings['ai']['executable'] = p['executable']
+            settings['_codex_project_dir'] = str(self.root/'Codex事务助手')
             result = list_models(settings)
             with self.store.connect() as c:
                 return {**result, **self.store.state(c)}
@@ -98,6 +103,12 @@ class Core:
             return {**result, **state}
 
     def _query(self, c, name, p):
+        if name == 'dashboard':
+            from .dashboard import overview
+            return overview(self,c,p)
+        if name == 'habits_overview':
+            from .habits import overview
+            return overview(self,c,p)
         if name in {"timetables", "timetable_week"}:
             from .timetable import timetables, timetable_week
             return (timetables if name == "timetables" else timetable_week)(self, c, p)
@@ -125,6 +136,9 @@ class Core:
         if name == 'review_preferences':
             from .workspace import review_preferences
             return review_preferences(self,c)
+        if name == 'workspace_tasks':
+            from .task_views import workspace_tasks
+            return workspace_tasks(self,c,p)
         if name == 'object_workspace':
             from .workspace import object_workspace
             return object_workspace(self,c,p)
@@ -171,7 +185,13 @@ class Core:
             rows = c.execute("SELECT * FROM entities WHERE " + where + " ORDER BY updated_at DESC,id LIMIT ? OFFSET ?", [*args, limit, offset])
             return {"items": [self.store.entity(r) for r in rows], "total": total, "next_offset": offset + limit if offset + limit < total else None}
         if name == "get":
-            entity = self.store.get(c, p["id"])
+            from .presentation import Presenter
+            entity = self.store.get(c,p["id"])
+            if p.get('display') and entity['type'] in {'task','event','milestone','assessment'}:
+                entity = Presenter(self,c).entity(entity)
+            if p.get('display') and entity['type']=='task':
+                from .task_views import state as task_state
+                entity['completion_state']=task_state(self,c,entity['id'])
             children = self._query(c, "list", {"parent_id": entity["id"], "limit": 100})
             history = [dict(r) for r in c.execute("SELECT seq,revision,action,request_id,created_at FROM changes WHERE entity_id=? ORDER BY seq DESC LIMIT 30", (p["id"],))]
             return {"entity": entity, "children": children["items"], "children_total": children["total"], "links": [dict(r) for r in c.execute("SELECT l.*,a.title AS source_title,b.title AS target_title,CASE WHEN l.source_id=? THEN b.title ELSE a.title END AS other_title FROM links l JOIN entities a ON a.id=l.source_id JOIN entities b ON b.id=l.target_id WHERE l.source_id=? OR l.target_id=? LIMIT 500", (p["id"], p["id"], p["id"]))], "history": history}
@@ -232,11 +252,8 @@ class Core:
             from .domains import query_domain
             return query_domain(self, c, name, p)
         if name == "warnings":
-            from .scheduler import warning_scan
-            items = warning_scan(self, c, p.get('date') or self.today(c))
-            offset = max(0, int(p.get('offset', 0)))
-            limit = max(1, min(500, int(p.get('limit', 100))))
-            return {'items': items[offset:offset+limit], 'total': len(items), 'scan_complete': True, 'occurrences_complete': all(r.get('occurrences_complete', True) for r in items), 'returned_complete': offset == 0 and len(items) <= limit, 'next_offset': offset+limit if offset+limit<len(items) else None}
+            from .planning import warning_query
+            return warning_query(self,c,p)
         if name == "diagnostics":
             return {"database_bytes": self.store.path.stat().st_size, "wal_bytes": Path(str(self.store.path) + "-wal").stat().st_size if Path(str(self.store.path) + "-wal").exists() else 0,
                     "disk_free_bytes": shutil.disk_usage(self.root).free, "sqlite_version": sqlite3.sqlite_version,
@@ -330,6 +347,28 @@ class Core:
             return {"request_id": request_id, "result": result, "epoch": epoch, "revision": revision, "replayed": False}
 
     def _prepare(self, name, p):
+        if name == 'configure_codex':
+            config = p.get('ai')
+            fields = {'enabled', 'executable', 'model', 'timeout_seconds'}
+            if set(p) - {'ai', '_operation_id'} or not isinstance(config, dict) or set(config) != fields:
+                raise BusinessError('validation', '请提供完整的 Codex 协助设置。')
+            if type(config['enabled']) is not bool:
+                raise BusinessError('validation', 'Codex 协助开关需要明确开启或关闭。')
+            for field, limit in (('executable', 4096), ('model', 256)):
+                value = config[field]
+                if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
+                    raise BusinessError('validation', 'Codex 程序位置或模型名称格式无效。')
+            if type(config['timeout_seconds']) is not int or not 10 <= config['timeout_seconds'] <= 900:
+                raise BusinessError('validation', 'AI 超时范围为 10 到 900 秒。')
+            config = copy.deepcopy(config)
+            if config['enabled']:
+                from .codex_project import ensure_project
+                project = ensure_project(self.root, config)
+                if not isinstance(project, dict) or project.get('status') != 'ready' or not project.get('mcp_verified'):
+                    raise BusinessError('codex_project_incomplete', '对话项目连接尚未完成；协助设置未保存。请重新保存以修复连接。')
+            else:
+                project = {'status': 'disabled', 'name': 'Codex事务助手'}
+            return {'ai': config, 'codex_project': project}
         if name == 'add_source':
             from .sources import prepare
             return prepare(self,p)
@@ -339,9 +378,12 @@ class Core:
         if name == 'attach_local_file':
             from .workspace import prepare_local_file
             return prepare_local_file(p)
-        # Filesystem and long I/O happen before BEGIN, with the application lock.
+        # Filesystem and long I/O happen before BEGIN, outside the application lock.
         if name == "import_asset":
-            return self.resources.import_file(p["path"])
+            from .library import prepare
+            data = self.resources.import_file(p["path"])
+            published = prepare(self,data,Path(p['path']).name,p.get('owner_id'))
+            return {**data,'library_relative_path':published['relative_path']}
         if name == "backup":
             def select_assets(c):
                 found = {}
@@ -351,7 +393,7 @@ class Core:
                         if item.get("sha256"):
                             found[item["sha256"]] = item
                 return list(found.values())
-            return self.resources.create_backup(self.store.path, select_assets, app_lock=self.store.lock, metadata={"app_version": "0.7.0", "operation_id": p.get("_operation_id")})
+            return self.resources.create_backup(self.store.path, select_assets, app_lock=self.store.lock, metadata={"app_version": "0.7.1", "operation_id": p.get("_operation_id")})
         if name == "restore_backup":
             target = Path(p["target_dir"]).resolve()
             if target == self.root or self.root in target.parents:
@@ -397,12 +439,23 @@ class Core:
         return None
 
     def _dispatch(self, c, name, p, rid, prepared=None):
+        if name == 'configure_codex':
+            result = self._dispatch(c, 'settings', {'settings': {'ai': prepared['ai']}}, rid)
+            project = prepared['codex_project']
+            if project['status'] == 'ready':
+                result['settings']['codex_project'] = copy.deepcopy(project)
+                self.store.set_meta(c, 'settings', result['settings'])
+            # Disabling internal assistance leaves the independent dialogue project connected.
+            return {**result, 'codex_project': project}
         if name in {"delete_task", "restore_task"}:
             from .tasks_delete import delete_task, restore_task
             return (delete_task if name == "delete_task" else restore_task)(self, c, p, rid)
         if name == "apply_timetable":
             from .timetable import apply_timetable
             return apply_timetable(self, c, p, rid)
+        if name == "correct_recovery_scope":
+            from .catchup import correct_recovery_scope
+            return correct_recovery_scope(self,c,p,rid)
         if name in {"set_recovery_task", "record_recovery_progress"}:
             from .catchup import set_recovery_task, record_recovery_progress
             return (set_recovery_task if name == "set_recovery_task" else record_recovery_progress)(self, c, p, rid)
@@ -418,6 +471,12 @@ class Core:
         if name == 'send_message':
             from .conversations import send
             return send(self,c,p,rid,prepared)
+        if name == 'set_task_completion':
+            from .reviews import set_task_completion
+            return set_task_completion(self,c,p,rid)
+        if name == 'revise_plan':
+            from .daily_flow import revise_plan
+            return revise_plan(self,c,p,rid)
         if name == 'submit_daily_review':
             from .reviews import submit_daily
             return submit_daily(self,c,p,rid)
@@ -564,6 +623,8 @@ class Core:
             from .timetable import normalize_timetable_defaults
             value.setdefault("timetable_defaults", normalize_timetable_defaults({}))
             updates = p["settings"]
+            if "codex_project" in updates:
+                raise BusinessError("validation", "对话项目连接信息由配置流程维护，请重新保存 Codex 协助设置。")
             if set(updates) - set(value):
                 raise BusinessError("validation", "未知的系统设置。")
             for k, v in updates.items():
@@ -644,7 +705,7 @@ class Core:
             return {'job': self.create_job(c, 'create_artifact_job', value, rid)}
         if name in {"create_job", "create_artifact_job"}:
             if name == 'create_job' and p.get('kind') == 'ai':
-                internal={'conversation_id','conversation_scope','provider_thread_id','history','local_images','source_versions','source_ids'}
+                internal={'conversation_id','conversation_scope','provider_thread_id','provider_project_path','history','local_images','source_versions','source_ids'}
                 if internal & set(p.get('input') or {}):
                     raise BusinessError('proposal_scope','会话与图片输入必须由正式讨论入口根据已保存资料建立。')
             return {"job": self.create_job(c, name, p, rid)}
@@ -673,10 +734,14 @@ class Core:
                 raise BusinessError("limit", "候选操作数量过多。")
             results = []
             for action in actions:
-                if action["command"] not in {"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress"}:
+                if action["command"] not in {"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress", "correct_recovery_scope"}:
                     raise BusinessError("proposal_scope", "候选含有未授权的操作。")
                 from .sources import apply_source_action
-                results.append(apply_source_action(self,c,job,action,rid))
+                if json.loads(job['input']).get('plan_requested'):
+                    from .plan_assistance import apply as apply_daily_plan
+                    results.append(apply_daily_plan(self,c,job,action,rid))
+                else:
+                    results.append(apply_source_action(self,c,job,action,rid))
             c.execute("UPDATE jobs SET status='applied',updated_at=? WHERE id=?", (now(), p["id"]))
             mark_applied(self,c,job)
             return {"results": results, "job_id": p["id"]}
@@ -918,18 +983,30 @@ class Core:
 
     def _rules(self, c, day):
         result = []
-        for row in c.execute("SELECT * FROM entities WHERE type='rule' AND archived=0 AND status NOT IN ('cancelled','draft')"):
+        for row in c.execute("SELECT * FROM entities WHERE type='rule' AND archived=0 AND status NOT IN ('done','cancelled','draft')"):
             e = self.store.entity(row)
             d = e['data']
-            if (d.get('effective_from') or day) <= day <= (d.get('effective_until') or day):
+            if d.get('enabled',True) is not False and (d.get('effective_from') or day) <= day <= (d.get('effective_until') or day):
                 result.append(e)
         return result
 
     def plan_context(self, c, day, mode):
         date_value(day)
         events, unknowns = self._events(c, day)
-        tasks = self._query(c, 'list', {'type': 'task', 'limit': 100, 'exclude_statuses': ['done', 'cancelled']})
-        active = [t for t in tasks['items'] if t['status'] not in {'done', 'cancelled'}]
+        from .task_views import rows_sql, ENTITY_COLUMNS
+        from .presentation import Presenter, owner_sort_sql
+        presenter=Presenter(self,c)
+        active_sql="SELECT * FROM ("+rows_sql("e.status NOT IN ('cancelled','draft')",day)+") e WHERE completion_state IS NULL OR completion_state!='done'"
+        total=c.execute('SELECT count(*) FROM ('+active_sql+')').fetchone()[0]
+        # Today's dated candidates cannot disappear behind recently imported tasks.
+        priority="CASE WHEN (nullif(json_extract(e.data,'$.scheduled_date'),'') IS NOT NULL AND json_extract(e.data,'$.scheduled_date')<=?) OR (nullif(json_extract(e.data,'$.due_date'),'') IS NOT NULL AND json_extract(e.data,'$.due_date')<=?) THEN 0 ELSE 1 END"
+        sort_date="min(coalesce(nullif(json_extract(e.data,'$.scheduled_date'),''),'9999-12-31'),coalesce(nullif(json_extract(e.data,'$.due_date'),''),'9999-12-31'))"
+        active=[]
+        for row in c.execute(active_sql+' ORDER BY '+priority+','+owner_sort_sql()+','+sort_date+',e.created_at,e.id LIMIT 100',(day,day)):
+            entity=presenter.entity(self.store.entity({key:row[key] for key in ENTITY_COLUMNS}))
+            entity['completion_state']=row['completion_state'];active.append(entity)
+        events=[presenter.entity(event) for event in events]
+        tasks={'total':total,'next_offset':100 if total>100 else None}
         rules, protected, capacity = self._rules(c, day), [], None
         for rule in rules:
             d = rule['data']
@@ -951,7 +1028,7 @@ class Core:
             windows.append({'start_minute': cursor, 'end_minute': 1440})
         return {'date': day, 'mode': mode, 'tasks': active, 'hard_events': events, 'protected_times': protected, 'free_windows': windows, 'capacity_minutes': capacity, 'rules': rules, 'unknowns': unknowns, 'coverage': {'tasks_total': tasks['total'], 'tasks_returned': len(active), 'tasks_paged': tasks['next_offset'] is not None, 'hard_constraints_complete': True}, 'guidance': '计划时间为软估计，完成门保持不变。未知时段不可当作空闲。分页候选不代表完整任务集合。'}
 
-    def create_plan(self, c, p, rid, *, _retained=()):
+    def create_plan(self, c, p, rid, *, _retained=(), _historical_retained=()):
         day, mode = date_value(p['date']).isoformat(), p.get('mode', 'standard')
         if mode not in {'standard', 'low_state', 'no_precise_time', 'rest'}:
             raise BusinessError('validation', '未知的计划方式。')
@@ -964,8 +1041,11 @@ class Core:
         occupied, targets, minutes_total = [], set(), 0
         for i, block in enumerate(blocks):
             retained = i < len(_retained) and block == _retained[i]
+            historical = retained and i < len(_historical_retained) and block == _historical_retained[i]
             target = self.store.get(c, block['target_id'])
-            if not retained and (target['archived'] or target['type'] not in {'task', 'event', 'milestone'} or target['status'] in {'done', 'cancelled'}):
+            from .daily_flow import completed_on_or_before
+            closed = target['status']=='done' and (target['type']!='task' or completed_on_or_before(self,c,target,day))
+            if not retained and (target['archived'] or target['type'] not in {'task', 'event', 'milestone'} or target['status']=='cancelled' or closed):
                 raise BusinessError('plan_target', '计划只能安排可执行的活动记录。')
             if target['id'] in targets:
                 raise BusinessError('duplicate', '同一任务不要重复加入计划；请使用子任务区分工作。')
@@ -977,21 +1057,21 @@ class Core:
                     raise BusinessError('completion_gate', '计划不能修改任务已有的完成条件。')
                 block['completion_gate'] = gate or block.get('completion_gate', '')
             if block.get('start') or block.get('end'):
-                if mode == 'no_precise_time':
+                if mode == 'no_precise_time' and not historical:
                     raise BusinessError('validation', '无精确排时计划只保留顺序与估时。')
-                if context['unknowns']:
+                if context['unknowns'] and not historical:
                     raise BusinessError('uncertain_time', '固定事件时间待确认，请补充信息或使用无精确排时方式。', {'unknowns': context['unknowns']})
                 a, z = time_value(block.get('start')), time_value(block.get('end'))
                 if z <= a:
                     raise BusinessError('validation', '计划块结束应晚于开始，跨午夜请拆为两日。')
-                for event in [*context['hard_events'], *context['protected_times']]:
+                for event in ([] if historical else [*context['hard_events'], *context['protected_times']]):
                     if event['id'] != target['id'] and event['start_minute'] is not None and a < event['end_minute'] and z > event['start_minute']:
                         raise BusinessError('schedule_conflict', '与固定时段“' + event['title'] + '”冲突。')
-                if target['type'] == 'event':
+                if target['type'] == 'event' and not historical:
                     matches = [e for e in context['hard_events'] if e['id'] == target['id']]
                     if matches and not any(e['start_minute'] == a and e['end_minute'] == z for e in matches):
                         raise BusinessError('schedule_conflict', '固定事件应保持正式时段；改期需先更新日程来源。')
-                if any(a < y and z > x for x, y in occupied):
+                if not historical and any(a < y and z > x for x, y in occupied):
                     raise BusinessError('schedule_conflict', '时间块互相重叠。')
                 occupied.append((a, z))
                 block['minutes'] = z - a
@@ -1087,7 +1167,11 @@ class Core:
             if not isinstance(value.get('prompt'), str) or not value['prompt'].strip():
                 raise BusinessError('validation', '请输入需要分析或安排的内容。')
             day = value.get('date') or self.today(c)
-            context = {'planning': self.plan_context(c, day, value.get('mode', 'standard')), **self.store.state(c)}
+            if value.get('plan_requested'):
+                from .plan_assistance import context as planning_context
+                context=planning_context(self,c,day,value.get('mode','standard'))
+            else:
+                context = {'planning': self.plan_context(c, day, value.get('mode', 'standard')), **self.store.state(c)}
             context['recent_inbox'] = self._query(c, 'list', {'type': 'inbox', 'limit': 10})['items']
             context['execution_on_date'] = self.review(c, day, day)
             from .reviews import query_daily
@@ -1098,15 +1182,16 @@ class Core:
             context['selected_records'] = [self.store.get(c, id) for id in dict.fromkeys(selected_ids)]
             context['asset_content_coverage'] = '附件仅含版本与元数据，未读取正文；不能声称已经分析附件。'
             context['types'] = [{'id': t['id'], 'fields': t['fields'], 'parent_types': t['parent_types']} for t in self.types(c).values() if not t.get('read_only')]
+            if value.get('plan_requested'):context['types']=[t for t in context['types'] if t['id']=='plan']
             max_chars = settings.get('context_characters', 42000)
-            while len(encode(context)) > max_chars and context['planning']['tasks']:
+            while len(encode(context)) > max_chars and context['planning']['tasks'] and not value.get('plan_requested'):
                 context['planning']['tasks'].pop()
                 context['planning']['coverage']['tasks_paged'] = True
             if len(encode(context)) > max_chars:
                 raise BusinessError('context_limit', '必要上下文超过推理预算，请缩小日期或对象范围。')
             context['planning']['coverage']['tasks_returned'] = len(context['planning']['tasks'])
             value['context'] = context
-            value['allowed_commands'] = ['apply_timetable', 'create', 'update', 'record_feedback', 'create_plan', 'save_review', 'set_recurring_rule', 'set_recovery_task', 'record_recovery_progress']
+            value['allowed_commands'] = ['apply_timetable', 'create', 'update', 'record_feedback', 'create_plan', 'save_review', 'set_recurring_rule', 'set_recovery_task', 'record_recovery_progress', 'correct_recovery_scope']
             value['context_characters'] = len(encode(context))
         else:
             if p.get('kind') not in {'text', 'markdown', 'csv', 'notebook', 'docx', 'pdf', 'pdf_notebook'}:

@@ -51,6 +51,7 @@ class Background:
                 if job['kind'] == 'ai':
                     from .ai import generate
                     settings = self.core.query('settings')['settings']
+                    settings['_codex_project_dir'] = str(self.core.root/'Codex事务助手')
                     result = generate(value, settings, cancel)
                     status = 'completed' if value.get('conversation_id') and not result.get('actions') else 'awaiting_review'
                 else:
@@ -76,6 +77,9 @@ class Background:
                             self.core._dispatch(c, 'link', {'source_id': value['owner_id'], 'target_id': entity['id'], 'kind': 'contributes'}, 'job:' + job['id'])
                         result['entity'] = entity
                         self.core.store.set_meta(c, 'revision', self.core.store.meta(c, 'revision') + 1)
+                    if job['kind']=='ai' and value.get('plan_requested'):
+                        from .plan_assistance import normalize
+                        result=normalize(self.core,c,current,result)
                     c.execute('UPDATE jobs SET status=?,result=?,updated_at=? WHERE id=?', (status, encode(result), now(), job['id']))
                     if job['kind'] == 'ai':
                         conversations.complete_job(self.core, c, job, result)

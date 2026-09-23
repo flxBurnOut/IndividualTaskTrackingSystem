@@ -334,6 +334,10 @@ class TaskDetailDialog(QDialog):
     def __init__(self, bridge, entity, parent=None, on_edit=None, on_open=None, on_saved=None, business_date=None, on_codex=None):
         super().__init__(parent)
         self.bridge, self.entity, self.on_saved = bridge, entity, on_saved
+        self.completion_saving = False
+        self.completion_epoch, self.completion_revision = bridge.epoch, bridge.revision
+        self.completion_date = business_date or QDate.currentDate().toString("yyyy-MM-dd")
+        self.destroyed.connect(lambda *_: setattr(self, "closed", True))
         self.plan_snapshot = None
         self.plan_generation = 0
         self.plan_ready = False
@@ -347,7 +351,8 @@ class TaskDetailDialog(QDialog):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(15)
         layout.addWidget(plain_label("交付 / 检查点" if entity["type"] == "milestone" else label_type(entity["type"]), "Eyebrow"))
-        layout.addWidget(plain_label(entity["title"], "DialogHeading"))
+        layout.addWidget(plain_label(entity.get("display_title") or entity["title"], "DialogHeading"))
+        if entity.get("owner_label"): layout.addWidget(plain_label(entity["owner_label"], "StatusPill"))
         data = entity.get("data", {})
         hints = [] if entity.get("type") in {"task", "note", "topic"} else [label_status(entity.get("status"))]
         if data.get("due_date"):
@@ -371,7 +376,12 @@ class TaskDetailDialog(QDialog):
                 details_layout.addWidget(content)
         details_layout.addStretch()
         if entity["type"] == "task" and not entity.get("archived"):
-            layout.addWidget(plain_label("安排到某天的日计划后，它才会出现在那天的每日复盘中。", "Quiet"))
+            quick = QHBoxLayout()
+            self.complete_button = make_button("标记未完成" if (entity.get("completion_state") == "done" if entity.get("completion_state") is not None else entity.get("status") == "done") else "标记完成", self.mark_complete, True)
+            quick.addWidget(self.complete_button); quick.addStretch(); layout.addLayout(quick)
+            self.completion_note = plain_label("完成记录与课程任务、补欠和当天复盘同步；不会自动确认到课、提交或掌握。", "Quiet")
+            layout.addWidget(self.completion_note)
+            layout.addWidget(plain_label("加入日计划后，也可在今天页直接记录完成情况。", "Quiet"))
             entry = QHBoxLayout()
             self.plan_date = QDateEdit(QDate.fromString(business_date, "yyyy-MM-dd") if business_date else QDate.currentDate())
             self.plan_date.setDisplayFormat("yyyy-MM-dd"); self.plan_date.setCalendarPopup(True); install_calendar(self.plan_date)
@@ -401,8 +411,23 @@ class TaskDetailDialog(QDialog):
         row.addWidget(make_button("关闭", self.accept))
         layout.addLayout(row)
 
+    def mark_complete(self):
+        if self.closed or self.completion_saving: return
+        self.completion_saving = True; self.complete_button.setEnabled(False)
+        current = (self.entity.get("completion_state") == "done" if self.entity.get("completion_state") is not None else self.entity.get("status") == "done")
+        payload = {"target_id": self.entity["id"], "target_version": self.entity["version"], "business_date": self.completion_date, "result": "incomplete" if current else "done"}
+        def saved(receipt):
+            self.completion_saving = False
+            if self.on_saved: self.on_saved(receipt)
+            if not self.closed: self.accept()
+        def failed(error):
+            self.completion_saving = False
+            if self.closed: return
+            self.complete_button.setEnabled(True); self.completion_note.setText(error.get("message", str(error)) + " 请关闭后重新读取这项任务。")
+        self.bridge.command("set_task_completion", payload, saved, failed, epoch=self.completion_epoch, expected_revision=self.completion_revision)
+
     def delete_task(self):
-        if self.saving_plan:
+        if self.saving_plan or self.completion_saving:
             return
         dialog = DeleteTaskDialog(self.bridge, self.entity, self, self.on_saved)
         try:
@@ -553,13 +578,14 @@ class WorkspacePage(QWidget):
             return
         if not self.current_entity or self.current_entity["id"] != entity["id"]:
             self.files_offset, self.files_history = 0, []
+            self.completed_tasks_expanded=False
         self.current_entity = entity
         self.load_workspace(entity["id"])
 
     def load_workspace(self, identifier):
         self.generation += 1
         generation = self.generation
-        self.bridge.query("object_workspace", lambda result: self.render(result) if generation == self.generation else None, self.show_error, id=identifier, files_offset=self.files_offset)
+        self.bridge.query("object_workspace", lambda result: self.render(result) if generation == self.generation else None, self.show_error, id=identifier, files_offset=self.files_offset, separate_tasks=True)
 
     def section_header(self, title, action=None, label=None):
         row = QHBoxLayout()
@@ -582,6 +608,11 @@ class WorkspacePage(QWidget):
         edit_button = make_button("编辑", lambda: self.on_edit(entity))
         edit_button.setEnabled(not self.type_map.get(entity["type"], {}).get("read_only", False))
         header.addWidget(edit_button)
+        if entity['type'] in {'domain','project','course','activity','phase','task','goal'}:
+            from .gui_library import open_library
+            folder=make_button('打开文件夹')
+            folder.clicked.connect(lambda _,b=folder,i=entity['id']:open_library(self.bridge,self,b,i,self.show_error))
+            header.addWidget(folder)
         if entity["type"] == "event" and has_preparation_date(entity): header.addWidget(make_button(preparation_label(entity), lambda: self.open_recurring(entity)))
         add = make_button("＋ 添加")
         menu = QMenu(add)
@@ -648,30 +679,12 @@ class WorkspacePage(QWidget):
             self.content_layout.addWidget(self.recovery_panel)
         can_add_task = entity["type"] in self.type_map.get("task", {}).get("parent_types", [])
         self.section_header("实际任务", (lambda: self.on_create("task", entity)) if can_add_task else None, "＋ 添加任务")
-        if not tasks:
-            self.content_layout.addWidget(plain_label("还没有实际任务。课程的评分规则和截止节点不会自动成为任务。", "Quiet"))
-        self.content_layout.addWidget(plain_label("任务先安排到某一天的日计划，再在那天的每日复盘中确认完成。", "Quiet"))
-        for child in tasks:
-            row = QFrame()
-            row.setObjectName("TaskRow")
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(15, 12, 15, 12)
-            completion = result.get("task_states", {}).get(child["id"])
-            mark = plain_label("✓" if completion == "done" or child["type"] != "task" and child.get("status") == "done" else "○", "TaskMark")
-            mark.setFixedWidth(23)
-            row_layout.addWidget(mark)
-            title = make_button(child["title"], lambda _, item=child: self.open_object(item))
-            title.setObjectName("TextLink")
-            title.setToolTip(child["title"])
-            row_layout.addWidget(title, 1)
-            if child.get("data", {}).get("catchup_enabled") or child.get("data", {}).get("task_kind") == "catchup": row_layout.addWidget(plain_label("补课 / 补欠", "StatusPill"))
-            due = child.get("data", {}).get("due_date")
-            if due:
-                row_layout.addWidget(plain_label("截止 " + due, "Quiet"))
-            state_text = {"done": "已完成", "incomplete": "未完成", "partial": "部分完成", "not_started": "未开始", "blocked": "受阻"}.get(completion, "尚未反馈") if child["type"] == "task" else label_status(child.get("status"))
-            row_layout.addWidget(plain_label(state_text, "StatusPill"))
-            if self.on_edit: row_layout.addWidget(make_button("编辑任务", lambda _, item=child: self.on_edit(item)))
-            self.content_layout.addWidget(row)
+        self.content_layout.addWidget(plain_label("点击任务左侧圆圈即可标记完成；补课与补欠使用同一项任务，进度和完成记录会同步。", "Quiet"))
+        from .gui_task_list import TaskListPanel
+        self.task_panel=TaskListPanel(self.bridge,entity,self,on_open=self.open_object,on_edit=self.on_edit,
+            initial=None if result.get('tasks_separated') else result,expanded=getattr(self,'completed_tasks_expanded',False),on_saved=self.saved)
+        self.task_panel.expanded_changed.connect(lambda value:setattr(self,'completed_tasks_expanded',value))
+        self.content_layout.addWidget(self.task_panel)
         if milestones or entity["type"] in {"course", "project"}:
             allowed_node = entity["type"] in self.type_map.get("milestone", {}).get("parent_types", [])
             self.section_header("交付与重要日期", (lambda: self.on_create("milestone", entity)) if allowed_node else None, "＋ 新建交付 / 检查点")
@@ -735,7 +748,7 @@ class WorkspacePage(QWidget):
                 inner.addWidget(make_button("保存到软件", lambda _, path=data["local_path"]: self.attach_paths([path])))
             if data.get("source_kind"):
                 inner.addWidget(make_button("查看提取", lambda _, item=file: self.view_source(item)))
-            inner.addWidget(make_button("打开" if is_reference else "打开副本", lambda _, identifier=file["id"]: self.open_file(identifier)))
+            inner.addWidget(make_button("打开" if is_reference else "打开原文件", lambda _, identifier=file["id"]: self.open_file(identifier)))
             self.content_layout.addWidget(row)
         file_next = result.get("files_next_offset")
         if self.files_offset or file_next is not None:

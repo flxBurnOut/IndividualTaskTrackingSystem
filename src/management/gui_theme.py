@@ -85,6 +85,15 @@ QToolTip { background: %(surface)s; color: %(text)s; border: 1px solid %(border)
 QPushButton#Primary { color: %(primary_text)s; }
 QPushButton#Prominent { background: %(surface)s; color: %(text)s; border: 2px solid %(primary)s; font-weight: 600; padding: 10px 18px; }
 QPushButton#Prominent:hover { background: %(selection)s; }
+QPushButton#HabitsSummary { text-align: left; background: %(surface_alt)s; color: %(text)s; border: 1px solid %(border)s; padding: 10px 14px; }
+QPushButton#HabitsSummary:hover { border-color: %(primary)s; }
+QFrame#CurrentWarningCard { background: %(warning_bg)s; border: 2px solid %(warning_border)s; border-left: 5px solid %(warning_text)s; border-radius: 10px; }
+QLabel#CurrentWarningTitle { color: %(warning_text)s; font-weight: 700; }
+QPushButton#TaskMark { padding: 4px; font-weight: 700; color: %(primary)s; }
+QTreeView::indicator:unchecked { width: 16px; height: 16px; border: 1px solid %(muted)s; background: %(surface)s; border-radius: 3px; }
+QTreeView::indicator:checked { width: 16px; height: 16px; border: 1px solid %(primary)s; background: %(primary)s; border-radius: 3px; }
+QFrame#DashboardToday { background: %(selection)s; border: 2px solid %(primary)s; border-radius: 10px; }
+
 QPushButton#Danger, QPushButton#DeleteTask { color: %(danger)s; border-color: %(danger_border)s; }
 QPushButton#Danger:hover, QPushButton#DeleteTask:hover { background: %(danger_bg)s; }
 QPushButton#Primary:disabled { background: %(disabled_bg)s; color: %(disabled_text)s; border-color: %(border)s; }
@@ -102,6 +111,10 @@ QScrollBar:horizontal { background: transparent; height: 9px; }
 QScrollBar::handle:horizontal { background: %(scrollbar)s; border-radius: 4px; min-width: 30px; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 """ % tokens
+    scale=config['font_size']/13
+    text += f'\nQLabel#DashboardDate, QLabel#TodayDateHeading {{ font-size: {round(27*scale)}px; font-weight: 700; }}'
+    text += f'\nQLabel#DashboardWeek {{ font-size: {round(16*scale)}px; color: {tokens["muted"]}; }}'
+    text += f'\nQLabel#DashboardMetric {{ font-size: {round(24*scale)}px; font-weight: 700; }}'
     return text
 
 

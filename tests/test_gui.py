@@ -62,7 +62,7 @@ def create(client, title, kind="task", data=None, parent_id=None):
     return client.command("create", {"type": kind, "title": title, "data": data or {}, "parent_id": parent_id})["result"]["entity"]
 
 def test_empty_three_navigation_and_form_create(app, window):
-    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["今天", "项目与课程", "复盘"]
+    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
     assert not window.today_page.has_plan
     assert Client(window.data_dir, autostart=False).query("state")["counts"] == {}
     form = EntityForm(window.bridge, window.capabilities, window)
@@ -178,7 +178,7 @@ def test_ten_extensions_keep_three_navigation_and_typed_fields(app, window):
         client.command("install_module", {"manifest": {"id": module, "version": 1, "types": [{"id": module + ".record", "label": f"合成类型 {index}", "section": "projects", "parent_types": [None], "fields": [{"id": "amount", "label": "计量", "type": "number"}]}]}})
     window.load_capabilities()
     wait(app, lambda: "synthetic9.record" in window.type_map)
-    assert len(window.nav_buttons) == 3
+    assert len(window.nav_buttons) == 4
     assert len(window.create_menu.actions()) == 6
     assert all("合成类型" not in action.text() for action in window.create_menu.actions())
     form = EntityForm(window.bridge, window.capabilities, window, default_type="synthetic9.record")

@@ -45,7 +45,7 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'PersonalManagement/0.7'
+    server_version = 'PersonalManagement/0.7.1'
     protocol_version = 'HTTP/1.1'
 
     def setup(self):

@@ -151,7 +151,7 @@ def test_picker_noneditable_preserves_unverified_original_and_exact_save(picker)
     assert '不在当前列表' in dialog.model_note.text()
     dialog.model.setCurrentIndex(dialog.model.findData('exact-provider-model'))
     dialog.save_ai()
-    assert bridge.commands[-1]['payload']['settings']['ai']['model']=='exact-provider-model'
+    assert bridge.commands[-1]['payload']['ai']['model']=='exact-provider-model'
 
 
 def test_default_remains_follow_local_config_not_catalog_recommendation(picker):
@@ -161,7 +161,7 @@ def test_default_remains_follow_local_config_not_catalog_recommendation(picker):
     assert dialog.model.currentData()==''
     assert '跟随本机' in dialog.model.currentText()
     dialog.save_ai()
-    assert bridge.commands[-1]['payload']['settings']['ai']['model']==''
+    assert bridge.commands[-1]['payload']['ai']['model']==''
 
 
 def test_offline_refresh_keeps_original_selection_and_allows_saving(picker):
@@ -171,7 +171,7 @@ def test_offline_refresh_keeps_original_selection_and_allows_saving(picker):
     assert dialog.model.currentData()=='saved-model'
     assert '未切换模型' in dialog.model_note.text()
     dialog.save_ai()
-    assert bridge.commands[-1]['payload']['settings']['ai']['model']=='saved-model'
+    assert bridge.commands[-1]['payload']['ai']['model']=='saved-model'
 
 
 def test_old_path_response_cannot_populate_new_path_catalog(picker):

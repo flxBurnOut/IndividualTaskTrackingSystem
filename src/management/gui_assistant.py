@@ -130,11 +130,12 @@ class AssistanceDialog(QDialog):
         if not text:self.error({'message':'先写下需要讨论的内容。'});return
         if len(self.selected_ids)>12:self.error({'message':'最多附带 12 份资料，请通过附件选择移除一些后再发送。'});return
         payload={'scope':self.scope,'text':text}
+        if self.intent=='daily_plan':payload['request_plan']=True
         if self.intent=='course_notes':payload['skill_id']='course-notes'
         if self.attachment_dirty:payload['source_ids']=list(self.selected_ids)
         self.mutating=True;self.generation+=1;self.full_job={};self.proposal_loading=None;self.apply.setEnabled(False);self.update_controls();version=self.attachment_version
         def saved(receipt):
-            if payload.get('skill_id') == 'course-notes':self.intent=None
+            if payload.get('skill_id') == 'course-notes' or payload.get('request_plan'):self.intent=None
             self.mutating=False;self.generation+=1;self.initial_scroll=True;self.showing_older=False;self.loading_older=False;self.messages={};result=receipt.get('result',receipt);self.conversation=result.get('conversation') or self.conversation
             self.active_job_id=(result.get('job') or {}).get('id') or (self.conversation or {}).get('active_job_id')
             if self.prompt.toPlainText().strip()==text:self.prompt.clear()
@@ -179,7 +180,10 @@ class AssistanceDialog(QDialog):
         self.proposal_loading=identifier;generation=self.generation
         def loaded(result):
             if self.closed or generation!=self.generation or identifier!=self.job_id:return
-            self.proposal_loading=None;self.full_job=result.get('job',{});self.render_history(force=True)
+            self.proposal_loading=None;self.full_job=result.get('job',{})
+            preview=(self.full_job.get('result') or {}).get('plan_preview')
+            self.apply.setText('保存到 '+preview['date']+' 的每日计划' if preview else '核对后保存这些变更')
+            self.render_history(force=True)
         def failed(error):
             if identifier==self.job_id:self.proposal_loading=None;self.error(error)
         self.bridge.query('job',loaded,failed,id=identifier)
@@ -207,7 +211,13 @@ class AssistanceDialog(QDialog):
                 lines.append('确认后成为固定时段；每日任务和补课需另外安排。')
             elif command=='create_plan':
                 lines.append('日期：'+str(payload.get('date','待确认')))
-                for block in payload.get('blocks',[]):lines.append(readable(block))
+                preview=result.get('plan_preview') or {}
+                if payload.get('mode')=='no_precise_time':lines.append('按先后顺序推进；具体钟点暂不假定。')
+                for i,block in enumerate(preview.get('items',payload.get('blocks',[])),1):
+                    title=block.get('title') or next((e.get('title') for e in self.context_entities if e.get('id')==block.get('target_id')),None) or '已登记事项'
+                    timing=(str(block['start'])+'–'+str(block['end'])+' ') if block.get('start') and block.get('end') else ''
+                    lines.append(str(i)+'. '+timing+title)
+                lines.append('点击下方保存后，计划才会出现在当天页面。')
             elif command=='save_review':lines.append(str(payload.get('content','')))
             elif command=='set_recovery_task':
                 total=payload.get('total_quantity');done=payload.get('completed_quantity')

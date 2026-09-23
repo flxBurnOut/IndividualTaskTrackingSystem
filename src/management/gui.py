@@ -1,6 +1,8 @@
 """Three focused native workspaces sharing one durable business service."""
 from __future__ import annotations
 from pathlib import Path
+import datetime as dt
+from zoneinfo import ZoneInfo
 from PySide6.QtCore import QDate, Qt, QTimer, QThread
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -12,16 +14,23 @@ from .gui_gc import install_gui_gc
 from .gui_forms import EntityForm
 from .gui_workflows import AssistanceDialog, PlanDialog, SettingsDialog
 from .gui_today import TodayPage
+from .gui_dashboard import DashboardPage
 from .gui_workspace import BASE_TYPES, TREE_TYPES, WorkspacePage, TaskDetailDialog, make_button, plain_label
 from .gui_review import ReviewPage
 from .gui_calendar import install_calendar
 
-NAVIGATION = [("today", "今天"), ("projects", "项目与课程"), ("reviews", "复盘")]
+NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("projects", "项目与课程"), ("reviews", "复盘")]
 from .appearance import normalize_appearance
 from .gui_theme import apply_appearance, current_appearance, stylesheet, bind_theme
 
 # Kept as an import-compatible light default for embedders and tests.
 STYLESHEET = stylesheet()
+
+
+def clock_snapshot(timezone=None):
+    instant=dt.datetime.now(dt.timezone.utc)
+    local_day=instant.astimezone(ZoneInfo(timezone)).date() if timezone else instant.astimezone().date()
+    return QDate(local_day.year,local_day.month,local_day.day),int(instant.timestamp())//60
 
 
 def configure_palette(app):
@@ -88,6 +97,8 @@ class MainWindow(QMainWindow):
     def __init__(self, data_dir, client_factory=None):
         install_gui_gc()
         super().__init__()
+        from .branding import configure_application
+        configure_application(QApplication.instance())
         configure_palette(QApplication.instance())
         self.data_dir = Path(data_dir)
         from . import __version__
@@ -98,10 +109,12 @@ class MainWindow(QMainWindow):
         self.bridge.failed.connect(self.show_error)
         self.bridge.activity.connect(self.activity_changed)
         self.type_map, self.capabilities = {}, {"types": []}
-        self.section = "today"
+        self.section = "dashboard"
         self.change_cursor = 0
         self.poll_pending = self.closed = self.close_requested = False
         self.review_pending = False
+        self._business_timezone = None
+        self._calendar_day, self._clock_minute = clock_snapshot()
         self.review_attention = False
         self.dialogs = set()
         self._display_generation = 0
@@ -154,8 +167,8 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         heading = QVBoxLayout()
         heading.setSpacing(4)
-        self.page_title = plain_label("今天", "PageTitle")
-        self.page_subtitle = plain_label("先看当天的安排，再开始行动。", "PageSubtitle")
+        self.page_title = plain_label("总览", "PageTitle")
+        self.page_subtitle = plain_label("日期、本周安排与当前进展。", "PageSubtitle")
         heading.addWidget(self.page_title)
         heading.addWidget(self.page_subtitle)
         header.addLayout(heading, 1)
@@ -170,7 +183,7 @@ class MainWindow(QMainWindow):
         self.notice.hide()
         main_layout.addWidget(self.notice)
         self.pages = QStackedWidget()
-        self.today_page = TodayPage(self.bridge, self, on_plan=self.plan_with_codex, on_manual=self.manual_plan, on_review=self.open_review, on_task=self.open_task, on_changed=self.saved, on_timetable=self.open_timetable)
+        self.today_page = TodayPage(self.bridge, self, on_plan=self.plan_with_codex, on_manual=self.manual_plan, on_review=self.open_review, on_task=self.open_task, on_changed=self.saved, on_timetable=self.open_timetable, on_habits=lambda:self.open_settings(page='日常习惯'))
         install_calendar(self.today_page.date)
         self.today_page.error.connect(self.show_error)
         self.today_page.review_attention.connect(self.review_attention_changed)
@@ -180,6 +193,10 @@ class MainWindow(QMainWindow):
             self.workspace_page.sidebar_collapsed_changed.connect(self.save_workspace_sidebar)
         self.review_page = ReviewPage(self.bridge, self, on_changed=self.saved, on_codex=self.review_handoff)
         self.review_page.has_pending.connect(self.pending_review_changed)
+        self.dashboard_page = DashboardPage(self.bridge, self, on_today=self.open_today, on_timetable=self.open_timetable, on_projects=self.open_project, on_task=self.open_task)
+        self.dashboard_page.error.connect(self.show_error)
+        self.dashboard_page.review_attention.connect(self.review_attention_changed)
+        self.pages.addWidget(self.dashboard_page)
         self.pages.addWidget(self.today_page)
         self.pages.addWidget(self.workspace_page)
         self.pages.addWidget(self.review_page)
@@ -191,7 +208,7 @@ class MainWindow(QMainWindow):
         self.activity_label = QLabel()
         self.statusBar().addWidget(self.connection_label, 1)
         self.statusBar().addPermanentWidget(self.activity_label)
-        self.nav_buttons["today"].setChecked(True)
+        self.nav_buttons["dashboard"].setChecked(True)
 
     def refresh_global_metrics(self):
         brand = self.navigation_sidebar.findChild(QLabel, 'Brand')
@@ -229,6 +246,7 @@ class MainWindow(QMainWindow):
         if epoch == self._display_epoch and revision is not None and self._display_revision is not None and revision < self._display_revision:
             return
         self._display_epoch, self._display_revision = epoch, revision
+        self._business_timezone = settings.get("timezone")
         self._saved_appearance = normalize_appearance(settings.get('appearance'))
         apply_appearance(QApplication.instance(), self._saved_appearance)
         self.review_page.set_weekly_style(settings.get('charts', {}).get('weekly_style', 'columns'))
@@ -274,8 +292,9 @@ class MainWindow(QMainWindow):
             return
         self.section = section
         self.nav_buttons[section].setChecked(True)
-        self.pages.setCurrentIndex({"today": 0, "projects": 1, "reviews": 2}[section])
+        self.pages.setCurrentIndex({"dashboard": 0, "today": 1, "projects": 2, "reviews": 3}[section])
         titles = {
+            "dashboard": ("总览", "日期、本周安排与当前进展。"),
             "today": ("今天", "先看当天的安排，再开始行动。"),
             "projects": ("项目与课程", "沿着归属浏览，任务和文件都放在需要它们的地方。"),
             "reviews": ("复盘", "按实际情况确认完成，再看一周的变化。"),
@@ -288,7 +307,9 @@ class MainWindow(QMainWindow):
     def refresh(self):
         if not self.type_map or self.closed:
             return
-        if self.section == "today":
+        if self.section == "dashboard":
+            self.dashboard_page.refresh()
+        elif self.section == "today":
             self.today_page.refresh()
         elif self.section == "projects":
             self.workspace_page.refresh()
@@ -321,6 +342,15 @@ class MainWindow(QMainWindow):
         self.notice.hide()
         self.statusBar().showMessage("整理已保存。", 4500)
 
+    def open_today(self, date):
+        self.navigate('today')
+        self.today_page.set_date(date)
+
+    def open_project(self, identifier=None):
+        self.navigate('projects')
+        if identifier:
+            self.bridge.query('get',lambda r:self.workspace_page.open_object(r['entity']),self.show_error,id=identifier)
+
     def open_task(self, identifier):
         def loaded(result):
             dialog = TaskDetailDialog(self.bridge, result["entity"], self, self.edit_entity, on_saved=self.saved, business_date=self.today_page.date_iso() if self.section == "today" else None)
@@ -332,7 +362,7 @@ class MainWindow(QMainWindow):
     def open_review(self, date, mode="daily"):
         self.section = "reviews"
         self.nav_buttons["reviews"].setChecked(True)
-        self.pages.setCurrentIndex(2)
+        self.pages.setCurrentIndex(3)
         self.page_title.setText("复盘")
         self.page_subtitle.setText("按实际情况确认完成，再看一周的变化。")
         self.review_page.set_date(date)
@@ -353,8 +383,8 @@ class MainWindow(QMainWindow):
 
     def plan_with_codex(self, date, has_plan):
         verb = "调整" if has_plan else "生成"
-        prompt = f"请为 {date} {verb}每日计划。先核对固定安排、可用时间和待确认事项；保留休息与缓冲，不把估计用时当成完成标准。需要补充的信息请明确列出。"
-        self.open_assistance(prompt=prompt, date=date, scope={"kind":"daily_plan","date":date})
+        prompt = f"请为 {date} {verb}每日计划。请先使用已保存的任务和固定安排，直接给出可保存的计划。时间或精力不确定时先按先后顺序安排少量重点，不猜钟点；保留休息与缓冲。只有确实无法继续时才问一个必要问题，其他缺口作为提醒保留。"
+        self.open_assistance(prompt=prompt, date=date, scope={"kind":"daily_plan","date":date}, intent="daily_plan")
 
     def open_timetable(self, day=None):
         from .gui_timetable import TimetableDialog
@@ -404,6 +434,7 @@ class MainWindow(QMainWindow):
 
     def open_settings(self, *_args, page=None, timetable_id=None):
         dialog=SettingsDialog(self.bridge,self.capabilities,self.data_dir,self,self.load_capabilities)
+        if page=='复盘时间':page='日常习惯';dialog.habits.show_reminders()
         if timetable_id:dialog.timetable_settings.select_timetable(timetable_id)
         if page:
             for index in range(dialog.tabs.count()):
@@ -425,11 +456,20 @@ class MainWindow(QMainWindow):
     def poll_changes(self):
         if self.closed or self.poll_pending or not self.type_map:
             return
+        calendar_day, minute = clock_snapshot(self._business_timezone)
+        clock_changed = minute != self._clock_minute
+        self._clock_minute = minute
+        if calendar_day != self._calendar_day:
+            previous = self._calendar_day
+            self._calendar_day = calendar_day
+            if self.today_page.date.date() == previous:
+                self.today_page.date.setDate(calendar_day)
+            clock_changed = True
         self.poll_pending = True
         def loaded(result):
             self.poll_pending = False
             self.change_cursor = result.get("cursor", self.change_cursor)
-            if result.get("items") or result.get("reset_required"):
+            if result.get("items") or result.get("reset_required") or clock_changed and self.section in {"dashboard", "today"}:
                 if result.get("reset_required") or any(item.get("action")=="settings" for item in result.get("items",[])):
                     self.load_display_preferences()
                 self.refresh()
@@ -464,7 +504,10 @@ class MainWindow(QMainWindow):
 
 
 def run(data_dir, argv=None):
+    from .branding import set_windows_identity, configure_application
+    set_windows_identity()
     app = QApplication.instance() or QApplication(argv or [])
+    configure_application(app)
     manager = install_gui_gc(app)
     app.setApplicationName("个人事务管理")
     app.setOrganizationName("PersonalManagement")

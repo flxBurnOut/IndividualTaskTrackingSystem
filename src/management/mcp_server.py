@@ -1,5 +1,6 @@
 """Typed MCP tools backed exclusively by the independent business service."""
 from __future__ import annotations
+from . import __version__
 
 import argparse
 import json
@@ -25,24 +26,25 @@ INSTRUCTIONS = (
 
 QueryName = Literal[
     "timetables", "timetable_week",
-    "skills",
+    "skills", "habits_overview", "dashboard",
     "recovery_summary",
     "daily_tasks", "recurring_rules", "preview_recurring", "codex_models",
-    "sources", "source_content", "conversation",
-    "daily_review", "weekly_review", "review_preferences", "object_workspace", "open_resource", "operation",
+    "sources", "source_content", "conversation", "library_folder",
+    "daily_review", "weekly_review", "review_preferences", "object_workspace", "workspace_tasks", "open_resource", "operation",
     "state", "capabilities", "list", "get", "changes", "today", "plan_context",
     "review", "jobs", "job", "settings", "receipt", "diagnostics", "warnings",
     "learning_summary", "assessment_summary", "collection_summary", "project_summary", "coverage_gaps",
 ]
 CommandName = Literal[
+    "set_task_completion", "revise_plan",
     "delete_task", "restore_task",
     "apply_timetable",
-    "set_recovery_task", "record_recovery_progress",
+    "set_recovery_task", "record_recovery_progress", "correct_recovery_scope",
     "add_to_plan", "set_recurring_rule", "materialize_recurring",
     "add_source", "send_message",
     "submit_daily_review", "set_review_preferences", "attach_local_file",
     "create", "update", "move", "archive", "link", "unlink", "record_feedback",
-    "create_plan", "create_checkin", "respond_checkin", "save_review", "settings",
+    "create_plan", "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex",
     "install_module", "disable_module", "create_job", "cancel_job", "apply_proposal",
     "import_asset", "export_asset", "backup", "create_bundle", "restore_backup",
     "create_artifact_job", "adopt_artifact", "create_notebook_from_pdf", "run_workflow", "undo", "promote_checklist",
@@ -78,7 +80,7 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     if client is None:
         from .client import Client
         client = Client(data_dir)
-    server = MCPServer("personal-management", title="个人事务管理", version="0.7.0", instructions=INSTRUCTIONS, log_level="WARNING")
+    server = MCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
 
     def query(name: str, **params: Any) -> dict[str, Any]:
         try:

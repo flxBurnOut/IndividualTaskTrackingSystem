@@ -296,3 +296,18 @@ def test_restore_marks_queued_message_cancelled(core):
     read=core.query('conversation',scope=SCOPE)
     assert read['messages'][0]['state']=='cancelled'
     assert read['conversation']['active_job_id'] is None
+
+
+def test_large_project_context_is_explicit_bounded_index(core):
+    project=command(core,'create',{'type':'project','title':'Large imported project'})['entity']
+    for i in range(60):
+        command(core,'create',{'type':'task','title':'Task '+str(i),'parent_id':project['id'],
+            'data':{'notes':'Unabridged evidence '*150,'completion_gate':'Original gate '+str(i)}})
+    with core.store.connect() as c:
+        result=conversations._scope_facts(core,c,{'kind':'object','entity_id':project['id']})
+    assert len(encode(result).encode('utf-8'))<28000
+    assert result['coverage']['complete'] is False
+    assert result['coverage']['total']==61
+    assert all('details_available_via' in item for item in result['records'])
+    original=core.query('get',id=result['records'][1]['id'])['entity']
+    assert original['data']['completion_gate'].startswith('Original gate')

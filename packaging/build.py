@@ -11,16 +11,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--name',default='PersonalManagement-0.7')
+    parser.add_argument('--name',default='PersonalManagement-0.11.2')
     args=parser.parse_args()
     if not args.name.startswith('PersonalManagement') or any(x in args.name for x in '/\\:'):
         parser.error('Invalid package directory name')
+    from version_info import write_versions
+    write_versions()
     os.environ['PM_PACKAGE_NAME']=args.name
     subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', str(ROOT / 'release'), '--workpath', str(ROOT / '.build' / 'pyinstaller'), str(ROOT / 'packaging' / 'personal_management.spec')], check=True, cwd=ROOT)
     package = ROOT / 'release' / args.name
-    (package / '使用说明.txt').write_text('个人事务管理 0.7\n\n打开 PersonalManagement.exe。首次启动会建立空数据空间。\n\n默认数据位置：%LOCALAPPDATA%\\PersonalManagement\\data\n如需使用其他目录，运行 PersonalManagement.exe --choose-data，或使用 --data-dir 指定目录。\n\nCodex 连接请使用 PersonalManagementService.exe --mcp --data-dir <数据目录>。配置模板见 mcp-config-example.toml。软件包不包含账号或个人记录。\n\n界面关闭后本机业务服务继续运行。电脑关闭期间不执行定时任务。\n\n完整验证范围与已知边界见项目中的 实施验收记录.md。\n', encoding='utf-8')
+    (package / '使用说明.txt').write_text('个人事务管理 0.11.2\n\n打开 PersonalManagement.exe。首次启动会建立空数据空间。\n\n默认数据位置：%LOCALAPPDATA%\\PersonalManagement\\data\n如需使用其他目录，运行 PersonalManagement.exe --choose-data，或使用 --data-dir 指定目录。\n\n在设置 → Codex 协助中启用并保存，软件会自动创建 Codex事务助手项目、连接当前数据空间，并打开空白对话。需要本机已安装并登录 Codex；不自动发送消息。软件包不包含账号或个人记录。\n\n界面关闭后本机业务服务继续运行。电脑关闭期间不执行定时任务。\n\n使用方法与功能边界见软件包中的 详细使用说明.md。\n', encoding='utf-8')
     (package / 'mcp-config-example.toml').write_text('# 用实际绝对路径替换下面内容；不含用户账号信息。\n[mcp_servers.personal_management]\ncommand = "D:\\\\YourSoftware\\\\PersonalManagementService.exe"\nargs = ["--mcp", "--data-dir", "D:\\\\YourData\\\\PersonalManagement"]\n', encoding='utf-8')
     (package / '选择数据空间.vbs').write_text('Set shell = CreateObject("WScript.Shell")\nSet fso = CreateObject("Scripting.FileSystemObject")\nbase = fso.GetParentFolderName(WScript.ScriptFullName)\nshell.Run Chr(34) & base & "\\PersonalManagement.exe" & Chr(34) & " --choose-data", 1, False\n', encoding='ascii')
+    (package / '创建快捷方式.vbs').write_text('Set shell = CreateObject("WScript.Shell")\nSet fso = CreateObject("Scripting.FileSystemObject")\nbase = fso.GetParentFolderName(WScript.ScriptFullName)\nshell.Run Chr(34) & base & "\\PersonalManagement.exe" & Chr(34) & " --install-shortcuts --choose-data", 1, False\n', encoding='ascii')
     (package / '详细使用说明.md').write_text((ROOT / 'docs' / '使用说明.md').read_text('utf-8-sig'), encoding='utf-8')
     files = [p for p in package.rglob('*') if p.is_file()]
     forbidden = {'.analysis', '.test-output', '.venv', 'database.sqlite3', 'runtime.json', 'auth.json', 'restore_pending.json'}

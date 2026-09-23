@@ -85,6 +85,8 @@ def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
                 'review_id': None, 'review_version': None}
     targets = {(day, b['target_id']) for b in plan['data'].get('blocks', []) if isinstance(b.get('target_id'), str) and b['target_id']}
     feedback = feedback if feedback is not None else _completion_feedback(core, c, day, day, targets)
+    from .presentation import Presenter
+    presenter=Presenter(core,c)
     items, seen = [], set()
     for block in plan['data'].get('blocks', []):
         target_id = block.get('target_id')
@@ -107,6 +109,9 @@ def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
                 'available': target is not None,
                 'target_archived': bool(target and target.get('archived')),
                 'can_review': bool(target and not target.get('archived'))}
+        item['target_type']=target['type'] if target else None
+        if target:item.update(presenter.fields(target))
+        else:item.update(owner_id=None,owner_label='原归属待核对',display_title=item['title'])
         for field in ('start', 'end'):
             if block.get(field) is not None:
                 item[field] = block[field]
@@ -117,6 +122,8 @@ def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
     return {'date': day, 'has_plan': True,
             'plan': {k: plan[k] for k in ('id', 'version', 'title')} | {'mode': plan['data'].get('mode', 'standard')},
             'items': items, 'summary': _summary(items), 'needs_codex': False,
+            'historical_import':bool(plan['data'].get('historical_import')),
+            'historical_source_asset_id':plan['data'].get('source_asset_id'),
             'review_id': review['id'] if review else None, 'review_version': review['version'] if review else None}
 
 
@@ -149,6 +156,7 @@ def query_weekly(core, c, p):
         daily = _daily(core, c, day, plan=plans.get(day), plan_loaded=True, feedback=feedback)
         counts = daily['summary']
         days.append({'date': day, 'has_plan': daily['has_plan'], 'summary': counts,
+                     'historical_import':daily.get('historical_import',False),
                      'needs_codex': daily['needs_codex'], 'plan_id': daily['plan']['id'] if daily['plan'] else None})
         total['days_with_plan' if daily['has_plan'] else 'days_without_plan'] += 1
         total['planned'] += counts['total']
@@ -167,7 +175,8 @@ def query_weekly(core, c, p):
                          'items_total': item_index, 'items_returned': len(items),
                          'items_complete': offset == 0 and len(items) == item_index,
                          'next_offset': offset + len(items) if offset + len(items) < item_index else None,
-                         'metrics_complete': True, 'denominator': 'latest_plan_unique_target_per_business_date',
+                         'metrics_complete': not any(d.get('historical_import') for d in days),
+                         'historical_import_days':sum(bool(d.get('historical_import')) for d in days), 'denominator': 'latest_plan_unique_target_per_business_date',
                          'feedback_coverage': reported / total['planned'] if total['planned'] else None,
                          'confirmed_completion_rate': total['done'] / binary if binary else None,
                          'missing_plan_is_failure': False, 'unknown_is_zero': False}}
@@ -293,3 +302,33 @@ def legacy_checkin(core, c, p, rid):
         'delivery_state': 'not_delivered', 'source_revision': core.store.meta(c, 'revision'),
         'no_reply_means': 'unknown'}}, rid)
     return {'entity': entity, 'needs_codex': False, 'reused': False}
+
+
+def set_task_completion(core,c,p,rid):
+    """One explicit completion fact, shared by daily review and task views."""
+    day=_date(p.get('business_date'))
+    if not isinstance(p.get('result'),str) or p['result'] not in RESULTS:
+        raise BusinessError('validation','请选择完成或未完成。')
+    target=core._versioned(c,{'id':p.get('target_id'),'version':p.get('target_version')})
+    if target['type'] not in {'task','event','milestone'} or target['archived'] or target['status']=='cancelled':
+        raise BusinessError('completion_target','请选择仍可记录完成情况的任务、日程或节点。')
+    if 'plan_id' in p or 'plan_version' in p:
+        plan=_latest_plan(core,c,day)
+        if not plan or (p.get('plan_id'),p.get('plan_version'))!=(plan['id'],plan['version']):
+            raise BusinessError('review_plan_conflict','当日计划已变化，请重新读取后核对。')
+        if target['id'] not in {b.get('target_id') for b in plan['data'].get('blocks',[])}:
+            raise BusinessError('review_target','这项任务不在当前每日计划中。')
+    row=c.execute("""SELECT * FROM entities WHERE type='feedback' AND archived=0
+        AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.business_date')=?
+        AND json_type(data,'$.dimensions.completion') IS NOT NULL
+        ORDER BY created_at DESC,rowid DESC LIMIT 1""",(target['id'],day)).fetchone()
+    prior=core.store.entity(row) if row else None
+    from .task_views import state
+    matches_current=target['type']!='task' or state(core,c,target['id'],day)==p['result']
+    if prior and prior['data']['dimensions']['completion']==p['result'] and matches_current:
+        return {'entity':target,'feedback':prior,'changed':False,'completion_state':p['result']}
+    payload={'target_id':target['id'],'business_date':day,'dimensions':{'completion':p['result']},
+             'source_text':'用户在 '+day+' 明确点击：'+('完成' if p['result']=='done' else '未完成')+'。'}
+    if prior:payload['supersedes_id']=prior['id']
+    record=core.feedback(c,payload,rid)
+    return {'entity':target,'feedback':record,'changed':True,'completion_state':p['result']}

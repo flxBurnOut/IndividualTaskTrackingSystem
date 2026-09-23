@@ -181,15 +181,32 @@ def _scope_facts(core, c, scope):
             raise BusinessError('context_limit', '此节点规则过多，请缩小范围后分批整理。')
         ids = {r['id'] for r in records}
         records.extend(r for r in rules['items'] if r['id'] not in ids)
-    return {'scope': scope, 'owner': owner, 'records': records, 'coverage': {'complete': True, 'count': len(records)}}
+    result = {'scope': scope, 'owner': owner, 'records': records, 'coverage': {'complete': True, 'count': len(records)}}
+    # Large imported projects receive an explicitly incomplete identity index.
+    if len(encode(result).encode('utf-8')) > 28000:
+        summaries = []
+        ordered = sorted(records, key=lambda e: (e['id'] != owner['id'], e['status'] in {'done','cancelled'}, e['type'] not in {'task','event','rule'}, e['title']))
+        for entity in ordered:
+            item = {k:entity[k] for k in ('id','type','title','parent_id','status','version')}
+            item['data'] = {k:v for k,v in entity['data'].items() if k in {'code','date','due_date','scheduled_date','earliest_start','start','end','time_kind','recurrence','until','event_kind','priority','weight','catchup_enabled','catchup_total_quantity','catchup_unit'}}
+            item['details_available_via'] = {'query':'get','id':entity['id']}
+            summaries.append(item)
+            if len(encode({'scope':scope,'owner':owner,'records':summaries}).encode('utf-8')) > 25000:
+                summaries.pop();break
+        result['records'] = summaries
+        result['coverage'] = {'complete':False,'count':len(summaries),'total':len(records),
+            'record_details_omitted':True,'guidance':'Identity index only. Do not infer completion gates, progress, rules or source content. Select a specific task or its source before changing details.'}
+    return result
 
 
 def send(core, c, p, rid, prepared=None):
-    if not isinstance(p, dict) or set(p) - {'scope', 'text', 'source_ids', 'skill_id'}:
+    if not isinstance(p, dict) or set(p) - {'scope', 'text', 'source_ids', 'skill_id', 'request_plan'}:
         raise BusinessError('validation', '讨论只接受范围、消息、已登记资料编号和已安装技能。')
     scope = _scope(c, p.get('scope'))
     from .skill_workflows import select_skill, skill_context
     selected_skill = select_skill(p)
+    if type(p.get('request_plan',False)) is not bool or p.get('request_plan') and scope['kind']!='daily_plan':
+        raise BusinessError('validation','生成计划需要明确的每日计划范围。')
     text = p.get('text')
     if not isinstance(text, str) or not text.strip() or len(text) > 12000:
         raise BusinessError('validation', '请输入不超过 12000 字符的讨论内容；长资料请作为附件选择。')
@@ -230,8 +247,18 @@ def send(core, c, p, rid, prepared=None):
     value = {'prompt': text.strip(), 'conversation_id': conversation['id'], 'conversation_scope': scope,
              'history': history, 'provider_thread_id': conversation['provider_thread_id'],
              'context_ids': [scope['entity_id']] if scope.get('entity_id') else []}
+    if conversation['provider_thread_id']:
+        previous = c.execute('''SELECT j.result FROM conversation_messages m JOIN jobs j ON j.id=m.job_id
+            WHERE m.conversation_id=? AND m.role='assistant'
+            AND json_extract(j.result,'$.provider.thread_id')=? ORDER BY m.seq DESC LIMIT 1''',
+            (conversation['id'],conversation['provider_thread_id'])).fetchone()
+        if previous:
+            value['provider_project_path'] = json.loads(previous['result']).get('provider',{}).get('project_path')
     if scope.get('date'):
         value['date'] = scope['date']
+    from .plan_assistance import requested_day
+    planning_day=requested_day(text,scope,core.today(c),p.get('request_plan',False))
+    if planning_day:value.update(plan_requested=True,date=planning_day)
     job = core.create_job(c, 'create_job', {'kind': 'ai', 'input': value}, rid)
     value = job['input']
     value['context']['discussion_scope'] = _scope_facts(core, c, scope)
@@ -248,6 +275,7 @@ def send(core, c, p, rid, prepared=None):
         value['skill_id'] = selected_skill
     if scope['kind'] == 'timetable':
         value['allowed_commands'] = ['apply_timetable']
+    if planning_day:value['allowed_commands']=['create_plan']
     value['source_versions'] = source_versions
     value['local_images'] = prepared.get('local_images', [])
     value['source_ids'] = sources

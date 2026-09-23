@@ -224,6 +224,8 @@ class ReviewPage(QWidget):
             text += ' 当前统计覆盖不完整，请先核对缺口。'
         if summary.get('archived'):
             text += f" 其中 {summary['archived']} 项任务已删除，历史计划与原有反馈保留。"
+        if coverage.get('historical_import_days'):
+            text += ' 旧计划按原时间块保留；未能明确对应条目的历史反馈保留原记录，不推算完成率。'
         self.week_notice.setText(text)
 
     def _week_error(self, generation, error):
@@ -279,13 +281,15 @@ class ReviewPage(QWidget):
         card.setObjectName('ReviewItem')
         layout = QVBoxLayout(card)
         layout.setSpacing(5)
-        title = QLabel(item.get('title') or '未命名项目')
+        title = QLabel(item.get('display_title') or item.get('title') or '未命名项目')
         title.setWordWrap(True)
         title.setTextFormat(Qt.TextFormat.PlainText)
         font = title.font()
         font.setBold(True)
         title.setFont(font)
         layout.addWidget(title)
+        if item.get('owner_label'):
+            owner = QLabel(item['owner_label']); owner.setObjectName('StatusPill'); owner.setTextFormat(Qt.TextFormat.PlainText); layout.addWidget(owner)
         if item.get('completion_gate'):
             gate = QLabel('完成条件：' + str(item['completion_gate']))
             gate.setWordWrap(True)

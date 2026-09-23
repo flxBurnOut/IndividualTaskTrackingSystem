@@ -320,8 +320,8 @@ def test_more_than_twelve_sources_requires_selection_instead_of_truncating(tmp_p
     core=Core(tmp_path/'data');owner=create(core)
     items=[source_fixture(core,tmp_path,'Synthetic '+str(i),owner) for i in range(13)]
     scope={'kind':'course','entity_id':owner['id']}
-    with pytest.raises(BusinessError) as error: sources.prepare_context(core,{'scope':scope})
-    assert error.value.code=='source_limit'
+    context=sources.prepare_context(core,{'scope':scope})
+    assert context['source_context']==[] and context['source_versions']=={}
     selected=sources.prepare_context(core,{'scope':scope,'source_ids':[item['id'] for item in items[:12]]})
     assert len(selected['source_context'])==12
     with pytest.raises(BusinessError): sources.prepare_context(core,{'scope':scope,'source_ids':[item['id'] for item in items]})

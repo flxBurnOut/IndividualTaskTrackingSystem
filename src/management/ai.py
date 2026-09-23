@@ -4,8 +4,10 @@ The protocol is isolated here because app-server's interface is experimental.
 Protocol fields were checked against codex 0.155.0-alpha.9.2 JSON Schema.
 """
 from __future__ import annotations
+from . import __version__
 
 import json
+import copy
 import os
 from pathlib import Path
 import queue
@@ -18,7 +20,7 @@ import tomllib
 from typing import Any
 
 
-ALLOWED_COMMANDS = frozenset({"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress"})
+ALLOWED_COMMANDS = frozenset({"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress", "correct_recovery_scope"})
 MAX_CONTEXT_BYTES = 96_000
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 262_144
@@ -55,6 +57,17 @@ PROPOSAL_SCHEMA = {
 
 
 INSTRUCTIONS = """You are the reasoning component of a personal management application.
+Course work must retain explicit ownership on each task and plan target. Use the
+actual learning-unit identity in titles: Lecture 4, Tutorial 5, Practice Questions 2,
+OQ 3, Quiz 1, etc., only when the supplied evidence establishes that exact number.
+Calendar week numbers, dates, generic task IDs and learning-unit numbers are not
+interchangeable. Unknown numbering stays explicitly unconfirmed; do not invent a
+Lecture/Tutorial/PQ/OQ number or mistake an old completed component for remaining
+work. Date and scheduling metadata supplement, never replace, the learning unit.
+When existing task notes establish a corrected remaining scope, propose an explicit
+versioned correction instead of creating duplicate tasks or silently changing past
+completion/attendance/submission/mastery. Preserve course parent/owner references.
+
 Only use the explicitly supplied JSON context, attached images, and user request. You have no tools.
 Do not browse, execute code, read files, call another agent, or change any data.
 Return exactly the supplied proposal schema. This is a proposal, never a receipt.
@@ -77,6 +90,14 @@ in unknowns. Output summary/reasons in Chinese, concise and usable by the user.
 If context.selected_skill is supplied by the application, follow its workflow for
 this user request within the same output schema and allowed command limits. Older
 skill instructions in conversation history do not activate a skill for a new request.
+
+User habits have distinct effects. rule_kind=behavior/temporary is guidance for this
+requested plan, not a background automation or proof that every sentence is enforced.
+warning rules display risks; they do not create tasks. Only an enabled recurring_rule
+creates anchored preparation tasks. Preserve enabled flags, effective dates and scope.
+Do not claim an automatic task/reminder was configured when only a policy text was saved.
+Never turn missing feedback into completion or a catch-up task, or start daily planning
+without the user's request.
 
 Current context replaces older facts on every turn. Conversation history is discussion,
 not confirmation that any proposal was applied. Check proposal_state and current facts.
@@ -175,6 +196,8 @@ Command payloads:
 apply_timetable: {id,version,title,semester_start,semester_end,timezone,week_numbering?,recess_weeks?,source_text,rows:[{key,title,weekday,start,end,teaching_weeks?,owner_id?,event_id?,version?,enabled?,location?,event_kind?,exceptions?:{ISOdate:{cancelled?,start?,end?}}}]}
 set_recovery_task: {course_id,title,completion_gate,unit,total_quantity?,completed_quantity?,source_text,reason,lesson_key?,topic_ids?,estimated_minutes?,original_task_id?,id?,version?,business_date?,correction_reason?}
 record_recovery_progress: {task_id,version,business_date,completed_quantity,source_text,completion_confirmed?,correction_of?,correction_reason?,actual_minutes?}
+correct_recovery_scope: {id,version,title,completion_gate,lesson_key,source_text,correction_reason,business_date?,total_quantity?}
+Use correct_recovery_scope only for an explicitly evidenced correction of an existing catch-up scope. It preserves identity and history, resets completion to unknown, and rejects any prior measured quantity. Never use it to silently lower a completion requirement; create a distinct task for a new measured scope instead.
 create: {type,title,parent_id?,status?,data?}
 update: {id,version,patch:{title?,status?,data?}}
 record_feedback: {target_id,business_date,dimensions:{completion?,attendance?,viewing?,submission?,mastery?,actual_minutes?},source_text}
@@ -207,11 +230,13 @@ def find_codex(executable: str | None = None) -> str | None:
     return str(candidates[0]) if candidates else None
 
 
-def _isolation_overrides() -> dict[str, Any]:
-    """Disable inherited integrations without changing the user's configuration.
+def _isolation_overrides(cwd: str | Path | None = None) -> dict[str, Any]:
+    """Disable inherited integrations without changing any configuration file.
 
-    Only configuration keys are inspected; credentials are not opened/copied.
-    Explicit per-server overrides are necessary because config tables merge.
+    Codex merges user/profile settings with trusted project configuration. Read
+    only bounded configuration files to enumerate integration names; scanning
+    every ancestor conservatively covers nested projects and custom repo roots.
+    Config contents, credentials and command values never enter model context.
     """
     overrides: dict[str, Any] = {
         "features.shell_tool": False, "features.unified_exec": False,
@@ -223,35 +248,73 @@ def _isolation_overrides() -> dict[str, Any]:
         "apps._default.enabled": False,
     }
     config_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    config_file = config_home / "config.toml"
     try:
-        if config_file.is_file():
-            if config_file.stat().st_size > 2_097_152:
+        workspace = Path(cwd if cwd is not None else Path.cwd()).resolve()
+        files = [config_home / "config.toml", *(
+            directory / ".codex" / "config.toml"
+            for directory in (workspace, *workspace.parents)
+        )]
+        visited: set[Path] = set()
+        total_bytes = 0
+        mcp_transports: dict[str, set[str]] = {}
+        for config_file in files:
+            config_file = config_file.resolve()
+            if config_file in visited:
+                continue
+            visited.add(config_file)
+            try:
+                with config_file.open("rb") as stream:
+                    raw = stream.read(2_097_153)
+            except FileNotFoundError:
+                continue
+            total_bytes += len(raw)
+            if len(raw) > 2_097_152 or total_bytes > 8_388_608:
                 raise AIError("AI_CONFIG_UNSAFE", "Codex 配置过大，无法确认辅助运行隔离。")
-            with config_file.open("rb") as stream:
-                config = tomllib.load(stream)
-            layers = [config, *[v for v in config.get("profiles", {}).values() if isinstance(v, dict)]]
-            for layer in layers:
-                for name in layer.get("mcp_servers", {}):
-                    if "." in name:
-                        raise AIError("AI_CONFIG_UNSAFE", "Codex MCP name cannot be safely isolated.")
-                    overrides[f'mcp_servers.{name}.enabled'] = False
-                for name in layer.get("plugins", {}):
-                    if "." in name:
-                        raise AIError("AI_CONFIG_UNSAFE", "Codex plugin name cannot be safely isolated.")
-                    overrides[f'plugins.{name}.enabled'] = False
-                for name in layer.get("apps", {}):
-                    if "." in name:
-                        raise AIError("AI_CONFIG_UNSAFE", "Codex app name cannot be safely isolated.")
-                    overrides[f'apps.{name}.enabled'] = False
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+            config = tomllib.loads(raw.decode("utf-8"))
+            profiles = config.get("profiles", {})
+            if not isinstance(profiles, dict) or any(not isinstance(v, dict) for v in profiles.values()):
+                raise AIError("AI_CONFIG_UNSAFE", "Codex 配置层格式不正确，无法确认辅助运行隔离。")
+            for layer in [config, *profiles.values()]:
+                for section in ("mcp_servers", "plugins", "apps"):
+                    integrations = layer.get(section, {})
+                    if not isinstance(integrations, dict):
+                        raise AIError("AI_CONFIG_UNSAFE", "Codex 接口配置格式不正确，无法确认辅助运行隔离。")
+                    for name in integrations:
+                        # CLI -c keys are dotted paths. Reject names which could
+                        # change that path instead of disabling the exact entry.
+                        if not name or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-@" for ch in name):
+                            raise AIError("AI_CONFIG_UNSAFE", "Codex 接口名称无法安全隔离。")
+                        overrides[f'{section}.{name}.enabled'] = False
+                        if section == "mcp_servers":
+                            definition = integrations[name]
+                            if not isinstance(definition, dict):
+                                raise AIError("AI_CONFIG_UNSAFE", "Codex MCP 配置格式不正确。")
+                            transports = mcp_transports.setdefault(name, set())
+                            for transport in ("command", "url"):
+                                if transport in definition:
+                                    if not isinstance(definition[transport], str) or not definition[transport]:
+                                        raise AIError("AI_CONFIG_UNSAFE", "Codex MCP 连接配置无法安全隔离。")
+                                    transports.add(transport)
+        for name, transports in mcp_transports.items():
+            if len(transports) != 1:
+                raise AIError("AI_CONFIG_UNSAFE", "Codex MCP 连接类型缺失或跨配置层冲突，无法确认隔离。")
+            # A project/profile can be ignored by Codex (for example before
+            # trust is granted). An enabled=false override alone would create
+            # an invalid transport-less server in that case. Supply an inert
+            # transport of the same kind; never copy command/URL credentials.
+            transport = next(iter(transports))
+            overrides[f'mcp_servers.{name}.{transport}'] = (
+                "__personal_management_internal_tools_disabled__" if transport == "command"
+                else "http://127.0.0.1:1/personal-management-disabled"
+            )
+    except (OSError, UnicodeError, ValueError) as exc:
         raise AIError("AI_CONFIG_UNSAFE", "无法读取 Codex 配置并隔离外部工具。") from exc
     return overrides
 
 
-def _arguments(executable: str) -> list[str]:
+def _arguments(executable: str, cwd: str | Path | None = None) -> list[str]:
     args = [executable, "app-server"]
-    for key, value in _isolation_overrides().items():
+    for key, value in _isolation_overrides(cwd).items():
         args += ["-c", key + "=" + json.dumps(value, ensure_ascii=False)]
     return args
 
@@ -271,7 +334,7 @@ class _AppServer:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             self.process = subprocess.Popen(
-                _arguments(executable), cwd=cwd, env=environment,
+                _arguments(executable, cwd), cwd=cwd, env=environment,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 creationflags=flags,
             )
@@ -457,6 +520,26 @@ def _content(input, allowed, include_history):
     return content
 
 
+def project_directory(settings: dict) -> Path:
+    """One stable project per data space; never a per-request temporary cwd."""
+    from .resources import _plain_path
+    path = settings.get('_codex_project_dir')
+    if path is None:
+        path = Path(tempfile.gettempdir()) / 'PersonalManagement' / 'Codex事务助手'
+    directory = _plain_path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _discussion_title(input):
+    scope = input.get('conversation_scope', {})
+    name = {'daily_plan':'每日计划','daily_review':'每日复盘','general':'日常讨论','timetable':'每周课表'}.get(scope.get('kind'))
+    if name is None:
+        selected = input.get('context', {}).get('selected_records', [])
+        name = next((e.get('title') for e in selected if e.get('id') == scope.get('entity_id')), None) or '课程与项目'
+    return ('个人事务 · '+name+(' · '+scope['date'] if scope.get('date') else ''))[:150]
+
+
 def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
     """Generate only. Persistent provider threads are private to scoped software chats.
 
@@ -486,78 +569,102 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
         timeout = min(900, max(10, float(config.get('timeout_seconds', 180))))
     except (TypeError, ValueError) as exc:
         raise AIError('AI_CONFIG_INVALID', 'Codex 超时设置必须为秒数。') from exc
-    with tempfile.TemporaryDirectory(prefix='personal-management-reasoning-') as workspace:
-        rpc = _AppServer(executable, Path(workspace), cancel, timeout)
-        try:
-            rpc.request('initialize', {'clientInfo': {'name': 'personal_management', 'version': '0.7.0'}, 'capabilities': {'experimentalApi': True}})
-            rpc.send({'method': 'initialized', 'params': {}})
-            common = {'cwd': workspace, 'sandbox': 'read-only', 'approvalPolicy': 'untrusted',
-                      'baseInstructions': INSTRUCTIONS,
-                      'developerInstructions': 'No tools or external context. Current software facts and candidate states override earlier discussion. Output only the candidate JSON.'}
-            if config.get('model'):
-                common['model'] = config['model']
-            recovery, started = None, None
-            if previous:
+    workspace = str(project_directory(settings))
+    from .codex_project import project_binding
+    binding = project_binding(workspace) if persistent else None
+    if previous and input.get('provider_project_path') != workspace:
+        previous = None
+    rpc = _AppServer(executable, Path(workspace), cancel, timeout)
+    try:
+        rpc.request('initialize', {'clientInfo': {'name': 'personal_management', 'version': __version__}, 'capabilities': {'experimentalApi': True}})
+        rpc.send({'method': 'initialized', 'params': {}})
+        instructions=INSTRUCTIONS
+        if input.get('plan_requested'):
+            from .plan_assistance import GUIDANCE
+            instructions += '\n\nDaily planning exception to the generic ambiguity rule:\n'+GUIDANCE
+        common = {'cwd': workspace, 'sandbox': 'read-only', 'approvalPolicy': 'untrusted',
+                  'baseInstructions': instructions,
+                  'developerInstructions': 'No tools or external context. Current software facts and candidate states override earlier discussion. Output only the candidate JSON.'}
+        if config.get('model'):
+            common['model'] = config['model']
+        recovery, started = None, None
+        if previous:
+            try:
+                # Resume has a different schema from start. Its unstable
+                # `history` property is deliberately not used.
+                started = rpc.request('thread/resume', {**common, 'threadId': previous, 'excludeTurns': True})
+                recovery = 'resumed'
+            except AIError as error:
+                if error.code != 'AI_REQUEST_REJECTED':
+                    raise
+                recovery = 'history_rebuilt'
+        if started is None:
+            started = rpc.request('thread/start', {**common, **({'projectId': binding['project_id']} if binding else {}), 'ephemeral': not persistent,
+                'environments': [], 'dynamicTools': [], 'selectedCapabilityRoots': [],
+                'serviceName': 'personal_management_proposals'})
+            recovery = recovery or ('history_rebuilt' if persistent and input.get('history', {}).get('messages') else 'new')
+        rpc.thread_id = started['thread']['id']
+        if binding and recovery == 'resumed':
+            rpc.request('thread/metadata/update', {'threadId': rpc.thread_id, 'projectId': binding['project_id']})
+        if persistent and recovery != 'resumed':
+            try:
+                rpc.request('thread/name/set', {'threadId':rpc.thread_id,'name':_discussion_title(input)})
+            except AIError as error:
+                if error.code != 'AI_REQUEST_REJECTED':raise
+        content = _content(input, allowed, include_history=False) if recovery == 'resumed' else fresh_content
+        schema=PROPOSAL_SCHEMA
+        if input.get('plan_requested'):
+            schema=copy.deepcopy(PROPOSAL_SCHEMA)
+            schema['properties']['unknowns']['maxItems']=1
+            schema['properties']['actions']['maxItems']=1
+            schema['properties']['actions']['items']['properties']['command']['enum']=['create_plan']
+            if input.get('context',{}).get('planning',{}).get('tasks'):
+                schema['properties']['actions']['minItems']=1
+        turn = rpc.request('turn/start', {
+            'threadId': rpc.thread_id, 'input': [{'type': 'text', 'text': content}, *images],
+            'cwd': workspace, 'environments': [], 'approvalPolicy': 'untrusted',
+            'sandboxPolicy': {'type': 'readOnly', 'networkAccess': False},
+            'outputSchema': schema, 'summary': 'none',
+        })
+        rpc.turn_id = turn['turn']['id']
+        final_messages, output_bytes = {}, 0
+        while True:
+            event = rpc.next_event()
+            method, body = event.get('method'), event.get('params', {})
+            if method == 'item/completed':
+                item = body.get('item', {})
+                if item.get('type') == 'agentMessage':
+                    text = item.get('text', '')
+                    output_bytes += len(text.encode('utf-8'))
+                    if output_bytes > MAX_OUTPUT_BYTES:
+                        raise AIError('AI_OUTPUT_LIMIT', '候选输出超过允许大小。')
+                    final_messages[item.get('id', str(len(final_messages)))] = text
+            elif method == 'turn/completed':
+                completed = body.get('turn', {})
+                if completed.get('id') != rpc.turn_id:
+                    continue
+                status = completed.get('status')
+                if status == 'interrupted':
+                    raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
+                if status != 'completed':
+                    raise AIError('AI_GENERATION_FAILED', 'Codex 未完成候选生成，请检查登录、模型权限或网络。')
+                if cancel.is_set():
+                    raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
+                if not final_messages:
+                    raise AIError('AI_EMPTY_OUTPUT', 'Codex 没有返回候选结果。')
                 try:
-                    # Resume has a different schema from start. Its unstable
-                    # `history` property is deliberately not used.
-                    started = rpc.request('thread/resume', {**common, 'threadId': previous, 'excludeTurns': True})
-                    recovery = 'resumed'
-                except AIError as error:
-                    if error.code != 'AI_REQUEST_REJECTED':
-                        raise
-                    recovery = 'history_rebuilt'
-            if started is None:
-                started = rpc.request('thread/start', {**common, 'ephemeral': not persistent,
-                    'environments': [], 'dynamicTools': [], 'selectedCapabilityRoots': [],
-                    'serviceName': 'personal_management_proposals'})
-                recovery = recovery or ('history_rebuilt' if persistent and input.get('history', {}).get('messages') else 'new')
-            rpc.thread_id = started['thread']['id']
-            content = _content(input, allowed, include_history=False) if recovery == 'resumed' else fresh_content
-            turn = rpc.request('turn/start', {
-                'threadId': rpc.thread_id, 'input': [{'type': 'text', 'text': content}, *images],
-                'cwd': workspace, 'environments': [], 'approvalPolicy': 'untrusted',
-                'sandboxPolicy': {'type': 'readOnly', 'networkAccess': False},
-                'outputSchema': PROPOSAL_SCHEMA, 'summary': 'none',
-            })
-            rpc.turn_id = turn['turn']['id']
-            final_messages, output_bytes = {}, 0
-            while True:
-                event = rpc.next_event()
-                method, body = event.get('method'), event.get('params', {})
-                if method == 'item/completed':
-                    item = body.get('item', {})
-                    if item.get('type') == 'agentMessage':
-                        text = item.get('text', '')
-                        output_bytes += len(text.encode('utf-8'))
-                        if output_bytes > MAX_OUTPUT_BYTES:
-                            raise AIError('AI_OUTPUT_LIMIT', '候选输出超过允许大小。')
-                        final_messages[item.get('id', str(len(final_messages)))] = text
-                elif method == 'turn/completed':
-                    completed = body.get('turn', {})
-                    if completed.get('id') != rpc.turn_id:
-                        continue
-                    status = completed.get('status')
-                    if status == 'interrupted':
-                        raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
-                    if status != 'completed':
-                        raise AIError('AI_GENERATION_FAILED', 'Codex 未完成候选生成，请检查登录、模型权限或网络。')
-                    if cancel.is_set():
-                        raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
-                    if not final_messages:
-                        raise AIError('AI_EMPTY_OUTPUT', 'Codex 没有返回候选结果。')
-                    try:
-                        value = json.loads(list(final_messages.values())[-1])
-                    except json.JSONDecodeError as exc:
-                        raise AIError('AI_INVALID_PROPOSAL', 'Codex 返回的候选结果不是 JSON。') from exc
-                    result = validate_proposal(value, allowed)
-                    result['provider'] = {'kind': 'codex_app_server', 'thread_id': rpc.thread_id,
-                        'turn_id': rpc.turn_id, 'model': started.get('model', config.get('model')), 'recovery': recovery}
-                    if recovery == 'history_rebuilt':
-                        result['summary'] = '已根据软件保存的有限讨论记录恢复会话；当前业务事实已重新读取。\n\n' + result['summary']
-                    rpc.turn_id = None
-                    return result
-        except (KeyError, TypeError) as exc:
-            raise AIError('AI_PROTOCOL_ERROR', 'Codex 接口返回格式与当前适配器不兼容。') from exc
-        finally:
-            rpc.close()
+                    value = json.loads(list(final_messages.values())[-1])
+                except json.JSONDecodeError as exc:
+                    raise AIError('AI_INVALID_PROPOSAL', 'Codex 返回的候选结果不是 JSON。') from exc
+                result = validate_proposal(value, allowed)
+                result['provider'] = {'kind': 'codex_app_server', 'thread_id': rpc.thread_id,
+                    'turn_id': rpc.turn_id, 'model': started.get('model', config.get('model')), 'recovery': recovery,
+                    'project_path':workspace}
+                if recovery == 'history_rebuilt':
+                    result['summary'] = '已根据软件保存的有限讨论记录恢复会话；当前业务事实已重新读取。\n\n' + result['summary']
+                rpc.turn_id = None
+                return result
+    except (KeyError, TypeError) as exc:
+        raise AIError('AI_PROTOCOL_ERROR', 'Codex 接口返回格式与当前适配器不兼容。') from exc
+    finally:
+        rpc.close()

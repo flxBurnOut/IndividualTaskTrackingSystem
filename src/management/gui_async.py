@@ -90,6 +90,8 @@ class ServiceBridge(QObject):
         self.mutation_thread.start()
 
     def query(self, name, callback=None, error=None, **params):
+        if name == 'get':
+            params.setdefault('display', True)
         return self._submit("query", name, params, callback, error)
 
     def command(self, name, payload, callback=None, error=None, **options):

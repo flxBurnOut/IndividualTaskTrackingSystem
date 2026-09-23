@@ -1,15 +1,21 @@
 """Today is only the selected day's plan, fixed events and attention items."""
 from __future__ import annotations
 from PySide6.QtCore import QDate, Qt, Signal
-from PySide6.QtWidgets import QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget, QSizePolicy
 from .gui_workspace import CountProgress, clear_layout, make_button, plain_label
 
 
 class TodayPage(QWidget):
     error = Signal(object)
     review_attention = Signal(bool)
-    def __init__(self, bridge, parent=None, on_plan=None, on_manual=None, on_review=None, on_task=None, on_changed=None, on_timetable=None):
+    def __init__(self, bridge, parent=None, on_plan=None, on_manual=None, on_review=None, on_task=None, on_changed=None, on_timetable=None, on_habits=None):
         super().__init__(parent)
+        self.dead = False
+        self.destroyed.connect(lambda *_: setattr(self, "dead", True))
+        self.review_saving = False
+        self.past_warnings = None
+        self.past_warning_offset = 0
+        self.past_expanded = False
         self.bridge, self.on_plan, self.on_manual, self.on_review, self.on_task = bridge, on_plan, on_manual, on_review, on_task
         self.on_changed = on_changed
         self.dialogs = []
@@ -27,6 +33,9 @@ class TodayPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(20)
+        self.date_heading = plain_label("", "TodayDateHeading")
+        font = self.date_heading.font(); font.setPointSize(22); font.setBold(True); self.date_heading.setFont(font)
+        outer.addWidget(self.date_heading)
         row = QHBoxLayout()
         previous = make_button("‹", lambda: self.date.setDate(self.date.date().addDays(-1)))
         previous.setFixedWidth(35)
@@ -50,6 +59,8 @@ class TodayPage(QWidget):
         self.plan_button = make_button("生成计划", self.request_plan, True)
         row.addWidget(self.plan_button)
         outer.addLayout(row)
+        self.habits_button=make_button('日常习惯 · 查看提醒、自动待办与安排偏好',lambda:on_habits() if on_habits else None)
+        self.habits_button.setObjectName('HabitsSummary');self.habits_button.setMinimumHeight(44);outer.addWidget(self.habits_button)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -79,7 +90,12 @@ class TodayPage(QWidget):
         self.body.addStretch()
         self.scroll.setWidget(body)
         outer.addWidget(self.scroll, 1)
+        self.update_date_heading()
         self.render_plan(None)
+
+    def update_date_heading(self):
+        day = self.date.date()
+        self.date_heading.setText(day.toString("yyyy 年 M 月 d 日") + "  ·  星期" + "一二三四五六日"[day.dayOfWeek()-1])
 
     def date_iso(self):
         return self.date.date().toString("yyyy-MM-dd")
@@ -92,19 +108,22 @@ class TodayPage(QWidget):
             self.refresh()
 
     def refresh(self, *_):
+        if self.dead: return
+        self.update_date_heading()
         self.generation += 1
         generation = self.generation
         day = self.date_iso()
         if self.warning_date != day:
             self.warning_date, self.warning_offset = day, 0
             self.tasks_offset = 0
+            self.past_warning_offset = 0; self.past_warnings = None; self.past_expanded = False
             self.daily_tasks_result = None
             clear_layout(self.tasks_layout)
         def failed(error):
-            if generation == self.generation:
+            if not self.dead and generation == self.generation:
                 self.error.emit(error)
         def review_loaded(result):
-            if generation != self.generation:
+            if self.dead or generation != self.generation:
                 return
             self.review_result = result
             self.has_plan = bool(result.get("has_plan"))
@@ -114,26 +133,34 @@ class TodayPage(QWidget):
             self.plan_button.setVisible(self.has_plan)
             self.render_plan(result)
         def today_loaded(result):
-            if generation != self.generation:
+            if self.dead or generation != self.generation:
                 return
             self.today_result = result
             self.render_events(result.get("events", []))
             self.render_attention()
         def warnings_loaded(result):
-            if generation != self.generation:
+            if self.dead or generation != self.generation:
                 return
+            if not result.get("items") and self.warning_offset and result.get("total", 0) <= self.warning_offset:
+                self.warning_offset = max(0, self.warning_offset - 3); self.refresh(); return
             self.warning_result = result
             self.render_attention()
         def tasks_loaded(result):
-            if generation != self.generation: return
+            if self.dead or generation != self.generation: return
             self.daily_tasks_result = result
             if not result.get("items") and self.tasks_offset and result.get("total", 0) <= self.tasks_offset:
                 self.tasks_offset = max(0, self.tasks_offset - 10); self.refresh(); return
             self.render_tasks(result)
+        def habits_loaded(result):
+            if not self.dead and generation==self.generation:
+                self.habits_button.setText('日常习惯 · '+result['summary_text']+'  ›')
+                self.habits_button.setToolTip(result.get('gap') or '查看实际作用、启用状态和下次触发时间。')
+        self.bridge.query('habits_overview',habits_loaded,failed,compact=True)
         self.bridge.query("daily_tasks", tasks_loaded, failed, date=day, limit=10, offset=self.tasks_offset)
         self.bridge.query("daily_review", review_loaded, failed, date=day)
         self.bridge.query("today", today_loaded, failed, date=day)
-        self.bridge.query("warnings", warnings_loaded, failed, date=day, limit=3, offset=self.warning_offset)
+        self.bridge.query("warnings", warnings_loaded, failed, date=day, limit=3, offset=self.warning_offset, group="current")
+        if self.past_expanded: self.load_past_warnings()
 
     def request_plan(self):
         if self.on_plan:
@@ -172,7 +199,7 @@ class TodayPage(QWidget):
             self.plan_layout.addSpacing(7)
             self.plan_layout.addWidget(self.progress)
         footer = QHBoxLayout()
-        footer.addWidget(plain_label("完成情况在复盘中统一确认。", "Quiet"), 1)
+        footer.addWidget(plain_label("直接标记即保存；每日复盘会同步显示同一份记录。", "Quiet"), 1)
         footer.addWidget(make_button("前往复盘", lambda: self.on_review(self.date_iso()) if self.on_review else None))
         self.plan_layout.addLayout(footer)
 
@@ -190,10 +217,10 @@ class TodayPage(QWidget):
         dot.setFixedWidth(18)
         layout.addWidget(dot)
         content = QVBoxLayout()
-        title = make_button(item.get("title", "计划事项"), lambda: self.on_task(item["target_id"]) if self.on_task else None)
-        title.setObjectName("TextLink")
+        title = make_button(item.get("display_title") or item.get("title", "计划事项"), lambda: self.on_task(item["target_id"]) if self.on_task else None)
+        title.setObjectName("TextLink"); title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred); title.setToolTip(item.get("display_title") or item.get("title", ""))
         content.addWidget(title)
-        details = []
+        details = [item["owner_label"]] if item.get("owner_label") else []
         if item.get("target_archived"):
             details.append("已删除 · 保留原计划记录")
         if item.get("completion_gate"):
@@ -204,8 +231,34 @@ class TodayPage(QWidget):
             content.addWidget(plain_label(" · ".join(details), "Quiet"))
         layout.addLayout(content, 1)
         result = item.get("result")
-        layout.addWidget(plain_label({"done": "已完成", "incomplete": "未完成"}.get(result, "已删除" if item.get("target_archived") else "尚未反馈"), "StatusPill"))
+        choices = QHBoxLayout()
+        for value, caption in (("done", "已完成" if result == "done" else "完成"), ("incomplete", "未完成")):
+            choice = make_button(caption, lambda _, i=item, v=value: self.complete_plan_item(i, v))
+            choice.setCheckable(True); choice.setChecked(result == value); choice.setObjectName("ReviewChoice")
+            choice.setProperty("result", value)
+            choice.setEnabled(not self.review_saving and not item.get("target_archived") and item.get("can_review", True) and result != value)
+            choice.setAccessibleName((item.get("owner_label", "") + " " + item.get("title", "事项") + "：" + caption).strip())
+            choices.addWidget(choice)
+        layout.addLayout(choices)
         return row
+
+    def complete_plan_item(self, item, result):
+        if self.dead or self.review_saving or not item.get("can_review", True) or item.get("target_archived"): return
+        snapshot = self.review_result or {}; plan = snapshot.get("plan")
+        if not plan or item.get("result") == result: return
+        day = self.date_iso(); self.review_saving = True; self.render_plan(snapshot)
+        payload = {"date": day, "plan_id": plan["id"], "plan_version": plan["version"], "answers": [{"target_id": item["target_id"], "result": result}]}
+        options = {("expected_revision" if k == "revision" else k): snapshot[k] for k in ("epoch", "revision") if snapshot.get(k) is not None}
+        def saved(receipt):
+            self.review_saving = False
+            if self.dead: return
+            self.refresh()
+            if self.on_changed: self.on_changed(receipt)
+        def failed(error):
+            self.review_saving = False
+            if self.dead: return
+            self.refresh(); self.error.emit(error)
+        self.bridge.command("submit_daily_review", payload, saved, failed, **options)
 
     def render_events(self, events):
         clear_layout(self.events_layout)
@@ -214,12 +267,13 @@ class TodayPage(QWidget):
             self.events_layout.addWidget(plain_label("这一天没有已登记的固定安排。", "Quiet"))
             return
         for event in events:
-            data = event.get("data", event)
+            from .dashboard import projected_event_times
+            data = event.get("effective") or event.get("data", event)
             row = QFrame()
             row.setObjectName("EventRow")
             layout = QHBoxLayout(row)
             layout.setContentsMargins(17, 13, 17, 13)
-            start, end = data.get("start"), data.get("end")
+            start, end = projected_event_times(event)
             time = f"{start} – {end}" if start and end else "时间待确认"
             clock = plain_label(time, "TimeLabel")
             clock.setFixedWidth(130)
@@ -227,7 +281,7 @@ class TodayPage(QWidget):
             layout.addWidget(plain_label(event.get("title", "固定安排")), 1)
             if data.get("location"):
                 layout.addWidget(plain_label(str(data["location"]), "Quiet"))
-            if event.get("id"): layout.addWidget(make_button("固定准备事项", lambda _, item=event: self.open_recurring(item)))
+            if event.get("id"): layout.addWidget(make_button("自动生成准备待办", lambda _, item=event: self.open_recurring(item)))
             self.events_layout.addWidget(row)
 
     def render_tasks(self, result):
@@ -238,10 +292,14 @@ class TodayPage(QWidget):
             self.tasks_layout.addWidget(plain_label("没有尚未排入当天计划的日期相关任务。其他课程任务仍可从项目与课程查看。", "Quiet"))
         day = result.get("date") or self.date_iso()
         snapshot = result.get("plan")
+        group_label = None
         for task in result.get("items", []):
+            owner = task.get("owner_label") or "未归属"
+            if owner != group_label:
+                group_label = owner; self.tasks_layout.addWidget(plain_label(owner, "SectionHeading"))
             row = QFrame(); row.setObjectName("TaskRow"); inner = QHBoxLayout(row); inner.setContentsMargins(16, 13, 16, 13)
-            words = QVBoxLayout(); title = make_button(task["title"], lambda _, identifier=task["id"]: self.on_task(identifier) if self.on_task else None); title.setObjectName("TextLink"); words.addWidget(title)
-            words.addWidget(plain_label(task.get("reason") or "日期相关待办", "Quiet"))
+            words = QVBoxLayout(); title = make_button(task.get("display_title") or task["title"], lambda _, identifier=task["id"]: self.on_task(identifier) if self.on_task else None); title.setObjectName("TextLink"); title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred); title.setToolTip(task.get("display_title") or task["title"]); words.addWidget(title)
+            words.addWidget(plain_label(" · ".join(x for x in (task.get("candidate_date"), task.get("reason") or "日期相关待办") if x), "Quiet"))
             if task.get("data", {}).get("completion_gate"): words.addWidget(plain_label(str(task["data"]["completion_gate"]), "Quiet"))
             inner.addLayout(words, 1)
             add = make_button("加入这天计划", lambda _, item=task, d=day, p=snapshot: self.add_task(item, d, p))
@@ -261,10 +319,14 @@ class TodayPage(QWidget):
         if self.daily_tasks_result: self.render_tasks(self.daily_tasks_result)
         payload = {"date": day, "target_id": task["id"], "plan_id": plan["id"] if plan else None, "plan_version": plan["version"] if plan else None}
         def saved(receipt):
-            self.pending_targets.discard(key); self.refresh()
+            self.pending_targets.discard(key)
+            if self.dead: return
+            self.refresh()
             if self.on_changed: self.on_changed(receipt)
         def failed(error):
-            self.pending_targets.discard(key); self.refresh(); self.error.emit(error)
+            self.pending_targets.discard(key)
+            if self.dead: return
+            self.refresh(); self.error.emit(error)
         self.bridge.command("add_to_plan", payload, saved, failed)
 
     def open_recurring(self, anchor):
@@ -272,73 +334,75 @@ class TodayPage(QWidget):
         dialog = RecurringDialog(self.bridge, anchor, self, lambda receipt: (self.refresh(), self.on_changed(receipt) if self.on_changed else None))
         self.dialogs.append(dialog); dialog.finished.connect(lambda _: self.dialogs.remove(dialog) if dialog in self.dialogs else None); dialog.open()
 
+    def warning_card(self, item, past=False):
+        card = QFrame(); card.setObjectName("AttentionCard" if past else "CurrentWarningCard")
+        layout = QVBoxLayout(card); layout.setContentsMargins(17, 13, 17, 13)
+        title = item.get("title") or item.get("message") or "需要核对"
+        owner = item.get("owner_label")
+        layout.addWidget(plain_label((owner + " · " if owner and owner not in title else "") + str(title), "AttentionTitle" if past else "CurrentWarningTitle"))
+        detail = item.get("reason") or item.get("message") or item.get("description") or ""
+        if detail and detail != title: layout.addWidget(plain_label(str(detail), "AttentionText"))
+        return card
+
     def render_attention(self):
+        if self.dead: return
         clear_layout(self.attention_layout)
-        notices = []
-        for item in (self.warning_result or {}).get("items", []):
-            title = item.get("title") or item.get("message") or "需要核对"
-            detail = item.get("reason") or item.get("message") or item.get("description") or ""
-            notices.append((str(title), str(detail)))
+        result = self.warning_result or {}; notices = result.get("items", [])
+        past_count = result.get("counts", {}).get("past", 0)
+        reminders = (self.today_result or {}).get("notifications", [])
         unknowns = (self.today_result or {}).get("unknowns", [])
+        self.attention_box.setVisible(bool(notices or reminders or unknowns or past_count))
+        if self.body.indexOf(self.attention_box) != 0:
+            self.body.removeWidget(self.attention_box); self.body.insertWidget(0, self.attention_box)
+        if notices:
+            self.attention_layout.addWidget(plain_label("● 当前警戒 · 即将到来的事项", "CurrentWarningTitle"))
+            for item in notices: self.attention_layout.addWidget(self.warning_card(item))
+            total = result.get("total", 0)
+            if total > 3:
+                row = QHBoxLayout(); row.addWidget(plain_label(f"当前警戒 {self.warning_offset + 1}–{self.warning_offset + len(notices)} / {total} 条", "Quiet"), 1)
+                previous = make_button("上一页警戒", lambda: self.set_warning_page(max(0, self.warning_offset - 3))); previous.setEnabled(self.warning_offset > 0); row.addWidget(previous)
+                following = make_button("更多警戒", lambda: self.set_warning_page(result.get("next_offset"))); following.setEnabled(result.get("next_offset") is not None); row.addWidget(following); self.attention_layout.addLayout(row)
+        if past_count:
+            toggle = make_button(f"已过节点的警戒（{past_count}） · " + ("收起" if self.past_expanded else "展开"), self.toggle_past_warnings)
+            toggle.setObjectName("CompletedTasksToggle"); self.attention_layout.addWidget(toggle)
+            if self.past_expanded:
+                self.attention_layout.addWidget(plain_label("仅按节点时间折叠，未将这些事项判为完成。", "Quiet"))
+                if self.past_warnings is None: self.attention_layout.addWidget(plain_label("正在读取历史警戒…", "Quiet"))
+                else:
+                    for item in self.past_warnings.get("items", []): self.attention_layout.addWidget(self.warning_card(item, True))
+                    if self.past_warning_offset or self.past_warnings.get("next_offset") is not None:
+                        row = QHBoxLayout(); previous = make_button("上一页历史", lambda: self.page_past_warnings(max(0, self.past_warning_offset-5))); previous.setEnabled(self.past_warning_offset>0); row.addWidget(previous)
+                        following = make_button("下一页历史", lambda: self.page_past_warnings(self.past_warnings.get("next_offset"))); following.setEnabled(self.past_warnings.get("next_offset") is not None); row.addWidget(following); self.attention_layout.addLayout(row)
         for item in unknowns[:2]:
             text = item if isinstance(item, str) else item.get("message", item.get("reason", "部分时间信息尚待确认"))
-            if text and not any(text in detail for _, detail in notices):
-                notices.append(("安排前需要确认", str(text)))
-        reminders = (self.today_result or {}).get("notifications", [])
-        if not notices and not reminders:
-            self.attention_box.hide()
-            return
-        self.attention_box.show()
-        desired_index = 0 if reminders else 3
-        if self.body.indexOf(self.attention_box) != desired_index:
-            self.body.removeWidget(self.attention_box)
-            self.body.insertWidget(desired_index, self.attention_box)
-        self.attention_layout.addWidget(plain_label("需要留意", "SectionHeading"))
-        visible_reminders = reminders if self.show_all_reminders else reminders[:3]
-        for reminder in visible_reminders:
-            data = reminder.get("data", {})
-            card = QFrame()
-            card.setObjectName("AttentionCard")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(17, 13, 17, 13)
+            if text: self.attention_layout.addWidget(plain_label("待确认 · " + str(text), "Quiet"))
+        for reminder in (reminders if self.show_all_reminders else reminders[:3]):
+            data = reminder.get("data", {}); card = QFrame(); card.setObjectName("AttentionCard"); layout = QVBoxLayout(card); layout.setContentsMargins(17, 13, 17, 13)
             heading = reminder.get("title", "复盘提醒")
-            if data.get("business_date") and data["business_date"] != self.date_iso():
-                heading += " · " + data["business_date"]
-            layout.addWidget(plain_label(heading, "AttentionTitle"))
-            layout.addWidget(plain_label(data.get("content", ""), "AttentionText"))
-            actions = QHBoxLayout()
-            mode = data.get("review_mode")
+            if data.get("business_date") and data["business_date"] != self.date_iso(): heading += " · " + data["business_date"]
+            layout.addWidget(plain_label(heading, "AttentionTitle")); layout.addWidget(plain_label(data.get("content", ""), "AttentionText")); actions = QHBoxLayout(); mode = data.get("review_mode")
             if mode in ("daily", "weekly"):
-                day = data.get("business_date") or self.date_iso()
-                actions.addWidget(make_button("查看每周回顾" if mode == "weekly" else "前往每日复盘", lambda checked=False, d=day, m=mode: self.on_review(d, m) if self.on_review else None))
-            actions.addStretch()
-            actions.addWidget(make_button("知道了", lambda checked=False, item=reminder: self.mark_reminder_seen(item)))
-            layout.addLayout(actions)
-            self.attention_layout.addWidget(card)
-        if len(reminders) > 3 and not self.show_all_reminders:
-            self.attention_layout.addWidget(make_button(f"展开其余 {len(reminders) - 3} 条近期提醒", self.expand_reminders))
-        for title, detail in notices[:4]:
-            card = QFrame()
-            card.setObjectName("AttentionCard")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(17, 13, 17, 13)
-            layout.addWidget(plain_label(title, "AttentionTitle"))
-            if detail and detail != title:
-                layout.addWidget(plain_label(detail, "AttentionText"))
-            self.attention_layout.addWidget(card)
-        total = (self.warning_result or {}).get("total", 0)
-        if total > 3:
-            row = QHBoxLayout()
-            returned = len((self.warning_result or {}).get("items", []))
-            row.addWidget(plain_label(f"警戒 {self.warning_offset + 1}–{self.warning_offset + returned} / {total} 条", "Quiet"), 1)
-            previous = make_button("上一页警戒", lambda: self.set_warning_page(max(0, self.warning_offset - 3)))
-            previous.setEnabled(self.warning_offset > 0)
-            row.addWidget(previous)
-            next_offset = (self.warning_result or {}).get("next_offset")
-            following = make_button("更多警戒" if self.warning_offset == 0 else "下一页警戒", lambda: self.set_warning_page(next_offset))
-            following.setEnabled(next_offset is not None)
-            row.addWidget(following)
-            self.attention_layout.addLayout(row)
+                day = data.get("business_date") or self.date_iso(); actions.addWidget(make_button("查看每周回顾" if mode == "weekly" else "前往每日复盘", lambda checked=False, d=day, m=mode: self.on_review(d, m) if self.on_review else None))
+            actions.addStretch(); actions.addWidget(make_button("知道了", lambda checked=False, item=reminder: self.mark_reminder_seen(item))); layout.addLayout(actions); self.attention_layout.addWidget(card)
+        if len(reminders)>3 and not self.show_all_reminders: self.attention_layout.addWidget(make_button(f"展开其余 {len(reminders)-3} 条近期提醒", self.expand_reminders))
+
+    def toggle_past_warnings(self):
+        self.past_expanded = not self.past_expanded
+        self.render_attention()
+        if self.past_expanded and self.past_warnings is None: self.load_past_warnings()
+
+    def page_past_warnings(self, offset):
+        if offset is None: return
+        self.past_warning_offset = offset; self.past_warnings = None; self.render_attention(); self.load_past_warnings()
+
+    def load_past_warnings(self):
+        generation, offset = self.generation, self.past_warning_offset
+        def loaded(result):
+            if self.dead or generation != self.generation or offset != self.past_warning_offset: return
+            self.past_warnings = result; self.render_attention()
+        def failed(error):
+            if not self.dead and generation == self.generation: self.error.emit(error)
+        self.bridge.query("warnings", loaded, failed, date=self.date_iso(), group="past", limit=5, offset=offset)
 
     def set_warning_page(self, offset):
         if offset is not None:

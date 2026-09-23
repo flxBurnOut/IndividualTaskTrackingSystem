@@ -166,13 +166,18 @@ def prepare(core,p):
             row=c.execute("SELECT * FROM entities WHERE type='asset' AND archived=0 AND json_extract(data,'$.source_kind')=? AND json_extract(data,'$.sha256')=? AND json_extract(data,'$.source_owner_id') IS ? AND json_extract(data,'$.source_identity')=? LIMIT 1",(kind,metadata['sha256'],p.get('owner_id'),identity)).fetchone()
             if row:
                 existing=core.store.entity(row)
+                from .library import materialize
+                materialize(core,existing)
                 return {'existing_id':existing['id'],'data':existing['data'],'title':existing['title']}
         try:
             extraction,derived=extract(core,metadata,name,root,layout_mode='timetable' if owner and owner['type']=='timetable' else None)
         except (ResourceError,BusinessError,OSError) as error:
             extraction={'status':'failed','coverage':{'complete':False},'warnings':['原件已保存，自动读取未完成：'+str(error)[:300]],'text_sha256':None,'images':[],'characters':0};derived=[]
         data={**metadata,'original_name':name,'source_kind':kind,'source_owner_id':p.get('owner_id'),'managed_copy':True,'source_identity':identity,'source_url':source_url,'original_path':source_path,'captured_at':now(),'extraction':extraction,'entries':[{'path':name,'sha256':metadata['sha256'],'size':metadata['size']},*derived]}
-        return {'data':data,'title':p.get('title') or (source_url[:300] if kind=='web' else name)}
+        from .library import prepare as prepare_original
+        published=prepare_original(core,data,name,p.get('owner_id'))
+        data['library_relative_path']=published['relative_path']
+        return {'data':data,'library':published,'title':p.get('title') or (source_url[:300] if kind=='web' else name)}
 
 
 def add(core,c,p,rid,prepared):
@@ -181,6 +186,9 @@ def add(core,c,p,rid,prepared):
     if row:return {'entity':core.store.entity(row),'reused':True,'extraction':data['extraction']}
     entity=core._create(c,{'type':'asset','title':prepared['title'],'data':data},rid)
     if owner:core._dispatch(c,'link',{'source_id':owner['id'],'target_id':entity['id'],'kind':'uses'},rid)
+    if prepared.get('library'):
+        from .library import register
+        register(c,entity,prepared['library'])
     return {'entity':entity,'reused':False,'extraction':data['extraction']}
 
 
@@ -215,8 +223,8 @@ def prepare_context(core,p):
         ids=list(dict.fromkeys(selected if 'source_ids' in p else previous))
         if 'source_ids' not in p and conversation is None and owner:
             available=list_sources(core,c,{'owner_id':owner,'limit':MAX_SOURCES+1})
-            if available['total']>MAX_SOURCES:raise BusinessError('source_limit','此课程资料超过12份，请在附件中选择本次需要整理的资料。')
-            ids=[x['id'] for x in available['items']]
+            # Bulk collections require explicit attachments, but normal discussion remains available.
+            ids=[x['id'] for x in available['items']] if available['total']<=MAX_SOURCES else []
         if len(ids)>MAX_SOURCES:raise BusinessError('source_limit','本次讨论累计资料超过12份，请分批另开资料范围。')
         entities=[core.store.get(c,i) for i in ids]
     materials=[];images=[];versions={};total=0
@@ -250,6 +258,10 @@ def apply_source_action(core,c,job,action,rid):
     value=json.loads(job['input']) if isinstance(job.get('input'),str) else job.get('input') or {}
     scope=value.get('conversation_scope') or {}
     payload=action['payload']
+    if action['command']=='correct_recovery_scope' and scope.get('kind')=='course':
+        from .catchup import _belongs
+        if not _belongs(core,c,core.store.get(c,payload.get('id')),scope['entity_id']):
+            raise BusinessError('course_scope','范围更正只能修改当前课程的补欠任务。')
     if scope.get('kind') == 'timetable':
         if action['command'] != 'apply_timetable' or payload.get('id') != scope['entity_id']:
             raise BusinessError('timetable_scope', '课表整理候选只能更新当前课表，请核对后重新生成。')

@@ -11,6 +11,7 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=default_data_dir())
     parser.add_argument('--verify-ui', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--choose-data', action='store_true')
+    parser.add_argument('--install-shortcuts', action='store_true', help='为所选数据空间创建桌面与开始菜单快捷方式')
     parser.add_argument('--service', action='store_true')
     parser.add_argument('--bootstrap-service', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
@@ -47,6 +48,20 @@ def main():
         if selected is None:
             return 0
         args.data_dir = selected
+    if args.install_shortcuts:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from .branding import set_windows_identity, configure_application
+        from .shortcuts import install_shortcuts
+        set_windows_identity()
+        app = QApplication.instance() or QApplication([])
+        configure_application(app)
+        try:
+            result = install_shortcuts(args.data_dir)
+        except Exception as error:
+            QMessageBox.warning(None, '创建快捷方式', str(error))
+            return 1
+        QMessageBox.information(None, '快捷方式已创建', '桌面和开始菜单中都可以找到“个人事务管理”。\n\n打开的数据空间：'+result['data_dir'])
+        return 0
     from .gui import run
     return run(args.data_dir)
 

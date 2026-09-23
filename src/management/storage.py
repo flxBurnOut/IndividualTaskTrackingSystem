@@ -104,6 +104,8 @@ class Store:
                     schedule_id TEXT NOT NULL,occurrence TEXT NOT NULL,job_id TEXT,
                     created_at TEXT NOT NULL,PRIMARY KEY(schedule_id,occurrence));
             """)
+            from .library import initialize as initialize_library
+            initialize_library(c)
             from .conversations import initialize
             initialize(c)
             from .recurring import initialize as initialize_recurring

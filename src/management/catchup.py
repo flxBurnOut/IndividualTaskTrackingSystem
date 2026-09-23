@@ -112,6 +112,10 @@ def _project(core, c, task, as_of):
         issues.append('已补量大于当前总量，需要核对；未截断成 100%。')
     completion = confirmation['data']['dimensions'].get('completion') if confirmation else None
     confirmed = completion == 'done' and bool(str(confirmation['data'].get('source_text') or '').strip()) if confirmation else False
+    scope_version=d.get('catchup_scope_version',0)
+    if scope_version and (not confirmation or confirmation['data'].get('target_version',0)<scope_version or confirmation['data'].get('business_date','')<d.get('catchup_scope_correction',{}).get('business_date','') or completion in (None,'unknown')):
+        completion=None;confirmed=False
+        issues.append('补欠范围已更正；旧范围的完成反馈不代表当前范围，当前完成情况待确认。')
     gate = d.get('completion_gate') or ''
     if confirmed and not str(gate).strip():
         confirmed = False
@@ -177,9 +181,25 @@ def recovery_summary(core, c, p):
     if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
         raise BusinessError('validation', '分页范围需要 1 到 100 项，起点不能为负。')
     as_of = _day(p.get('as_of'), core.today(c))
+    open_only = p.get('open_only', False)
+    if type(open_only) is not bool:
+        raise BusinessError('validation', '未完成筛选需要布尔值。')
+    completed_ids = set()
+    if open_only:
+        from .task_views import rows_sql
+        scope = "(json_extract(e.data,'$.catchup_enabled')=1 OR json_extract(e.data,'$.task_kind')='catchup')"
+        args = []
+        if p.get('course_id'):
+            scope += ' AND e.id IN (WITH RECURSIVE scope(id) AS (SELECT ? UNION SELECT child.id FROM entities child JOIN scope ON child.parent_id=scope.id) SELECT id FROM scope)'
+            args.append(p['course_id'])
+        if p.get('task_id'):
+            scope += ' AND e.id=?';args.append(p['task_id'])
+        completed_ids = {row['id'] for row in c.execute("SELECT id FROM ("+rows_sql(scope)+") WHERE completion_state='done'", args)}
     metrics = Counter({'total_tasks':0, 'active_tasks':0, 'cancelled_tasks':0, 'completion_confirmed':0,
                        'quantity_unknown':0, 'total_unknown':0, 'awaiting_confirmation':0})
-    groups, items, total = {}, [], 0
+    from .presentation import Presenter
+    presenter=Presenter(core,c)
+    groups, items, total, completed_hidden = {}, [], 0, 0
     for task in _rows(core, c, p.get('course_id'), p.get('task_id')):
         progress = _project(core, c, task, as_of)
         metrics['total_tasks'] += 1
@@ -201,8 +221,12 @@ def recovery_summary(core, c, p):
                 else:
                     group[sum_key] += progress[quantity_key]
                     group[known_key] += 1
+        # Filter before paging, without changing historical quantity aggregates.
+        if task['id'] in completed_ids:
+            completed_hidden += 1
+            continue
         if offset <= total < offset + limit:
-            items.append({**task, 'progress':progress})
+            items.append({**presenter.entity(task), 'progress':progress})
         total += 1
     for group in groups.values():
         if not group['completed_known_tasks']:
@@ -215,6 +239,7 @@ def recovery_summary(core, c, p):
         group['coverage_complete'] = complete
     return {'course_id':p.get('course_id'), 'task_id':p.get('task_id'), 'as_of':as_of, 'items':items, 'metrics':dict(metrics), 'groups':list(groups.values()),
             'total':total, 'next_offset':offset+len(items) if offset+len(items)<total else None,
+            'completed_hidden':completed_hidden,
             'coverage':{'metrics_complete':True,'returned':len(items),'total':total,'cancelled_excluded_from_quantities':True},
             'unknowns':['不同单位分别汇总；数量比例不是工作量比例，也不是掌握、提交或出勤比例。','补完只来自明确完成反馈，数量达到总量不会自动确认。','查询不会建立待补任务，也不会安排每日计划。']}
 
@@ -401,3 +426,60 @@ def record_recovery_progress(core, c, p, rid):
     # overwrites an independent completion result nor invents another dimension.
     feedback = core._create(c,{'type':'feedback','title':(day+' · 补课进展 · '+task['title'])[:300],'data':data},rid)
     return {'entity':task,'feedback':feedback,'reused':False,'progress':_project(core,c,task,core.today(c))}
+
+def correct_recovery_scope(core,c,p,rid):
+    """Correct an imported catch-up scope without reusing old completion facts.
+
+    This deliberately refuses any historical measured quantity. Replacing a
+    measured learning scope requires a distinct task so its units cannot drift.
+    """
+    allowed={'id','version','title','completion_gate','lesson_key','source_text','correction_reason','business_date','total_quantity'}
+    if set(p)-allowed:
+        raise BusinessError('validation','范围更正仅接受任务标识、版本、明确范围、来源和更正原因。')
+    old=core._versioned(c,{'id':p.get('id'),'version':p.get('version')})
+    if not _is_recovery(old) or old['archived'] or old['status'] in {'cancelled','draft'}:
+        raise BusinessError('recovery_task','请选择仍可更正的待补任务。')
+    core._ensure_mutable(c,old)
+    title=_text(p.get('title'),'事项名称',300)
+    gate=_text(p.get('completion_gate'),'完成条件')
+    lesson_key=_text(p.get('lesson_key'),'学习单元标识',200)
+    source=_text(p.get('source_text'),'来源')
+    reason=_text(p.get('correction_reason'),'范围更正原因',2000)
+    day=_day(p.get('business_date'),core.today(c))
+    if day>core.today(c):
+        raise BusinessError('recovery_scope_date','范围更正不能预先写成未来已生效。')
+    d=copy.deepcopy(old['data'])
+    if (title,gate,lesson_key)==(old['title'],d.get('completion_gate'),d.get('catchup_lesson_key')):
+        return {'entity':old,'reused':True,'feedback':None,'progress':_project(core,c,old,day)}
+    measured=c.execute("""SELECT id FROM entities WHERE type='feedback'
+        AND json_extract(data,'$.target_id')=?
+        AND json_extract(data,'$.catchup_progress.completed_quantity') IS NOT NULL LIMIT 1""",(old['id'],)).fetchone()
+    if measured:
+        raise BusinessError('recovery_scope_has_quantities','该任务已经记录过明确累计数量。请为新范围建立独立待补任务，保留原任务及进度，不能换范围后复用旧数量。',{'feedback_id':measured['id']})
+    future=c.execute("""SELECT id FROM entities WHERE type='feedback' AND archived=0
+        AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.business_date')>?
+        AND json_type(data,'$.dimensions.completion') IS NOT NULL LIMIT 1""",(old['id'],day)).fetchone()
+    if future:
+        raise BusinessError('recovery_scope_date','更正日期之后已有完成反馈，请先核对其业务日期和适用范围。',{'feedback_id':future['id']})
+    from .presentation import Presenter
+    course=Presenter(core,c).owner(old)
+    if not course or course['type']!='course':
+        raise BusinessError('scope_type','待补事项需要保留一门明确课程归属。')
+    key=_key(course['id'],title,lesson_key)
+    for candidate in _rows(core,c,course['id']):
+        if candidate['id']!=old['id'] and candidate['data'].get('catchup_key')==key:
+            raise BusinessError('recovery_exists','同一课程已有此学习单元的待补记录，请使用已有记录，避免重复。',{'id':candidate['id'],'version':candidate['version']})
+    total=_number(p.get('total_quantity'),'新范围总量')
+    previous={'title':old['title'],'completion_gate':d.get('completion_gate'),'lesson_key':d.get('catchup_lesson_key'),
+              'total_quantity':d.get('catchup_total_quantity'),'topic_ids':d.get('catchup_topic_ids',[]),'lesson_topics':d.get('catchup_lesson_topics',[])}
+    d.update(completion_gate=gate,catchup_lesson_key=lesson_key,catchup_key=key,catchup_source_text=source,
+             catchup_total_quantity=total,catchup_topic_ids=[],catchup_lesson_topics=[],catchup_scope_version=old['version']+1,
+             catchup_scope_correction={'previous_scope':previous,'source_text':source,'reason':reason,'recorded_at':now(),
+                'business_date':day,'previous_version':old['version'],'completion_reset_to':'unknown'})
+    updated={**old,'title':title,'status':'pending' if old['status']=='done' else old['status'],'data':d}
+    core._validate(c,updated)
+    entity=core._save(c,old,updated,rid,'correct_recovery_scope')
+    feedback=core.feedback(c,{'target_id':entity['id'],'business_date':day,'dimensions':{'completion':'unknown'},
+        'source_text':'范围更正：'+reason+'。新范围的完成情况待确认，旧完成记录不沿用。依据：'+source},rid)
+    return {'entity':entity,'reused':False,'feedback':feedback,'progress':_project(core,c,entity,day),
+            'warnings':['旧任务、反馈及原范围审计保留；当前总量仅采用本次明确提供的新范围总量。']}

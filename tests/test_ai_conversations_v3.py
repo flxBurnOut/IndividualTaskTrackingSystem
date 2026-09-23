@@ -53,6 +53,7 @@ def rpc(monkeypatch):
 def request(**extra):
     return {'prompt': 'Synthetic current request', 'context': {'facts': 'current'}, 'conversation_id': 'software-scope-1',
             'conversation_scope': {'kind': 'course', 'entity_id': 'course-1'},
+            'provider_project_path':str(ai.project_directory({})),
             'history': {'messages': [{'role': 'assistant', 'text': 'Old discussion, not a fact', 'state': 'completed', 'proposal_state': 'superseded'}], 'older_messages_omitted': False}, **extra}
 
 
@@ -87,7 +88,7 @@ def test_missing_provider_thread_rebuilds_once_from_software_history(rpc, monkey
     monkeypatch.setattr(RPC, 'resume_error', 'AI_REQUEST_REJECTED')
     result = ai.generate(request(provider_thread_id='unavailable'), {'enabled': True}, threading.Event())
     instance = rpc.instances[-1]
-    assert [name for name, p in instance.requests] == ['initialize', 'thread/resume', 'thread/start', 'turn/start']
+    assert [name for name, p in instance.requests] == ['initialize', 'thread/resume', 'thread/start', 'thread/name/set', 'turn/start']
     assert result['provider']['recovery'] == 'history_rebuilt'
     assert result['provider']['thread_id'] == 'new-provider-thread'
     content = json.loads(instance.requests[-1][1]['input'][0]['text'])
@@ -127,3 +128,17 @@ def test_large_fallback_context_rejected_before_spawn(rpc):
         ai.generate(request(history={'messages': [{'role': 'user', 'text': 'x' * ai.MAX_CONTEXT_BYTES}]}, provider_thread_id='exists'), {'enabled': True}, threading.Event())
     assert error.value.code == 'AI_CONTEXT_LIMIT'
     assert len(rpc.instances) == before
+
+
+def test_registered_workspace_binds_new_and_resumed_software_tasks(rpc, tmp_path):
+    from management.codex_project import _save_binding
+    workspace=tmp_path/'Codex事务助手';workspace.mkdir()
+    _save_binding(workspace,{'status':'ready','workspace':str(workspace),'project_id':'registered-project'})
+    settings={'ai':{'enabled':True},'_codex_project_dir':str(workspace)}
+    ai.generate(request(provider_project_path=str(workspace)), settings, threading.Event())
+    calls=rpc.instances[-1].requests
+    assert next(p for m,p in calls if m=='thread/start')['projectId']=='registered-project'
+    ai.generate(request(provider_project_path=str(workspace),provider_thread_id='old-thread'), settings, threading.Event())
+    calls=rpc.instances[-1].requests
+    assert ('thread/metadata/update',{'threadId':'old-thread','projectId':'registered-project'}) in calls
+    assert not any(m=='thread/start' for m,p in calls)

@@ -12,7 +12,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.7') / 'PersonalManagementService.exe'
+EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.11.2') / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
 
 async def main():
@@ -54,6 +54,15 @@ async def main():
                 response = await session.call_tool('query_business', {'name':'state','params':{}})
                 assert not response.is_error, response
         assert client.state()['counts'] == {}
+        habit_state=client.state()
+        habits=client.query('habits_overview')
+        assert habits['summary']['preparation_total']==0 and not habits['reminders']['daily']['enabled']
+        assert habits['rules']['total']==0 and client.state()==habit_state
+        report['habits_readonly_empty']=True
+        home=client.query('dashboard',date='2030-01-01')
+        assert home['weekday']=='星期二' and len(home['days'])==7 and home['tasks']['total']==0
+        assert client.state()==habit_state
+        report['dashboard_readonly']=True
         state = client.state()
         assert client.query('daily_review',date='2030-01-01')['needs_codex']
         target=client.command('create',{'type':'task','title':'Synthetic packaged task'})['result']['entity']
@@ -71,12 +80,22 @@ async def main():
         client.command('set_review_preferences',prefs)
         assert client.query('list',type='schedule')['total']==2
         report['structured_review_and_settings']={'explicit_incomplete':True,'duplicate_feedback':False,'duplicate_reminders':False,'no_generated_checkins':True}
+        quick=client.command('set_task_completion',{'target_id':target['id'],'target_version':target['version'],'business_date':'2030-01-01','result':'done'})
+        assert client.query('daily_review',date='2030-01-01')['summary']['done']==1
+        current=client.query('get',id=target['id'])['entity']
+        client.command('set_task_completion',{'target_id':target['id'],'target_version':current['version'],'business_date':'2030-01-01','result':'incomplete'})
+        assert client.query('daily_review',date='2030-01-01')['summary']['incomplete']==1
+        report['quick_completion_review_link']=True
         owner=client.command('create',{'type':'course','title':'Synthetic packaged course'})['result']['entity']
         source_path=root/'synthetic-source.txt';source_path.write_text('Final exam 60 percent. Coursework 40 percent.',encoding='utf-8')
         source=client.command('add_source',{'owner_id':owner['id'],'kind':'file','path':str(source_path)})['result']['entity']
         source_path.unlink()
         assert 'Final exam' in client.query('source_content',id=source['id'])['text']
-        assert client.query('open_resource',id=source['id'])['exists']
+        readable=client.query('open_resource',id=source['id'])
+        assert readable['exists'] and '原文件' in Path(readable['path']).parts
+        folder=client.query('library_folder',owner_id=owner['id'])
+        assert not folder['issues'] and Path(readable['path']).parent==Path(folder['path'])
+        report['readable_originals']={'managed_original_exists':True,'owner_folder_exists':Path(folder['path']).is_dir(),'external_source_required':False}
         from PIL import Image
         scan_path=root/'synthetic-scan.pdf';Image.new('RGB',(200,280),'white').save(scan_path,'PDF')
         scan=client.command('add_source',{'owner_id':owner['id'],'kind':'file','path':str(scan_path)})['result']['entity']
@@ -95,6 +114,10 @@ async def main():
         assert client.query('daily_review',date='2030-01-07')['summary']['unreported']==1
         assert client.query('recurring_rules',anchor_id=anchor['id'])['total']==1
         report['recurring_daily_flow']={'one_task_per_occurrence':True,'no_implicit_plan':True,'explicit_plan_then_review':True}
+        habit_state=client.state();habits=client.query('habits_overview')
+        assert habits['summary']['preparation_total']==1 and habits['preparations']['items'][0]['id']==rule['id']
+        assert not habits['reminders']['daily']['enabled'] and client.state()==habit_state
+        report['habits_readonly_configured']=True
         table=client.command('apply_timetable',{'title':'Synthetic packaged timetable','semester_start':'2030-01-07','semester_end':'2030-02-10','timezone':'Asia/Shanghai','week_numbering':'teaching','recess_weeks':['2030-01-21'],'source_text':'Synthetic user-confirmed course schedule','rows':[{'key':'lab','title':'Synthetic even-week lab','weekday':2,'start':'14:00','end':'16:00','teaching_weeks':[2,4],'owner_id':owner['id']}]})['result']
         event_id=table['rows'][0]['id']
         assert not any(e['id']==event_id for e in client.query('plan_context',date='2030-01-09')['hard_events'])

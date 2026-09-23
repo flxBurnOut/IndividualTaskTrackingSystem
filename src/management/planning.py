@@ -243,16 +243,21 @@ def warning_scan(core, c, day):
         return []
     scope, feedback = _Scope(core, c), _event_feedback(c)
     zone = ZoneInfo(core.store.meta(c, 'settings')['timezone'])
+    from .presentation import Presenter
+    from .daily_flow import completed_on_or_before
+    presenter=Presenter(core,c)
     risks = []
-    rows = c.execute("SELECT * FROM entities WHERE type IN ('task','project','assessment','milestone','event') AND archived=0 AND status NOT IN ('done','cancelled','draft')")
+    rows = c.execute("SELECT * FROM entities WHERE type IN ('task','project','assessment','milestone','event') AND archived=0 AND status NOT IN ('cancelled','draft') AND (status!='done' OR type='task')")
     for row in rows:
         entity = core.store.entity(row)
+        if entity['type']!='event' and completed_on_or_before(core,c,entity,day):
+            continue
         matching = [rule for rule in rules if scope.matches(rule, entity)]
         if not matching:
             continue
         data = entity['data']
         base = {'id': entity['id'], 'title': entity['title'], 'rule_ids': [r['id'] for r in matching],
-                'occurrences_complete': True}
+                'occurrences_complete': True, **presenter.fields(entity)}
         due_text = data.get('date') if entity['type'] == 'event' else data.get('due_date')
         if not due_text:
             risks.append({**base, 'reason': '日期待确认', 'severity': 'unknown', 'occurrence_date': None})
@@ -301,3 +306,44 @@ def warning_scan(core, c, day):
                           'occurrence_date': bucket['occurrence_date'].isoformat(), 'due_date': first,
                           'last_due_date': last, 'occurrence_count': bucket['count']})
     return sorted(risks, key=lambda r: ({'urgent': 0, 'warning': 1, 'unknown': 2}[r['severity']], r.get('due_date', ''), r['id']))
+
+
+def _warning_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def warning_query(core,c,p):
+    """Current warnings first, with past occurrences retained behind a group."""
+    day=_date(p.get('date') or core.today(c)).isoformat()
+    items=warning_scan(core,c,day)
+    instant=_warning_now()
+    local_day=instant.astimezone(ZoneInfo(core.store.meta(c,'settings')['timezone'])).date().isoformat()
+    for item in items:
+        # Unknown dates cannot safely be called past and remain visible.
+        item['group']='past' if item.get('due_date') and item['due_date']<day else 'current'
+        if item['group']=='current' and item.get('due_date')==day==local_day:
+            target=core.store.get(c,item['id'])
+            if target['type']=='event':
+                data=target['data'];occurrence=item.get('occurrence_date') or day
+                effective={**data,**data.get('exceptions',{}).get(occurrence,{})}
+                end=effective.get('end') or effective.get('start')
+                if end and effective.get('time_kind') not in {'unknown','approximate','date_only'}:
+                    from .event_time import local_datetime
+                    due=_date(occurrence)
+                    if effective.get('end') and effective.get('start') and _minute(end)<=_minute(effective['start']):due+=dt.timedelta(days=1)
+                    try:
+                        finish=local_datetime(due,_minute(end),ZoneInfo(effective.get('timezone') or core.store.meta(c,'settings')['timezone']))
+                        if finish<=instant:item['group']='past'
+                    except ValueError:pass
+    items.sort(key=lambda item:(item['group']=='past',{'urgent':0,'warning':1,'unknown':2}[item['severity']],item.get('due_date') or '9999-12-31',item['owner_label'],item['id']))
+    counts={group:sum(item['group']==group for item in items) for group in ('current','past')}
+    group=p.get('group')
+    if group not in (None,'all','current','past'):
+        raise BusinessError('validation','警戒分组无效。')
+    selected=items if group in (None,'all') else [item for item in items if item['group']==group]
+    offset=max(0,int(p.get('offset',0)));limit=max(1,min(500,int(p.get('limit',100))))
+    page=selected[offset:offset+limit]
+    return {'date':day,'items':page,'counts':counts,'group':group or 'all','total':len(selected),
+            'scan_complete':True,'occurrences_complete':all(item.get('occurrences_complete',True) for item in items),
+            'returned_complete':offset==0 and len(selected)<=limit,
+            'next_offset':offset+len(page) if offset+len(page)<len(selected) else None}

@@ -32,7 +32,8 @@ def run_dialog(dialog):
 
 class DraftDialog(FormDialog):
     def __init__(self,*args,**kwargs):
-        super().__init__(*args,**kwargs);self.dirty=False;self.saving=False;self.finished_ok=False
+        super().__init__(*args,**kwargs);self.dirty=False;self.saving=False;self.finished_ok=False;self.closed=False
+        self.finished.connect(lambda *_:setattr(self,"closed",True));self.destroyed.connect(lambda *_:setattr(self,"closed",True))
     def mark_dirty(self,*_):self.dirty=True
     def reject(self):
         if self.saving:return
@@ -98,24 +99,39 @@ class RecoveryTaskDialog(DraftDialog):
 
 class RecoveryProgressDialog(DraftDialog):
     def __init__(self,bridge,task,parent=None,on_saved=None):
-        super().__init__('记录补欠进度',parent,650);self.bridge,self.task,self.on_saved=bridge,task,on_saved;self.epoch=bridge.epoch;self.loaded=False;self.progress={};self.generation=0
-        self.body_layout.addWidget(label(task['title'],'SectionHeading'));self.body_layout.addWidget(label('记录截至所选日期累计已经补了多少；同一任务的旧反馈会保留。'))
+        super().__init__('记录补欠进度',parent,610);self.resize(610,440);self.body_layout.setAlignment(Qt.AlignmentFlag.AlignTop);self.body_layout.setSpacing(14);self.bridge,self.task,self.on_saved=bridge,task,on_saved;self.epoch=bridge.epoch;self.revision=bridge.revision;self.loaded=False;self.progress={};self.generation=0
+        self.body_layout.addWidget(label(task.get('display_title') or task['title'],'SectionHeading'))
+        if task.get('owner_label'):self.body_layout.addWidget(label(task['owner_label'],'StatusPill'))
+        self.body_layout.addWidget(label('与实际任务共用同一份记录。填写累计数量，或直接确认整体完成，即可保存。'))
         form=QFormLayout();self.body_layout.addLayout(form)
-        self.day=QDateEdit(QDate.currentDate());self.day.setDisplayFormat('yyyy-MM-dd');self.day.setCalendarPopup(True);install_calendar(self.day);form.addRow('反馈日期',self.day)
-        self.current=label('正在读取当前进度…');form.addRow('已有记录',self.current)
-        self.completed=quantity();form.addRow('累计已补',self.completed)
-        self.completion=QComboBox();self.completion.addItem('仅记录数量，不判断整体完成',None);self.completion.addItem('明确尚未完成全部条件',False);self.completion.addItem('确认已满足全部完成条件',True);form.addRow('整体完成情况',self.completion)
+        self.current=label('正在读取当前进度…');form.addRow('已有进度',self.current)
+        quantity_row=QWidget();quantity_layout=QHBoxLayout(quantity_row);quantity_layout.setContentsMargins(0,0,0,0)
+        self.completed=quantity();quantity_layout.addWidget(self.completed,1)
+        self.add_one=button('＋1',self.increment);self.add_one.setToolTip('在已知累计数量上增加 1；保存后生效。');quantity_layout.addWidget(self.add_one);form.addRow('累计已补',quantity_row)
+        self.completion=QComboBox();self.completion.addItem('只更新数量',None);self.completion.addItem('尚未完成',False);self.completion.addItem('确认全部完成',True);form.addRow('任务状态',self.completion)
         self.gate=label(task['data'].get('completion_gate','完成条件待确认'));form.addRow('完成条件',self.gate)
-        self.source=QTextEdit();self.source.setMaximumHeight(100);self.source.setPlaceholderText('例如：今天补完第 3 讲，目前累计补了 2 节，配套练习还没做完。');form.addRow('实际情况',self.source)
-        self.correction=QCheckBox('更正上一次记录（数量或完成情况）');form.addRow('',self.correction)
-        self.correction_reason=QLineEdit();self.correction_reason.setPlaceholderText('例如：上次把重复观看的一节计算了两次');self.correction_reason.setEnabled(False);form.addRow('更正原因',self.correction_reason)
+        self.body_layout.addWidget(label('数量达到总量时，不会自动认定全部完成；到课、提交、掌握情况保持原记录。'))
+        self.more=button('补充说明 / 更正旧记录',lambda:self.advanced.setVisible(not self.advanced.isVisible()));self.more.setObjectName('TextLink');self.body_layout.addWidget(self.more)
+        self.advanced=QWidget();advanced_form=QFormLayout(self.advanced);advanced_form.setContentsMargins(0,0,0,0);self.body_layout.addWidget(self.advanced);self.advanced.hide()
+        self.day=QDateEdit(QDate.currentDate());self.day.setDisplayFormat('yyyy-MM-dd');self.day.setCalendarPopup(True);install_calendar(self.day);advanced_form.addRow('反馈日期',self.day)
+        self.source=QTextEdit();self.source.setMaximumHeight(75);self.source.setPlaceholderText('可选：这次补了哪一个 Lecture、Tutorial 或练习。');advanced_form.addRow('说明（选填）',self.source)
+        self.correction=QCheckBox('更正上一次记录');advanced_form.addRow('',self.correction)
+        self.correction_reason=QLineEdit();self.correction_reason.setPlaceholderText('例如：上次将一讲重复计数');self.correction_reason.setEnabled(False);advanced_form.addRow('更正原因',self.correction_reason)
         self.correction.toggled.connect(self.correction_reason.setEnabled)
         self.completed.valueChanged.connect(self.mark_dirty);self.completion.currentIndexChanged.connect(self.mark_dirty);self.source.textChanged.connect(self.mark_dirty);self.correction.toggled.connect(self.mark_dirty);self.correction_reason.textChanged.connect(self.mark_dirty);self.day.dateChanged.connect(self.reload)
-        self.buttons.accepted.connect(self.save);self.reload()
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('保存进度');self.buttons.accepted.connect(self.save);self.reload()
+
+    def increment(self):
+        if not self.loaded:return
+        if self.completed.value()<0:
+            self.error('原累计数量未知，请先填写实际累计数量。');return
+        self.completed.setValue(self.completed.value()+1)
+
     def reload(self,*_):
         self.generation+=1;generation=self.generation;self.loaded=False;self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(False)
         def got(result):
-            if generation!=self.generation:return
+            if self.closed or generation!=self.generation:return
+            self.epoch=result.get("epoch",self.bridge.epoch);self.revision=result.get("revision",self.bridge.revision)
             items=result.get('items',[])
             if not items:self.error('这项补欠任务暂不可用，请重新读取。');return
             self.task=items[0];self.progress=self.task.get('progress',{});p=self.progress
@@ -123,18 +139,23 @@ class RecoveryProgressDialog(DraftDialog):
             if not self.dirty:self.completed.blockSignals(True);self.completed.setValue(-1 if p.get('completed_quantity') is None else p['completed_quantity']);self.completed.blockSignals(False)
             self.loaded=True;self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(True)
         def failed(error):
-            if generation==self.generation:self.error(error);self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(False)
+            if not self.closed and generation==self.generation:self.error(error);self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(False)
         self.bridge.query('recovery_summary',got,failed,task_id=self.task['id'],as_of=self.day.date().toString('yyyy-MM-dd'))
     def save(self):
         if self.saving or not self.loaded:return
-        if not self.source.toPlainText().strip():self.error('请写明这次实际补了什么；数量未知可以留空。');return
         value=quantity_value(self.completed);old=self.progress.get('completed_quantity')
-        if old is not None and (value is None or value<old) and not self.correction.isChecked():self.error('累计数量减少时，请勾选更正并说明原因；不会覆盖原反馈。');return
+        if old is not None and (value is None or value<old) and not self.correction.isChecked():self.advanced.show();self.error('累计数量减少时，请勾选更正并说明原因；不会覆盖原反馈。');return
         reverting=self.completion.currentData() is False and self.progress.get('completion')=='done'
-        if reverting and not self.correction.isChecked():self.error('把已完成改为未完成时，请选择更正并填写原因。');return
+        if reverting and not self.correction.isChecked():self.advanced.show();self.error('把已完成改为未完成时，请选择更正并填写原因。');return
         if self.correction.isChecked() and (not (self.progress.get('latest_feedback_id') or self.progress.get('completion_feedback_id')) or not self.correction_reason.text().strip()):self.error('更正需要已有反馈和明确原因。');return
-        p={'task_id':self.task['id'],'version':self.task['version'],'business_date':self.day.date().toString('yyyy-MM-dd'),'completed_quantity':value,'source_text':self.source.toPlainText().strip()}
         confirmed=self.completion.currentData()
+        source=self.source.toPlainText().strip()
+        if value==old and confirmed is None and not source and not self.correction.isChecked():self.error('先修改累计数量或选择完成情况，再保存。');return
+        if not source:
+            parts=['用户在补欠进度界面确认累计已补 '+number(value)+' '+self.progress.get('unit','')]
+            if confirmed is not None:parts.append('整体完成情况：'+('已完成' if confirmed else '未完成'))
+            source='；'.join(parts)+'。'
+        p={'task_id':self.task['id'],'version':self.task['version'],'business_date':self.day.date().toString('yyyy-MM-dd'),'completed_quantity':value,'source_text':source}
         if confirmed is not None:p['completion_confirmed']=confirmed
         if self.correction.isChecked():
             p['correction_reason']=self.correction_reason.text().strip()
@@ -143,12 +164,12 @@ class RecoveryProgressDialog(DraftDialog):
         def saved(result):
             self.finished_ok=True;self.saving=False;self.accept()
             if self.on_saved:self.on_saved(result)
-        self.bridge.command('record_recovery_progress',p,saved,self.error,epoch=self.epoch)
+        self.bridge.command('record_recovery_progress',p,saved,lambda error:self.error(error) if not self.closed else None,epoch=self.epoch,expected_revision=self.revision)
 
 
 class RecoveryPanel(QFrame):
     def __init__(self,bridge,course,parent=None,on_saved=None):
-        super().__init__(parent);self.bridge,self.course,self.on_saved=bridge,course,on_saved;self.offset=0;self.next_offset=None;self.generation=0
+        super().__init__(parent);self.bridge,self.course,self.on_saved=bridge,course,on_saved;self.offset=0;self.next_offset=None;self.generation=0;self.dead=False;self.destroyed.connect(lambda *_:setattr(self,'dead',True))
         self.setObjectName('ProgressCard');self.root_layout=QVBoxLayout(self);self.root_layout.setContentsMargins(16,16,16,16)
         head=QHBoxLayout();head.addWidget(label('补课与补欠','SectionHeading'),1);head.addWidget(button('登记补课 / 补欠',self.register));self.root_layout.addLayout(head)
         self.summary=label('记录已确认落下的课或任务，查看已补进度，再按实际精力加入日计划。');self.root_layout.addWidget(self.summary)
@@ -170,19 +191,24 @@ class RecoveryPanel(QFrame):
     def load(self):
         self.generation+=1;generation=self.generation
         def got(result):
-            if generation!=self.generation:return
+            if self.dead or generation!=self.generation:return
             from .gui_workspace import clear_layout
             clear_layout(self.rows_layout)
             total=result.get('total',len(result.get('items',[])))
-            self.summary.setText(('共有 '+str(total)+' 项已登记的补课或补欠任务。数量进度与整体完成分别记录。') if total else '还没有登记补欠。你可以记录落下的课程范围，或复用课程里已有的未完成任务。')
+            hidden=result.get('completed_hidden',0)
+            message=('还有 '+str(total)+' 项补课或补欠任务。这里与上方实际任务是同一批事项，进度和完成记录同步。') if total else '暂无未完成的补欠任务。' if hidden else '还没有登记补欠。你可以记录落下的课程范围，或复用课程里已有的未完成任务。'
+            if hidden:message+=' 已完成的 '+str(hidden)+' 项保留在所属事项的已完成记录中。'
+            self.summary.setText(message)
             for task in result.get('items',[]):
-                p=task.get('progress',{});row=QFrame();row.setObjectName('TaskRow');v=QVBoxLayout(row);top=QHBoxLayout();top.addWidget(button(task['title'],lambda _,e=task:self.open_task(e)),1);top.addWidget(button('修改范围',lambda _,e=task:self.edit(e)));v.addLayout(top)
+                p=task.get('progress',{});row=QFrame();row.setObjectName('TaskRow');v=QVBoxLayout(row);top=QHBoxLayout();top.addWidget(button(task.get('display_title') or task['title'],lambda _,e=task:self.open_task(e)),1);top.addWidget(button('修改范围',lambda _,e=task:self.edit(e)));v.addLayout(top)
+                if task.get('owner_label'):v.addWidget(label(task['owner_label'],'StatusPill'))
+                if task.get('learning_unit_missing'):v.addWidget(label('课次编号待补充；尚无明确资料，未按日期或教学周推测。'))
                 state='已明确完成' if p.get('completion_confirmed') else '原完成记录与当前数量需核对' if p.get('completion')=='done' else '整体尚未明确完成'
                 v.addWidget(label('累计已补 '+number(p.get('completed_quantity'))+' / '+number(p.get('total_quantity'))+' '+p.get('unit','')+' · '+state))
                 if p.get('issues'):v.addWidget(label('；'.join(p['issues'][:2])))
                 if p.get('ratio') is not None:
                     bar=QProgressBar();bar.setRange(0,100);bar.setValue(round(max(0,min(1,p['ratio']))*100));bar.setTextVisible(True);bar.setFormat('%p%（数量进度）');v.addWidget(bar)
                 else:v.addWidget(label('数量尚未明确，不显示推测的完成百分比。'))
-                actions=QHBoxLayout();actions.addWidget(button('记录补欠进度',lambda _,e=task:self.record(e)));actions.addWidget(button('加入某天计划',lambda _,e=task:self.open_task(e)));actions.addStretch();v.addLayout(actions);self.rows_layout.addWidget(row)
+                actions=QHBoxLayout();actions.addWidget(button('更新进度',lambda _,e=task:self.record(e)));actions.addWidget(button('加入某天计划',lambda _,e=task:self.open_task(e)));actions.addStretch();v.addLayout(actions);self.rows_layout.addWidget(row)
             self.next_offset=result.get('next_offset');self.previous.setVisible(self.offset>0);self.next.setVisible(self.next_offset is not None)
-        self.bridge.query('recovery_summary',got,lambda e:self.summary.setText(e.get('message',str(e))),course_id=self.course['id'],limit=10,offset=self.offset)
+        self.bridge.query('recovery_summary',got,lambda e:self.summary.setText(e.get('message',str(e))),course_id=self.course['id'],limit=10,offset=self.offset,open_only=True)
