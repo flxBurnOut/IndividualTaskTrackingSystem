@@ -28,8 +28,8 @@ def produce(manager, job_id, value, cancel):
         json.dump(work, stream, ensure_ascii=False)
     args = [sys.executable]
     if getattr(sys, 'frozen', False):
-        sibling = Path(sys.executable).with_name('PersonalManagementService.exe')
-        args[0] = str(sibling if sibling.exists() else sys.executable)
+        from .runtime import service_executable
+        args[0] = str(service_executable())
         args += ['--document-worker', str(workspace)]
     else:
         args += ['-m', 'management.document_worker', str(workspace)]
@@ -129,8 +129,9 @@ def worker(workspace):
                 section = document.sections[0]
                 section.top_margin = section.bottom_margin = Cm(2)
                 style = document.styles['Normal']
-                style.font.name, style.font.size = 'Microsoft YaHei', Pt(11)
-                style.element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei')
+                family = 'PingFang SC' if sys.platform == 'darwin' else 'Microsoft YaHei'
+                style.font.name, style.font.size = family, Pt(11)
+                style.element.rPr.rFonts.set(qn('w:eastAsia'), family)
                 if title:
                     document.add_heading(title, 0)
                 for paragraph in paragraphs:
@@ -140,18 +141,11 @@ def worker(workspace):
                 checked = Document(output)
                 validation = {'format': 'verified', 'paragraphs': len(checked.paragraphs), 'content': 'not_checked', 'layout': 'not_rendered', 'execution': 'not_run'}
             else:
-                from reportlab.pdfbase import pdfmetrics
-                from reportlab.pdfbase.ttfonts import TTFont
                 from reportlab.lib.styles import getSampleStyleSheet
                 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
                 from reportlab.lib.pagesizes import A4
-                font_path = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / 'simsun.ttc'
-                font = 'Helvetica'
-                if font_path.exists():
-                    pdfmetrics.registerFont(TTFont('PMChinese', str(font_path), subfontIndex=0))
-                    font = 'PMChinese'
-                elif any(ord(ch) > 255 for ch in title + ''.join(paragraphs)):
-                    raise ResourceError('FONT_REQUIRED', '需要可嵌入的中文字体才能生成此 PDF。')
+                from .document_fonts import pdf_font
+                font = pdf_font(title + ''.join(paragraphs))
                 styles = getSampleStyleSheet()
                 for style in styles.byName.values():
                     style.fontName = font

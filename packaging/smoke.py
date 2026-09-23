@@ -7,13 +7,20 @@ import sys
 import time
 import uuid
 import psutil
+import platform
 from management.client import Client
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.7') / 'PersonalManagementService.exe'
-GUI = EXE.with_name('PersonalManagement.exe')
+if sys.platform == 'darwin':
+    package = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME', f'PersonalManagement-0.7-macos-{platform.machine()}')
+    EXE = package / 'PersonalManagement.app' / 'Contents' / 'MacOS' / 'PersonalManagementService'
+    GUI = EXE.with_name('PersonalManagement')
+else:
+    EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.7') / 'PersonalManagementService.exe'
+    GUI = EXE.with_name('PersonalManagement.exe')
+FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
 async def main():
     root = ROOT / '.test-output' / ('packaged-' + uuid.uuid4().hex[:10])
@@ -24,7 +31,7 @@ async def main():
     environment.pop('VIRTUAL_ENV', None)
     report = {'synthetic_only': True, 'package': str(EXE.parent), 'data_dir': str(data)}
     try:
-        result = subprocess.run([str(EXE), '--diagnose', '--data-dir', str(data)], capture_output=True, encoding='utf-8', errors='replace', env=environment, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = subprocess.run([str(EXE), '--diagnose', '--data-dir', str(data)], capture_output=True, encoding='utf-8', errors='replace', env=environment, timeout=30, creationflags=FLAGS)
         if result.returncode:
             raise RuntimeError(result.stderr or result.stdout)
         client = Client(data, autostart=False)
@@ -34,7 +41,7 @@ async def main():
         service = psutil.Process(runtime['pid'])
         report['frozen_service'] = Path(service.exe()).name == EXE.name
         verify_report = root / 'frozen-gui.json'
-        gui = subprocess.Popen([str(GUI), '--data-dir', str(data), '--verify-ui', str(verify_report)], env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
+        gui = subprocess.Popen([str(GUI), '--data-dir', str(data), '--verify-ui', str(verify_report)], env=environment, creationflags=FLAGS)
         time.sleep(1)
         gui_process = psutil.Process(gui.pid)
         report['service_private_bytes_snapshot'] = getattr(service.memory_info(),'private',service.memory_info().rss)
@@ -129,7 +136,7 @@ async def main():
         client.command('settings',{'settings':{'appearance':{'theme':'dark','font_size':18}}})
         settings=client.query('settings')['settings'];assert settings['appearance']['theme']=='dark' and settings['appearance']['font_size']==18
         dark_report=root/'frozen-dark-gui.json'
-        dark_gui=subprocess.Popen([str(GUI),'--data-dir',str(data),'--verify-ui',str(dark_report)],env=environment,creationflags=subprocess.CREATE_NO_WINDOW)
+        dark_gui=subprocess.Popen([str(GUI),'--data-dir',str(data),'--verify-ui',str(dark_report)],env=environment,creationflags=FLAGS)
         dark_gui.wait(timeout=30);assert dark_gui.returncode==0
         report['dark_gui']=json.loads(dark_report.read_text('utf-8'));assert report['dark_gui']['loaded'] and report['dark_gui']['visible'] and report['dark_gui']['appearance']['theme']=='dark' and report['dark_gui']['font_pixel_size']==18
         report['recovery_and_appearance']={'three_of_eight':True,'not_auto_completed':True,'dark_large_font_saved':True}
@@ -143,6 +150,15 @@ async def main():
             time.sleep(.1)
         assert job['status']=='completed', job
         report['frozen_document_worker'] = job['result']['metadata']['validation']
+        receipt = client.command('create_artifact_job', {'kind':'pdf','relative_path':'中文测试.pdf','title':'中文导出验证','content':'课程计划与任务复盘。计算 2 + 3。'})
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            job = client.query('job', id=receipt['result']['job']['id'])['job']
+            if job['status'] in ('completed', 'failed'):
+                break
+            time.sleep(.1)
+        assert job['status'] == 'completed', job
+        report['frozen_chinese_pdf_worker'] = job['result']['metadata']['validation']
         report['service_survives_both_entrances'] = service.is_running()
         report['passed'] = True
     except Exception as error:
@@ -151,6 +167,7 @@ async def main():
         raise
     finally:
         report_path = ROOT / '.build' / 'packaged-smoke.json'
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         if (data/'runtime.json').exists():
             runtime=json.loads((data/'runtime.json').read_text('utf-8'))

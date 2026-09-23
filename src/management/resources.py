@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sqlite3
+import sys
 import stat
 import threading
 import time
@@ -46,6 +47,16 @@ class ResourceError(Exception):
 def _plain_path(path: str | Path, *, file: bool = False) -> Path:
     """Reject links/reparse junctions before resolve can hide them."""
     path = Path(path).absolute()
+    if sys.platform == 'darwin':
+        # macOS owns these root aliases (including tempfile's /var/folders).
+        # Expand only the known alias, then inspect EVERY remaining component;
+        # resolving the whole path here would hide user-created symlinks.
+        for name in ('var', 'tmp', 'etc'):
+            alias, target = Path('/') / name, Path('/private') / name
+            if path.is_relative_to(alias) and alias.is_symlink():
+                if alias.readlink() in {target, target.relative_to('/')}:
+                    path = target / path.relative_to(alias)
+                break
     for part in [*reversed(path.parents), path]:
         if part.is_symlink() or (hasattr(part, "is_junction") and part.is_junction()):
             raise ResourceError("UNSAFE_PATH", "符号链接或目录连接不能作为资源路径。")

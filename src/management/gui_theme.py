@@ -60,8 +60,9 @@ def resolved_font_family(config):
     families = available_font_families()
     if family in families:
         return family
-    if not family and 'Microsoft YaHei UI' in families:
-        return 'Microsoft YaHei UI'
+    preferred = DEFAULT_APPEARANCE['font_family']
+    if preferred in families:
+        return preferred
     return QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
 
 
@@ -74,7 +75,7 @@ def stylesheet(config=None):
         text = re.sub(r'#[0-9a-fA-F]{6}', lambda m: mapping[m.group().lower()], text)
     family = config['font_family'].replace('\\', '\\\\').replace('"', '\\"')
     if not family:
-        family = 'Microsoft YaHei UI'
+        family = DEFAULT_APPEARANCE['font_family']
     text = text.replace('"Microsoft YaHei UI", "Microsoft YaHei"', '"'+family+'"')
     text = re.sub(r'font-size: (\d+)px', lambda m: 'font-size: %dpx' % max(10, round(int(m[1])*config['font_size']/13)), text)
     text += """

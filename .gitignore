@@ -8,6 +8,8 @@ dist/
 .test-output/
 .local-data/
 *.spec
+!packaging/*.spec
+.DS_Store
 
 
 .build/

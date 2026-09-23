@@ -229,8 +229,10 @@ class ResourceTests(unittest.TestCase):
     def test_symlink_guard_without_os_link_privilege(self):
         source = self.file()
         actual = Path.is_symlink
+        # macOS may expand the OS-owned /var alias before inspecting the file.
+        canonical_source = source.resolve()
         def pretend_link(path):
-            return path == source or actual(path)
+            return path in {source, canonical_source} or actual(path)
         with patch.object(Path, "is_symlink", pretend_link):
             self.error("UNSAFE_PATH", self.manager.import_file, source)
 
