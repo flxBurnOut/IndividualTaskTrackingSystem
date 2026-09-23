@@ -2,9 +2,15 @@
 
 当前已有可运行的 Windows 原生版本（0.7）。界面、Codex 接口和后台推理共用独立本机业务服务及 SQLite 数据库；不需要 npm 或网页前端编译。
 
+macOS 适配增加源码双击入口和独立 `.app` 构建。安装、数据目录、打包和发布边界见 [macOS 适配方案](docs/macOS适配方案.md)，本机运行验证见 [macOS 测试报告](docs/macOS测试报告.md)。
+
 **本次只构建软件，没有迁移 `D:\Y2S1`；发布包不带业务数据，试用时已保存的记录保留。** 测试仅使用隔离的合成记录。完整历史功能方案仍有后续工作，具体见 [功能实现对照](docs/功能实现对照.md)，不能把本版当成全部 49 类场景已验收。
 
 ## 启动
+
+Mac：安装 Python 3.12+，在项目目录执行 `python3 -m venv .venv` 和 `.venv/bin/python -m pip install -e '.[dev]'`，然后双击 `启动个人事务管理.command`。新数据默认保存在 `~/Library/Application Support/PersonalManagement/data`。独立应用可用 `.venv/bin/python packaging/build_macos.py` 构建。
+
+Windows：
 
 - 项目内使用：双击 `启动个人事务管理.vbs`。它使用本目录下的 `data` 数据空间。
 - 便携软件：打开 `release/PersonalManagement-0.7/PersonalManagement.exe`。默认数据位于 `%LOCALAPPDATA%/PersonalManagement/data`。

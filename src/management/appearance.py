@@ -1,7 +1,8 @@
 """Portable appearance preferences; no GUI/font discovery in the business service."""
 from .schemas import BusinessError
+import sys
 
-DEFAULT_APPEARANCE = {'theme': 'light', 'font_family': 'Microsoft YaHei UI', 'font_size': 13,
+DEFAULT_APPEARANCE = {'theme': 'light', 'font_family': 'PingFang SC' if sys.platform == 'darwin' else 'Microsoft YaHei UI', 'font_size': 13,
                       'workspace_sidebar_collapsed': False}
 
 

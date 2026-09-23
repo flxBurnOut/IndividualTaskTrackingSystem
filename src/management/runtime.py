@@ -42,8 +42,28 @@ class OwnerLock:
 
 def default_data_dir():
     if os.environ.get('PERSONAL_MANAGEMENT_DATA'):
-        return Path(os.environ['PERSONAL_MANAGEMENT_DATA']).resolve()
+        return Path(os.environ['PERSONAL_MANAGEMENT_DATA']).expanduser().resolve()
+    if sys.platform == 'darwin':
+        # Preserve pre-macOS-adaptation spaces without moving user data silently.
+        legacy = Path.home() / 'PersonalManagement' / 'data'
+        if (legacy / 'database.sqlite3').is_file():
+            return legacy
+        return Path.home() / 'Library' / 'Application Support' / 'PersonalManagement' / 'data'
     return Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'PersonalManagement' / 'data'
+
+
+def service_executable():
+    """Keep venv symlinks intact; frozen clients must use the stdio-capable helper."""
+    executable = Path(sys.executable).absolute()
+    if not getattr(sys, 'frozen', False):
+        if executable.name.lower() == 'pythonw.exe':
+            executable = executable.with_name('python.exe')
+        return executable
+    suffix = '.exe' if executable.suffix.lower() == '.exe' else ''
+    helper = executable.with_name('PersonalManagementService' + suffix)
+    if not helper.is_file():
+        raise ValueError('未找到随应用提供的业务服务程序，请保持软件目录完整。')
+    return helper
 
 
 def discovery(root):
@@ -57,12 +77,7 @@ def discovery(root):
 
 
 def _service_args(root, bootstrap=False):
-    executable = Path(sys.executable)
-    if getattr(sys, 'frozen', False):
-        sibling = executable.with_name('PersonalManagementService.exe')
-        if sibling.exists():
-            executable = sibling
-    args = [str(executable)]
+    args = [str(service_executable())]
     if not getattr(sys, 'frozen', False):
         args += ['-m', 'management']
     return args + ['--bootstrap-service' if bootstrap else '--service', '--data-dir', str(root)]

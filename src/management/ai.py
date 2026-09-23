@@ -11,6 +11,7 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -202,6 +203,14 @@ def find_codex(executable: str | None = None) -> str | None:
     found = shutil.which("codex")
     if found and Path(found).suffix.lower() in {".exe", ""}:
         return found
+    if sys.platform == 'darwin':
+        # Finder-launched apps do not inherit a terminal's Homebrew PATH.
+        for path in (Path('/opt/homebrew/bin/codex'), Path('/usr/local/bin/codex'),
+                     Path.home() / '.local/bin/codex',
+                     Path('/Applications/Codex.app/Contents/Resources/codex'),
+                     Path.home() / 'Applications/Codex.app/Contents/Resources/codex'):
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
     local = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
     candidates = sorted(local.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
     return str(candidates[0]) if candidates else None

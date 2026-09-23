@@ -4,7 +4,7 @@ import json
 import time
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFontInfo, QKeySequence
 from .gui import MainWindow
 from .gui_theme import apply_appearance, current_appearance
 
@@ -23,6 +23,11 @@ def verify(data_dir, report_path):
         if window.type_map and not window.bridge.callbacks:
             window.grab().save(str(report_path.with_suffix('.png')))
             state.update({'loaded': True, 'visible': window.isVisible(), 'epoch': window.bridge.epoch, 'revision': window.bridge.revision, 'elapsed_seconds': round(time.monotonic() - start, 3), 'appearance': current_appearance(), 'font_pixel_size': app.font().pixelSize()})
+            state['resolved_font'] = QFontInfo(app.font()).family()
+            state['device_pixel_ratio'] = window.devicePixelRatioF()
+            state['menu_shortcuts'] = {action.text(): action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+                                       for menu in window.menuBar().actions() if menu.menu()
+                                       for action in menu.menu().actions()}
         elif time.monotonic() - start < 20:
             QTimer.singleShot(250, finish)
             return

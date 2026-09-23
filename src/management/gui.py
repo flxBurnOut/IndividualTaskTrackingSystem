@@ -1,7 +1,9 @@
 """Three focused native workspaces sharing one durable business service."""
 from __future__ import annotations
 from pathlib import Path
+import sys
 from PySide6.QtCore import QDate, Qt, QTimer, QThread
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -110,12 +112,28 @@ class MainWindow(QMainWindow):
         self._sidebar_pending = False
         self._sidebar_desired = False
         self._build()
+        if sys.platform == 'darwin':
+            self._build_mac_menu()
         bind_theme(self, self.refresh_global_metrics)
         self.poll = QTimer(self)
         self.poll.setInterval(5000)
         self.poll.timeout.connect(self.poll_changes)
         self.load_capabilities()
         self.poll.start()
+
+    def _build_mac_menu(self):
+        menu = self.menuBar().addMenu('个人事务管理')
+        for label, shortcut, callback, role in (
+            ('设置…', 'Ctrl+,', self.open_settings, QAction.MenuRole.PreferencesRole),
+            ('搜索…', QKeySequence.StandardKey.Find, self.search, QAction.MenuRole.NoRole),
+            ('关闭窗口', QKeySequence.StandardKey.Close, self.close, QAction.MenuRole.NoRole),
+            ('退出个人事务管理', QKeySequence.StandardKey.Quit, self.close, QAction.MenuRole.QuitRole),
+        ):
+            action = QAction(label, self)
+            action.setMenuRole(role)
+            action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(callback)
+            menu.addAction(action)
 
     def _build(self):
         central = QWidget()

@@ -77,8 +77,8 @@ def extract(core,metadata,name,directory,*,layout_mode=None):
     (root/'input.json').write_text(json.dumps({'source_path':str(core.resources._blob(metadata['sha256'])),'original_name':name,'layout_mode':layout_mode}),encoding='utf-8')
     args=[sys.executable]
     if getattr(sys,'frozen',False):
-        sibling=Path(sys.executable).with_name('PersonalManagementService.exe')
-        args=[str(sibling),'--source-worker',str(root)]
+        from .runtime import service_executable
+        args=[str(service_executable()),'--source-worker',str(root)]
     else:args+=['-m','management.source_worker',str(root)]
     environment=dict(os.environ);environment['QT_QPA_PLATFORM']='offscreen';environment['PYTHONUTF8']='1'
     with core.resources._reservation((96 if layout_mode == 'timetable' else 8)*1024*1024):

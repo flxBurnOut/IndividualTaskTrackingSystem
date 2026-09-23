@@ -10,6 +10,7 @@ import uuid
 
 from .schemas import BusinessError
 from .appearance import DEFAULT_APPEARANCE
+from .runtime_check import check_sqlite
 
 
 def now():
@@ -41,11 +42,7 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "database.sqlite3"
         self.lock = threading.RLock()
-        v = sqlite3.sqlite_version_info
-        if v < (3, 51, 3) and v[:2] not in {(3, 44), (3, 50)}:
-            raise BusinessError("sqlite_version", "SQLite 版本缺少所需的 WAL 修复，请使用随软件提供的运行时。")
-        if v[:2] == (3, 44) and v < (3, 44, 6) or v[:2] == (3, 50) and v < (3, 50, 7):
-            raise BusinessError("sqlite_version", "SQLite 版本缺少 WAL 修复。")
+        check_sqlite()
         if self.path.exists() and self.path.stat().st_size:
             probe = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True)
             try:

@@ -26,12 +26,10 @@ from .gui_forms import EntityForm, EntityPicker, FormDialog, FIELD_LABELS, label
 
 def codex_mcp_config(data_dir):
     """Generate local MCP configuration without reading tokens or changing config."""
-    executable = Path(sys.executable).resolve()
+    from .runtime import service_executable
+    executable = service_executable()
     frozen = bool(getattr(sys, "frozen", False))
     if frozen:
-        executable = executable.with_name("PersonalManagementService.exe")
-        if not executable.is_file():
-            raise ValueError("未找到随应用提供的业务服务程序，请保持软件目录完整。")
         args = ["--mcp", "--data-dir", str(Path(data_dir).resolve())]
     else:
         if executable.name.lower() == "pythonw.exe" and executable.with_name("python.exe").is_file():
