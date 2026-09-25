@@ -127,11 +127,12 @@ class TodayPage(QWidget):
                 return
             self.review_result = result
             self.has_plan = bool(result.get("has_plan"))
-            needs_review = not self.has_plan or (result.get("summary") or {}).get("pending_review", (result.get("summary") or {}).get("unreported", 0)) > 0
+            needs_review = not result.get("can_review", self.has_plan) or (result.get("summary") or {}).get("pending_review", (result.get("summary") or {}).get("unreported", 0)) > 0
             self.review_attention.emit(needs_review and self.date.date() <= QDate.currentDate())
             self.plan_button.setText("调整计划" if self.has_plan else "生成计划")
-            self.plan_button.setVisible(self.has_plan)
+            self.plan_button.setVisible(self.has_plan or result.get("has_fixed_schedule",False))
             self.render_plan(result)
+            if self.today_result:self.render_events(self.today_result.get("events",[]))
         def today_loaded(result):
             if self.dead or generation != self.generation:
                 return
@@ -172,7 +173,7 @@ class TodayPage(QWidget):
             self.plan_layout.addWidget(plain_label("今天的安排", "SectionHeading"))
             self.plan_layout.addWidget(plain_label("正在读取当天计划…", "Quiet"))
             return
-        if not result.get("has_plan"):
+        if not result.get("can_review", result.get("has_plan")):
             self.plan_layout.addWidget(plain_label("还没有这一天的计划", "CardTitle"))
             self.plan_layout.addWidget(plain_label("先说明今天能投入的时间，以及最需要完成的事情。\nCodex 会结合已登记的固定安排，给出可以核对的计划。", "Body"))
             self.plan_layout.addSpacing(5)
@@ -180,7 +181,7 @@ class TodayPage(QWidget):
             return
         plan = result.get("plan") or {}
         header = QHBoxLayout()
-        heading = plain_label(plan.get("title") or "这一天的计划", "CardTitle")
+        heading = plain_label(plan.get("title") or "当天固定安排", "CardTitle")
         header.addWidget(heading, 1)
         mode = {"standard": "常规", "low_state": "低精力", "no_precise_time": "按先后", "rest": "休息"}.get(plan.get("mode"), "")
         if mode:
@@ -194,7 +195,7 @@ class TodayPage(QWidget):
         summary = result.get("summary", {})
         if items:
             self.progress = CountProgress()
-            self.progress.title.setText("完成记录")
+            self.progress.title.setText("执行反馈 · 出勤不代表学习完成")
             self.progress.set_counts(summary)
             self.plan_layout.addSpacing(7)
             self.plan_layout.addWidget(self.progress)
@@ -223,6 +224,10 @@ class TodayPage(QWidget):
         details = [item["owner_label"]] if item.get("owner_label") else []
         if item.get("target_archived"):
             details.append("已删除 · 保留原计划记录")
+        if item.get("fixed_schedule") and not item.get("can_review") and not item.get("target_archived"): details.append("尚未开始，到时可记录实际情况")
+        if item.get("catchup_task_id"):
+            details.append("补课已完成" if (item.get("catchup_progress") or {}).get("completion_confirmed") else "已关联补课事项")
+        if item.get("location"): details.append(item["location"])
         if item.get("completion_gate"):
             details.append(str(item["completion_gate"]))
         if item.get("planned_minutes") is not None:
@@ -232,7 +237,7 @@ class TodayPage(QWidget):
         layout.addLayout(content, 1)
         result = item.get("result")
         choices = QHBoxLayout()
-        for value, caption in (("done", "已完成" if result == "done" else "完成"), ("incomplete", "未完成")):
+        for value, caption in item.get("choices", (("done", "已完成" if result == "done" else "完成"), ("incomplete", "未完成"))):
             choice = make_button(caption, lambda _, i=item, v=value: self.complete_plan_item(i, v))
             choice.setCheckable(True); choice.setChecked(result == value); choice.setObjectName("ReviewChoice")
             choice.setProperty("result", value)
@@ -244,10 +249,10 @@ class TodayPage(QWidget):
 
     def complete_plan_item(self, item, result):
         if self.dead or self.review_saving or not item.get("can_review", True) or item.get("target_archived"): return
-        snapshot = self.review_result or {}; plan = snapshot.get("plan")
-        if not plan or item.get("result") == result: return
+        snapshot = self.review_result or {}; plan = snapshot.get("plan") or {}
+        if not snapshot.get("can_review", bool(plan)) or item.get("result") == result: return
         day = self.date_iso(); self.review_saving = True; self.render_plan(snapshot)
-        payload = {"date": day, "plan_id": plan["id"], "plan_version": plan["version"], "answers": [{"target_id": item["target_id"], "result": result}]}
+        payload = {"date": day, "plan_id": plan.get("id"), "plan_version": plan.get("version"), "schedule_signature": snapshot.get("schedule_signature"), "answers": [{("item_id" if item.get("item_id") else "target_id"): item.get("item_id",item["target_id"]), "result": result}]}
         options = {("expected_revision" if k == "revision" else k): snapshot[k] for k in ("epoch", "revision") if snapshot.get(k) is not None}
         def saved(receipt):
             self.review_saving = False
@@ -262,6 +267,9 @@ class TodayPage(QWidget):
 
     def render_events(self, events):
         clear_layout(self.events_layout)
+        integrated=bool(self.review_result and self.review_result.get('has_fixed_schedule'))
+        self.events_box.setVisible(not integrated)
+        if integrated:return
         self.events_layout.addWidget(plain_label("固定安排", "SectionHeading"))
         if not events:
             self.events_layout.addWidget(plain_label("这一天没有已登记的固定安排。", "Quiet"))

@@ -11,7 +11,7 @@ from .storage import encode
 
 GUIDANCE = """The user explicitly requests a daily plan, not a questionnaire.
 Produce one create_plan action for the supplied date using real existing IDs.
-Read the complete task index and nearby deadlines before choosing priorities.
+Search the paged task collections for relevant candidates; do not require every historical body. Read all pages of deadlines, active rules and applicable events before choosing priorities.
 Use existing records first. Unknown completion is not zero progress. Never change
 feedback, task scope, status or deadlines while planning. Keep original gates.
 If today's available hours or sleep anchors are unconfirmed, use no_precise_time:
@@ -32,7 +32,12 @@ def requested_day(text,scope,today,explicit=False):
     """Explicit planning requests use the workflow; explanatory chat stays chat."""
     if re.search(r'(?:不要|先别|暂不|不用|先不).{0,8}(?:生成|安排|制定|调整|重做).{0,8}(?:计划|日程)|(?:只|仅)(?:讨论|解释|了解)',text):return None
     if re.match(r'^(?:请)?(?:解释|介绍|说明).{0,12}(?:计划|生成)|^(?:怎么|如何|怎样|为什么).{0,12}(?:计划|生成)',text):return None
-    requested=explicit or re.search(r'(?:生成|安排|制定|重做|调整|排).{0,24}(?:计划|今天|今日|明天)|(?:今天|今日)(?:该|要)?(?:干什么|做什么)',text)
+    request_words=re.search(r'(?:生成|安排|制定|重做|调整|排).{0,24}(?:计划|今天|今日|明天)|(?:今天|今日)(?:该|要)?(?:干什么|做什么)',text)
+    # A launch-button hint must not turn a replacement feedback message into a
+    # plan-only request. Preserve normal feedback commands and separate facts.
+    feedback=re.search(r'(?:已经|已|刚刚|刚).{0,12}(?:完成|做完|搞定|提交|看完|到课)|(?:完成|做完|搞定|提交|看完)了|(?:还没|没有|未)(?:完成|做完|提交|到课)|(?:完成了|做了|看了|补了).{0,10}(?:题|页|节|讲|章|分钟|小时|%)',text)
+    if feedback and not request_words:return None
+    requested=explicit or request_words
     if not requested:return None
     if scope['kind']=='daily_plan':return scope['date']
     if scope['kind']!='general':return None
@@ -48,6 +53,11 @@ def requested_day(text,scope,today,explicit=False):
 def context(core, c, day, mode):
     from .reviews import _latest_plan
     base = core.plan_context(c, day, mode)
+    # Ordinary occurrences duplicate the complete source data. Retain a second
+    # copy only when an exception changes the effective values for this date.
+    for event in base['hard_events']:
+        if 'effective' in event and event['effective'] == event['data']:
+            event.pop('effective')
     # Keep safety constraints intact; replace verbose task bodies with a complete
     # bounded index, rather than dropping most tasks to fit the prompt budget.
     from .task_views import rows_sql, ENTITY_COLUMNS
@@ -90,7 +100,14 @@ def context(core, c, day, mode):
             reported=c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.business_date')=? LIMIT 1",(block['target_id'],day)).fetchone()
             past=day<local.date().isoformat() or day==local.date().isoformat() and block.get('end','99:99')<=local.strftime('%H:%M')
             if reported or past:protected.append(block)
+    # Completed captures already belong to canonical tasks/facts. Their old
+    # imported bodies are not outstanding work for every subsequent daily plan.
+    inbox_where="type='inbox' AND archived=0 AND status NOT IN ('done','cancelled')"
+    inbox_total=c.execute('SELECT count(*) FROM entities WHERE '+inbox_where).fetchone()[0]
+    inbox=[core.store.entity(row) for row in c.execute('SELECT * FROM entities WHERE '+inbox_where+' ORDER BY updated_at DESC,rowid DESC LIMIT 10')]
     return {'planning':base, 'nearby_events':nearby[:100], 'nearby_events_complete':len(nearby)<=100,
+        'recent_inbox':inbox, 'recent_inbox_coverage':{'only_unresolved':True,'records_total':inbox_total,
+            'records_returned':len(inbox),'complete':len(inbox)==inbox_total},
         'plan_request':{'date':day,'guidance':GUIDANCE,'local_now':local.isoformat(timespec='minutes'),
             'existing_plan':current,'protected_blocks':protected}, **core.store.state(c)}
 
@@ -99,11 +116,19 @@ def normalize(core, c, job, result):
     """Dry-run the exact candidate; no business mutation or invented time facts."""
     value=json.loads(job['input']) if isinstance(job['input'],str) else job['input']
     if not value.get('plan_requested'):return result
-    request=value['context']['plan_request'];day=request['date']
+    if value.get('context_operation_id'):
+        from .context_service import plan_request
+        request=plan_request(core,c,value.get('date') or value['context']['scope']['date'])
+    else:request=value['context']['plan_request']
+    day=request['date']
     result=copy.deepcopy(result)
     actions=result.get('actions',[])
     if not actions:
-        if value['context']['planning']['tasks']:
+        if value.get('context_operation_id'):
+            from .context_service import _count,_operation
+            available=_count(core,c,_operation(core,c,value['context_operation_id']),'tasks')
+        else:available=len(value['context']['planning']['tasks'])
+        if available:
             raise BusinessError('plan_missing_candidate','这次未返回可保存的计划，原记录未改动。请重新生成计划。')
         return result
     if len(actions)!=1 or actions[0]['command']!='create_plan':
@@ -123,7 +148,8 @@ def normalize(core, c, job, result):
     # as adoption. The savepoint also rolls back change/audit rows and new IDs.
     c.execute('SAVEPOINT validate_daily_plan')
     try:
-        core.create_plan(c,payload,'preview:'+job['id'],_retained=protected,_historical_retained=protected)
+        checked=core.create_plan(c,payload,'preview:'+job['id'],_retained=protected,_historical_retained=protected)
+        payload['blocks']=checked['data']['blocks']
     finally:
         c.execute('ROLLBACK TO validate_daily_plan');c.execute('RELEASE validate_daily_plan')
     result['plan_preview']={'date':day,'mode':payload.get('mode','standard'),
@@ -137,7 +163,14 @@ def normalize(core, c, job, result):
 
 def apply(core,c,job,action,rid):
     value=json.loads(job['input']) if isinstance(job['input'],str) else job['input']
-    request=value['context']['plan_request'];payload=action['payload']
+    if value.get('context_operation_id'):
+        from .context_service import plan_request
+        request=plan_request(core,c,value.get('date') or value['context']['scope']['date'])
+    else:request=value['context']['plan_request']
+    payload=action['payload']
     if action['command']!='create_plan' or payload.get('date')!=request['date']:
         raise BusinessError('plan_proposal_scope','候选不是本次请求的每日计划。')
+    protected=request.get('protected_blocks',[])
+    if payload.get('blocks',[])[:len(protected)]!=protected:
+        raise BusinessError('plan_protected_changed','已有计划新增了执行反馈或保护时段，请重新核对后再采用。')
     return {'entity':core.create_plan(c,payload,rid,_retained=request.get('protected_blocks',[]),_historical_retained=request.get('protected_blocks',[]))}

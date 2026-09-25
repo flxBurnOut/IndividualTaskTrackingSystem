@@ -13,12 +13,13 @@ import threading
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .schemas import BusinessError, TYPES, RESERVED_TYPES, validate_dimensions, validate_manifest
+from .ai_commands import CANDIDATE_COMMANDS
 from .storage import Store, encode, new_id, now
 
 
-COMMANDS = ["correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
+COMMANDS = ["attach_conversation", "correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
             "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "install_module", "disable_module",
-            "create_job", "cancel_job", "apply_proposal", "promote_checklist", "run_workflow", "undo",
+            "create_job", "cancel_job", "resume_context_operation", "apply_proposal", "promote_checklist", "run_workflow", "undo",
             "import_asset", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
 
 
@@ -71,10 +72,45 @@ class Core:
         return definitions
 
     def query(self, name, **p):
+        if name=='candidate_actions':
+            from .context_candidates import page
+            return page(self,p)
+        if name=='material_image':
+            import base64
+            from .materials import image_bytes
+            if p.get('from_job'):
+                from .context_history import image
+                raw=image(self,p['operation_id'],p['from_job'],p['image_ref'])
+            else:raw=image_bytes(self,p['operation_id'],p['image_ref'])
+            mime='image/png'
+            if len(raw)>1024*1024:
+                from PIL import Image
+                import io
+                with Image.open(io.BytesIO(raw)) as original:
+                    image=original.convert('RGB')
+                    for quality in (90,80,65,50):
+                        output=io.BytesIO();image.save(output,format='JPEG',quality=quality)
+                        if output.tell()<=1024*1024:break
+                    raw=output.getvalue();mime='image/jpeg'
+                if len(raw)>1024*1024:raise BusinessError('image_budget','此图像仍超过视觉单批预算，原件已保留。')
+            return {'mime_type':mime,'data':base64.b64encode(raw).decode('ascii')}
+        from .context_service import QUERY_NAMES, handle as context_query
+        if name in QUERY_NAMES:
+            return context_query(self,name,p)
+
+        if name=='conversation_targets':
+            from .session_coordinator import candidate_threads
+            return {**candidate_threads(self,p.get('conversation_id')),**self.query('state')}
+
         if name == 'library_folder':
             from .library import browse
             result = browse(self,p)
             with self.store.connect() as c:return {**result,**self.store.state(c)}
+        if name == 'codex_connection':
+            from .ai_shared import connection_status
+            import sys
+            expected = Path(sys.executable).with_name('PersonalManagementCodex.exe') if getattr(sys, 'frozen', False) else None
+            return {**connection_status(self.root/'codex-desktop-bridge', expected_bridge_executable=expected), **self.query('state')}
         if name == 'codex_models':
             from .model_catalog import list_models
             with self.store.connect() as c:
@@ -272,7 +308,7 @@ class Core:
             encoded = encode({"command": name, "payload": payload})
         except (TypeError, ValueError) as error:
             raise BusinessError("validation", "输入包含不可保存的数值或字段格式；本次未写入。") from error
-        if len(encoded.encode()) > 256 * 1024:
+        if len(encoded.encode()) > (1024 * 1024 if name in {'send_message','add_source'} else 256 * 1024):
             raise BusinessError("request_limit", "请求过大，请将大内容存为资料附件。")
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -288,7 +324,11 @@ class Core:
                     raise BusinessError("idempotency_conflict", "同一请求编号用于不同内容；未保存。")
                 return {"request_id": request_id, "result": json.loads(old["result"]), "epoch": old["epoch"], "revision": old["revision"], "replayed": True}
             if check_revision and (type(expected_revision) is not int or expected_revision != state["revision"]):
-                raise BusinessError("revision_conflict", "其他入口已更新资料。请重新读取后保留你的编辑并核对，再保存。", state)
+                scoped=False
+                if name=='apply_proposal' and type(expected_revision) is int:
+                    candidate=c.execute("SELECT input FROM jobs WHERE id=?",(payload.get('id'),)).fetchone()
+                    scoped=bool(candidate and json.loads(candidate[0]).get('context_operation_id'))
+                if not scoped:raise BusinessError("revision_conflict", "其他入口已更新资料。请重新读取后保留你的编辑并核对，再保存。", state)
             return None
 
         prepared = None
@@ -347,10 +387,14 @@ class Core:
             return {"request_id": request_id, "result": result, "epoch": epoch, "revision": revision, "replayed": False}
 
     def _prepare(self, name, p):
+        if name=='attach_conversation':
+            from .session_coordinator import prepare_attachment
+            return prepare_attachment(self,p)
+
         if name == 'configure_codex':
             config = p.get('ai')
             fields = {'enabled', 'executable', 'model', 'timeout_seconds'}
-            if set(p) - {'ai', '_operation_id'} or not isinstance(config, dict) or set(config) != fields:
+            if set(p) - {'ai', '_operation_id'} or not isinstance(config, dict) or not fields.issubset(config) or set(config) - (fields | {'execution_mode'}):
                 raise BusinessError('validation', '请提供完整的 Codex 协助设置。')
             if type(config['enabled']) is not bool:
                 raise BusinessError('validation', 'Codex 协助开关需要明确开启或关闭。')
@@ -360,6 +404,8 @@ class Core:
                     raise BusinessError('validation', 'Codex 程序位置或模型名称格式无效。')
             if type(config['timeout_seconds']) is not int or not 10 <= config['timeout_seconds'] <= 900:
                 raise BusinessError('validation', 'AI 超时范围为 10 到 900 秒。')
+            if config.get('execution_mode', 'background') not in {'background', 'desktop_shared'}:
+                raise BusinessError('validation', '请选择有效的 Codex 使用方式。')
             config = copy.deepcopy(config)
             if config['enabled']:
                 from .codex_project import ensure_project
@@ -368,6 +414,9 @@ class Core:
                     raise BusinessError('codex_project_incomplete', '对话项目连接尚未完成；协助设置未保存。请重新保存以修复连接。')
             else:
                 project = {'status': 'disabled', 'name': 'Codex事务助手'}
+            if config['enabled'] and config.get('execution_mode') == 'desktop_shared':
+                from .codex_desktop import prepare
+                prepare(self.root, config['executable'])
             return {'ai': config, 'codex_project': project}
         if name == 'add_source':
             from .sources import prepare
@@ -392,6 +441,9 @@ class Core:
                     for item in [d, *d.get("entries", [])]:
                         if item.get("sha256"):
                             found[item["sha256"]] = item
+                for row in c.execute('''SELECT m.sha256,m.size FROM material_chunks m JOIN material_catalog a ON a.key=m.material_key
+                    WHERE a.sha256 IN (SELECT json_extract(data,'$.sha256') FROM entities WHERE type IN ('asset','artifact'))'''):
+                    found[row[0]]={'sha256':row[0],'size':row[1],'path':'blobs/'+row[0]}
                 return list(found.values())
             return self.resources.create_backup(self.store.path, select_assets, app_lock=self.store.lock, metadata={"app_version": "0.7.1", "operation_id": p.get("_operation_id")})
         if name == "restore_backup":
@@ -439,6 +491,10 @@ class Core:
         return None
 
     def _dispatch(self, c, name, p, rid, prepared=None):
+        if name=='attach_conversation':
+            from .session_coordinator import attach
+            return attach(self,c,p,rid,prepared)
+
         if name == 'configure_codex':
             result = self._dispatch(c, 'settings', {'settings': {'ai': prepared['ai']}}, rid)
             project = prepared['codex_project']
@@ -639,8 +695,10 @@ class Core:
                         raise BusinessError("validation","请选择支持的每周回顾图表样式。")
                     value[k].update(v)
                 elif k == "ai":
-                    if not isinstance(v, dict) or set(v) - set(value["ai"]):
+                    if not isinstance(v, dict) or set(v) - (set(value["ai"]) | {"execution_mode"}):
                         raise BusinessError("validation", "AI 设置无效。")
+                    if v.get("execution_mode", "background") not in {"background", "desktop_shared"}:
+                        raise BusinessError("validation", "请选择有效的 Codex 使用方式。")
                     value[k].update(v)
                 else:
                     value[k] = v
@@ -705,10 +763,13 @@ class Core:
             return {'job': self.create_job(c, 'create_artifact_job', value, rid)}
         if name in {"create_job", "create_artifact_job"}:
             if name == 'create_job' and p.get('kind') == 'ai':
-                internal={'conversation_id','conversation_scope','provider_thread_id','provider_project_path','history','local_images','source_versions','source_ids'}
+                internal={'source_owner_scope','analyze_materials','context_operation_id','context','scope_title','ai_config','previous_operation','execution_owner','conversation_id','conversation_scope','provider_thread_id','provider_project_path','provider_contract','history','local_images','source_versions','source_ids'}
                 if internal & set(p.get('input') or {}):
                     raise BusinessError('proposal_scope','会话与图片输入必须由正式讨论入口根据已保存资料建立。')
             return {"job": self.create_job(c, name, p, rid)}
+        if name=='resume_context_operation':
+            from .context_driver import resume
+            return resume(self,c,p,rid)
         if name == "cancel_job":
             job = self._job(c, p["id"])
             if job["status"] not in {"queued", "running", "awaiting_review"}:
@@ -719,6 +780,8 @@ class Core:
                 event.set()
             from .conversations import update_job
             update_job(self,c,job,"cancelled")
+            from .conversation_progress import finish
+            finish(c, job["id"])
             self.store.change(c, rid, "cancel_job")
             return {"id": p["id"], "status": "cancelled"}
         if name == "apply_proposal":
@@ -727,24 +790,38 @@ class Core:
             validate_current_proposal(self,c,job)
             if job["status"] != "awaiting_review" or job["epoch"] != self.store.meta(c, "epoch"):
                 raise BusinessError("job_state", "候选已失效、取消或处理。")
-            if job["snapshot_revision"] != self.store.meta(c, "revision"):
+            value=json.loads(job['input'])
+            if value.get('context_operation_id'):
+                from .context_service import _operation,validate
+                validate(self,c,_operation(self,c,value['context_operation_id']),json.loads(job['result']))
+            elif job["snapshot_revision"] != self.store.meta(c, "revision"):
                 raise BusinessError("stale_proposal", "推理后业务资料已经变化，请重新生成候选。原候选已保留。")
-            actions = json.loads(job["result"]).get("actions", [])
-            if len(actions) > 30:
-                raise BusinessError("limit", "候选操作数量过多。")
-            results = []
+            candidate=json.loads(job['result'])
+            if value.get('context_operation_id') and candidate.get('action_manifest'):
+                from .context_candidates import iter_actions
+                actions=iter_actions(c,value['context_operation_id'])
+            else:
+                actions=candidate.get('actions',[])
+                if len(actions)>30:raise BusinessError('limit','候选操作数量过多。')
+            results = [];results_total=0
             for action in actions:
-                if action["command"] not in {"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress", "correct_recovery_scope"}:
+                if action["command"] not in CANDIDATE_COMMANDS:
                     raise BusinessError("proposal_scope", "候选含有未授权的操作。")
                 from .sources import apply_source_action
                 if json.loads(job['input']).get('plan_requested'):
                     from .plan_assistance import apply as apply_daily_plan
-                    results.append(apply_daily_plan(self,c,job,action,rid))
+                    applied=apply_daily_plan(self,c,job,action,rid)
                 else:
-                    results.append(apply_source_action(self,c,job,action,rid))
+                    applied=apply_source_action(self,c,job,action,rid)
+                results_total+=1
+                if len(results)<30:
+                    if len(encode(applied).encode('utf-8'))>8000:
+                        entity=applied.get('entity') or {}
+                        applied={'entity_ref':entity.get('id'),'version':entity.get('version')}
+                    if len(encode(results+[applied]).encode('utf-8'))<16000:results.append(applied)
             c.execute("UPDATE jobs SET status='applied',updated_at=? WHERE id=?", (now(), p["id"]))
             mark_applied(self,c,job)
-            return {"results": results, "job_id": p["id"]}
+            return {"results": results, "results_total":results_total, "job_id": p["id"], "details_query":{"name":"changes","request_id":rid}}
         if name == "import_asset":
             data = {**prepared, "original_name": Path(p["path"]).name, "source_text": p.get("source_text", "")}
             entity = self._create(c, {"type": "asset", "title": p.get("title") or Path(p["path"]).name, "data": data}, rid)
@@ -1044,13 +1121,15 @@ class Core:
             historical = retained and i < len(_historical_retained) and block == _historical_retained[i]
             target = self.store.get(c, block['target_id'])
             from .daily_flow import completed_on_or_before
-            closed = target['status']=='done' and (target['type']!='task' or completed_on_or_before(self,c,target,day))
+            closed = completed_on_or_before(self,c,target,day) if target['type']=='task' else target['status']=='done'
             if not retained and (target['archived'] or target['type'] not in {'task', 'event', 'milestone'} or target['status']=='cancelled' or closed):
                 raise BusinessError('plan_target', '计划只能安排可执行的活动记录。')
             if target['id'] in targets:
                 raise BusinessError('duplicate', '同一任务不要重复加入计划；请使用子任务区分工作。')
             targets.add(target['id'])
             if not retained:
+                if block.get('target_version') is not None and block['target_version']!=target['version']:
+                    raise BusinessError('context_changed','计划中的任务已被更新，请重新核对该项。',{'id':target['id']})
                 block['target_version'] = target['version']
                 gate = target['data'].get('completion_gate') or target['data'].get('acceptance') or ''
                 if block.get('completion_gate') and gate and block['completion_gate'] != gate:
@@ -1167,32 +1246,14 @@ class Core:
             if not isinstance(value.get('prompt'), str) or not value['prompt'].strip():
                 raise BusinessError('validation', '请输入需要分析或安排的内容。')
             day = value.get('date') or self.today(c)
-            if value.get('plan_requested'):
-                from .plan_assistance import context as planning_context
-                context=planning_context(self,c,day,value.get('mode','standard'))
-            else:
-                context = {'planning': self.plan_context(c, day, value.get('mode', 'standard')), **self.store.state(c)}
-            context['recent_inbox'] = self._query(c, 'list', {'type': 'inbox', 'limit': 10})['items']
-            context['execution_on_date'] = self.review(c, day, day)
-            from .reviews import query_daily
-            context['daily_review'] = query_daily(self,c,{'date':day})
-            selected_ids = value.get('context_ids', [])
-            if not isinstance(selected_ids, list) or len(selected_ids) > 12 or any(not isinstance(id, str) for id in selected_ids):
-                raise BusinessError('context_limit', '一次协助最多附带 12 项明确记录。')
-            context['selected_records'] = [self.store.get(c, id) for id in dict.fromkeys(selected_ids)]
-            context['asset_content_coverage'] = '附件仅含版本与元数据，未读取正文；不能声称已经分析附件。'
-            context['types'] = [{'id': t['id'], 'fields': t['fields'], 'parent_types': t['parent_types']} for t in self.types(c).values() if not t.get('read_only')]
-            if value.get('plan_requested'):context['types']=[t for t in context['types'] if t['id']=='plan']
-            max_chars = settings.get('context_characters', 42000)
-            while len(encode(context)) > max_chars and context['planning']['tasks'] and not value.get('plan_requested'):
-                context['planning']['tasks'].pop()
-                context['planning']['coverage']['tasks_paged'] = True
-            if len(encode(context)) > max_chars:
-                raise BusinessError('context_limit', '必要上下文超过推理预算，请缩小日期或对象范围。')
-            context['planning']['coverage']['tasks_returned'] = len(context['planning']['tasks'])
-            value['context'] = context
-            value['allowed_commands'] = ['apply_timetable', 'create', 'update', 'record_feedback', 'create_plan', 'save_review', 'set_recurring_rule', 'set_recovery_task', 'record_recovery_progress', 'correct_recovery_scope']
-            value['context_characters'] = len(encode(context))
+            from .context_service import create as create_context
+            value['context'] = create_context(self,c,scope={**(value.get('conversation_scope') or {'kind':'general'}),'date':day,
+                    'source_owner_scope':value.get('source_owner_scope'),'analyze_materials':value.get('analyze_materials',bool(value.get('source_ids') or value.get('context_ids')))},
+                goal=value['prompt'],job_id=id,sources=value.get('source_ids') or [],selected=value.get('context_ids') or [])
+            value['context_operation_id']=value['context']['operation_id']
+            value['allowed_commands'] = sorted(CANDIDATE_COMMANDS)
+            value['context_characters'] = len(encode(value['context']))
+
         else:
             if p.get('kind') not in {'text', 'markdown', 'csv', 'notebook', 'docx', 'pdf', 'pdf_notebook'}:
                 raise BusinessError('executor_unavailable', '此成果格式尚未注册执行器。')

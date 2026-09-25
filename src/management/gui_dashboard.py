@@ -39,14 +39,18 @@ class DashboardPage(QScrollArea):
         def loaded(result):
             if self.dead or generation!=self.generation:return
             self.result=result;self.day=result['date'];self.render(result)
-            self.review_attention.emit(not result['plan']['has_plan'] or result['plan']['summary'].get('pending_review',0)>0)
+            self.review_attention.emit(not result['plan'].get('can_review',result['plan']['has_plan']) or result['plan']['summary'].get('pending_review',0)>0)
             if self.past_toggle.isChecked():self.load_past()
         self.bridge.query('dashboard',loaded,lambda e:self.error.emit(e) if not self.dead and generation==self.generation else None)
 
     def render(self,r):
         self.date.setText(r['date_label']+'  '+r['weekday']);self.position.setText(r['week_label']+'  ·  '+r['week_start'][5:]+' — '+r['week_end'][5:])
         self.position.setToolTip('\n'.join(p['title']+'：'+p['label'] for p in r['periods']))
-        daily=r['plan']['summary'];value,detail,progress=self.metrics['plan'];value.setText(f"{daily['done']} / {daily['total']}" if r['plan']['has_plan'] else '尚未安排');detail.setText('已完成 / 今日计划事项' if r['plan']['has_plan'] else '进入今天，生成或手动安排');progress.setRange(0,max(1,daily['total']));progress.setValue(daily['done'])
+        daily=r['plan']['summary'];value,detail,progress=self.metrics['plan'];value.setText(f"{daily['done']} / {daily['total']}" if r['plan'].get('can_review',r['plan']['has_plan']) else '尚未安排');detail.setText('已完成 / 计划与固定安排' if r['plan'].get('can_review',r['plan']['has_plan']) else '进入今天，生成或手动安排');progress.setRange(0,max(1,daily['total']));progress.setValue(daily['done'])
+        if daily.get('fixed_scheduled'):
+            reported=daily['total']-daily['unreported'];value.setText(f"{reported} / {daily['total']}")
+            detail.setText(f"已反馈 · 参加 {daily.get('attended',0)} 次 · 待补 {daily.get('catchup_needed',0)} 次");progress.setValue(reported)
+
         counts=r['warnings']['counts'];value,detail,_=self.metrics['warnings'];value.setText(str(counts['current'])+' 项');detail.setText('当前警戒与日期待核对事项')
         tasks=r['tasks'];value,detail,progress=self.metrics['tasks'];value.setText(str(tasks['open'])+' 项待办');detail.setText(str(tasks['done'])+' 项已完成，记录保留');progress.setRange(0,max(1,tasks['total']));progress.setValue(tasks['done'])
         clear_layout(self.week);self.week_cards=[]

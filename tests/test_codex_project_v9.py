@@ -1,5 +1,6 @@
 """Stable Codex project, scoped independent chats and explicit migration."""
 import json,threading
+import pytest
 from management import ai,conversations
 from management.core import Core
 from management.storage import encode
@@ -18,14 +19,12 @@ def test_distinct_conversations_share_project_but_do_not_resume_each_other(rpc,t
     assert (tmp_path/'fixed-project').is_dir()
 
 
-def test_old_temporary_project_rebuilds_history_in_fixed_project_then_resumes(rpc,tmp_path):
-    path=str(tmp_path/'fixed-project');settings={'enabled':True,'_codex_project_dir':path}
-    first=ai.generate(request(provider_thread_id='old-thread',provider_project_path='old-temporary-directory'),settings,threading.Event())
-    assert 'thread/resume' not in [n for n,p in rpc.instances[-1].requests]
-    assert first['provider']['recovery']=='history_rebuilt'
-    ai.generate(request(provider_thread_id=first['provider']['thread_id'],provider_project_path=path),settings,threading.Event())
-    assert [n for n,p in rpc.instances[-1].requests]==['initialize','thread/resume','turn/start']
-    assert all(p['cwd']==path for n,p in rpc.instances[-1].requests if n in {'thread/resume','turn/start'})
+def test_old_project_mismatch_does_not_silently_create_another_task(rpc,tmp_path):
+    before=len(rpc.instances)
+    with pytest.raises(ai.AIError) as error:
+        ai.generate(request(provider_thread_id='old-thread',provider_project_path='old-temporary-directory'),
+                    {'enabled':True,'_codex_project_dir':str(tmp_path/'fixed-project')},threading.Event())
+    assert error.value.code=='AI_BINDING_CONFLICT' and len(rpc.instances)==before
 
 
 def test_software_persists_provider_project_for_next_turn(tmp_path):

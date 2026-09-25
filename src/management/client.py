@@ -78,11 +78,11 @@ class Client:
 
     def query(self, name, **params):
         try:
-            return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 35))
+            return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
         except ClientError as error:
             if error.code == 'connection_lost' and self.autostart:
                 self._connect()
-                return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 35))
+                return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
             raise
 
     def state(self):

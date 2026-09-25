@@ -11,14 +11,27 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=default_data_dir())
     parser.add_argument('--verify-ui', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--choose-data', action='store_true')
+    parser.add_argument('--launch-codex', action='store_true', help='启动已配置的 Codex 桌面连接模式')
     parser.add_argument('--install-shortcuts', action='store_true', help='为所选数据空间创建桌面与开始菜单快捷方式')
     parser.add_argument('--service', action='store_true')
     parser.add_argument('--bootstrap-service', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
+    parser.add_argument('--mcp-discussion')
+    parser.add_argument('--discussion-epoch')
     parser.add_argument('--diagnose', action='store_true')
     parser.add_argument('--source-worker', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--document-worker', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.launch_codex:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from .codex_desktop import launch
+        app = QApplication.instance() or QApplication([])
+        try:
+            launch(args.data_dir)
+        except Exception as exc:
+            QMessageBox.warning(None, 'Codex 连接模式', getattr(exc, 'message', str(exc)))
+            return 1
+        return 0
     if args.source_worker:
         from .source_worker import worker
         return worker(args.source_worker)
@@ -32,6 +45,9 @@ def main():
     if args.service:
         from .service import run_service
         return run_service(args.data_dir)
+    if args.mcp_discussion:
+        from .discussion_mcp import create_server
+        return create_server(args.data_dir,args.mcp_discussion,args.discussion_epoch).run(transport='stdio')
     if args.mcp:
         from .mcp_server import run
         return run(args.data_dir)

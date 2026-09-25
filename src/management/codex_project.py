@@ -88,31 +88,33 @@ def _desktop_project(rpc, workspace):
     known_ids = {row['id'] for row in before}
     binding = project_binding(workspace)
     preferred = binding['project_id'] if binding else None
-    open_desktop_workspace(workspace)
-    deadline = time.monotonic() + 12
-    while True:
-        matches = _matching_projects(rpc, workspace)
-        added = [row for row in matches if row['id'] not in known_ids]
-        if len(added) == 1:
-            selected = added[0]
-            break
-        if len(added) > 1:
-            raise _error('多个项目同时使用此目录，请在 Codex 核对项目后重新保存。')
-        chosen = [row for row in matches if row['id'] == preferred]
-        if len(chosen) == 1:
-            selected = chosen[0]
-            break
-        if time.monotonic() >= deadline:
-            if len(matches) != 1:
+    chosen = [row for row in before if row['id'] == preferred]
+    opened = False
+    if len(chosen) == 1:
+        selected = chosen[0]
+    elif len(before) == 1:
+        selected = before[0]
+    elif before:
+        raise _error('多个项目同时使用此目录，请在 Codex 核对项目后重新保存。')
+    else:
+        open_desktop_workspace(workspace)
+        opened = True
+        deadline = time.monotonic() + 12
+        while True:
+            matches = _matching_projects(rpc, workspace)
+            if len(matches) == 1:
+                selected = matches[0]
+                break
+            if len(matches) > 1:
+                raise _error('多个项目同时使用此目录，请在 Codex 核对项目后重新保存。')
+            if time.monotonic() >= deadline:
                 raise _error('Codex 桌面尚未完成项目登记。请检查 Codex 提示后重新保存设置。')
-            selected = matches[0]
-            break
-        time.sleep(.2)
+            time.sleep(.2)
     verified = rpc.request('project/read', {'projectId': selected['id']})
     confirmed = _project(verified.get('project'), workspace)
     if confirmed['id'] != selected['id']:
         raise _error('项目读取结果与登记标识不一致。')
-    return confirmed, confirmed['id'] not in known_ids
+    return confirmed, confirmed['id'] not in known_ids, opened
 
 
 def _active_project_layer(result, workspace):
@@ -233,17 +235,17 @@ def ensure_project(data_dir, ai_config):
         rpc.send({'method': 'initialized', 'params': {}})
         _activate_project_config(rpc, workspace)
         _probe_mcp(workspace, Path(data_dir).resolve())
-        project, created = _desktop_project(rpc, workspace)
+        project, created, opened = _desktop_project(rpc, workspace)
         rpc.close()
         rpc = None
         result = {**prepared, 'status': 'ready', 'name': project['name'], 'project_path': str(workspace),
-                  'project_id': project['id'], 'created': created, 'mcp_verified': True, 'desktop_open_requested': True}
+                  'project_id': project['id'], 'created': created, 'mcp_verified': True, 'desktop_open_requested': opened}
         _save_binding(workspace, result)
         return result
     except (ai.AIError, BusinessError, OSError, ValueError, KeyError, TypeError) as exc:
         if workspace is not None:
             try:
-                _save_binding(workspace, {'status': 'needs_repair', 'workspace': str(workspace)})
+                _save_binding(workspace, {**(project_binding(workspace) or {}), 'status': 'needs_repair', 'workspace': str(workspace)})
             except (OSError, BusinessError):
                 pass
         if isinstance(exc, BusinessError):

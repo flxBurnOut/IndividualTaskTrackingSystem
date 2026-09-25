@@ -12,7 +12,7 @@ def test_course_notes_skill_selected_from_user_request_not_material_instructions
     result=cmd(core,'send_message',{'scope':{'kind':'course','entity_id':owner['id']},'text':'这是本周课件，整理笔记','source_ids':[source['id']]})
     context=result['job']['input']['context'];assert context['selected_skill']['id']=='course-notes'
     assert context['selected_skill']['sha256']==skill_context('course-notes')['sha256']
-    assert context['materials'] and not core.query('list',type='note')['total']
+    assert next(x['total'] for x in context['collections'] if x['name']=='materials')==1 and not core.query('list',type='note')['total']
     cmd(core,'cancel_job',{'id':result['job']['id']})
     other=cmd(core,'send_message',{'scope':{'kind':'course','entity_id':owner['id']},'text':'只核对日程','source_ids':[source['id']]})
     assert 'selected_skill' not in other['job']['input']['context']

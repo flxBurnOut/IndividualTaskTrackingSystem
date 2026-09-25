@@ -279,7 +279,8 @@ def test_new_plan_gets_distinct_review_record_but_same_facts_are_not_copied(core
     t = task(core)
     first_plan = plan(core, [t])
     first = submit(core, first_plan, [{'target_id': t['id'], 'result': 'done'}])
-    second_plan = plan(core, [t])
+    second_plan = command(core,'revise_plan',{'date':'2030-01-01','plan_id':first_plan['id'],'plan_version':first_plan['version'],
+        'mode':'no_precise_time','blocks':first_plan['data']['blocks']})['entity']
     second = submit(core, second_plan, [{'target_id': t['id'], 'result': 'done'}])
     assert second['changed_count'] == 0
     assert second['review']['id'] != first['review']['id']

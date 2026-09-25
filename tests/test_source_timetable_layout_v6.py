@@ -119,16 +119,17 @@ def test_old_text_only_pdf_cannot_silently_become_complete_timetable_context(tmp
     source = tmp_path/'source.pdf'
     pdf(source, 1)
     old = command('add_source', {'kind':'file', 'path':str(source), 'owner_id':course['id']})['entity']
-    assert old['data']['extraction']['images'] == []
+    assert old['data']['extraction']['images'], 'Vector layouts must have original page evidence'
     scope = {'kind':'timetable', 'entity_id':table['id']}
-    with pytest.raises(BusinessError) as error:
-        prepare_context(core, {'scope':scope, 'source_ids':[old['id']]})
-    assert error.value.code == 'timetable_layout_missing'
-    new = command('add_source', {'kind':'file', 'path':str(source), 'owner_id':table['id']})['entity']
-    assert new['id'] != old['id']
-    assert new['data']['sha256'] == old['data']['sha256']
-    assert new['data']['extraction']['coverage']['layout_mode'] == 'timetable'
-    prepared = prepare_context(core, {'scope':scope, 'source_ids':[new['id']]})
-    assert len(prepared['local_images']) == 1
-    assert prepared['source_context'][0]['visuals'] == ['PDF第1页']
-    assert prepared['source_versions'] == {new['id']:new['version']}
+    # Changing use from course reading to timetable layout re-extracts visuals
+    # automatically from the same immutable original; no manual re-upload.
+    envelope=core.query('prepare_context',goal='Read timetable',scope=scope,source_ids=[old['id']])
+    from context_harness import read
+    op=envelope['operation_id'];images=[]
+    while True:
+        step=read(core,'next_context_step',operation_id=op)
+        if step.get('all_steps_processed'):break
+        if step['content']['kind']=='image':images.append(step['content']['locator'])
+        core.query('checkpoint_context',operation_id=op,step_key=step['step_key'],delivery_token=step['delivery_token'],result={'facts':[]})
+    assert images==['PDF 第 1 页图像']
+    assert core.query('get',id=old['id'])['entity']==old

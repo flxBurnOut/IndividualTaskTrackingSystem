@@ -42,7 +42,16 @@ class ReviewPage(QWidget):
         self.date_editor.setDisplayFormat('yyyy-MM-dd')
         self.date_editor.setAccessibleName('复盘日期')
         self.date_editor.dateChanged.connect(lambda date: self.set_date(date.toString('yyyy-MM-dd')))
+        self.previous_date = QPushButton('‹')
+        self.next_date = QPushButton('›')
+        for button,step,title in ((self.previous_date,-1,'上一天'),(self.next_date,1,'下一天')):
+            button.setAccessibleName(title);button.setToolTip(title)
+            button.setMinimumWidth(36)
+            button.setStyleSheet('QPushButton { padding: 8px 10px; }')
+            button.clicked.connect(lambda checked=False,amount=step:self.date_editor.setDate(self.date_editor.date().addDays(amount)))
+        top.addWidget(self.previous_date)
         top.addWidget(self.date_editor)
+        top.addWidget(self.next_date)
         self.refresh_button = QPushButton('刷新')
         self.refresh_button.clicked.connect(lambda: self.refresh())
         top.addWidget(self.refresh_button)
@@ -172,7 +181,7 @@ class ReviewPage(QWidget):
         plan = value.get('plan') or {}
         return json.dumps({'epoch': value.get('epoch'), 'has_plan': value.get('has_plan'),
             'plan': [plan.get('id'), plan.get('version')],
-            'items': [{k: item.get(k) for k in ('target_id', 'target_version', 'completion_gate', 'result', 'original_completion', 'feedback_id', 'can_review', 'target_archived')}
+            'items': [{k: item.get(k) for k in ('item_id', 'occurrence_version', 'target_id', 'target_version', 'completion_gate', 'result', 'original_completion', 'feedback_id', 'can_review', 'target_archived')}
                       for item in value.get('items', [])]}, sort_keys=True, ensure_ascii=False)
 
     def _receive_daily(self, day, generation, result):
@@ -213,12 +222,16 @@ class ReviewPage(QWidget):
         self.week_error.clear()
         self.week_error.hide()
         summary = result.get('summary') or {}
-        self.week_chart.set_summary(summary, denominator='本周有计划日期中的计划项目')
+        self.week_chart.set_summary(summary, denominator='本周计划事项与按次固定安排；出勤单独记录')
         days = result.get('days') or []
         self.week_days.set_days(days)
         with_plan = summary.get('days_with_plan', sum(bool(d.get('has_plan')) for d in days))
         without_plan = summary.get('days_without_plan', sum(not d.get('has_plan') for d in days))
         text = f'有计划 {with_plan} 天 · 缺计划 {without_plan} 天。缺计划不等于未完成；点击日期可查看当天并按实际情况复盘。'
+        if summary.get('fixed_scheduled'):
+            fixed_only=sum(bool(d.get('has_fixed_schedule') and not d.get('has_plan')) for d in days)
+            text=f'已有每日计划 {with_plan} 天 · 仅固定安排 {fixed_only} 天 · 无已知安排 {without_plan-fixed_only} 天。未反馈保持未知。'
+            text += f" 固定安排 {summary['fixed_scheduled']} 次 · 仍需补课 {summary.get('catchup_needed',0)} 次；课程出勤与任务完成在下方分别标明。"
         coverage = result.get('coverage') or {}
         if coverage.get('complete') is False or coverage.get('metrics_complete') is False:
             text += ' 当前统计覆盖不完整，请先核对缺口。'
@@ -249,7 +262,7 @@ class ReviewPage(QWidget):
         self.daily_data = value
         self._clear_rows()
         known = value is not None
-        has_plan = bool(value and value.get('has_plan'))
+        has_plan = bool(value and value.get('can_review',value.get('has_plan')))
         self.notice.setVisible(known and not has_plan)
         self.codex_button.setVisible(known and not has_plan)
         self.codex_button.setEnabled(self.on_codex is not None)
@@ -263,8 +276,8 @@ class ReviewPage(QWidget):
             self.notice.setText('这一天没有每日计划，无法按计划逐项复核。请到 Codex 根据实际发生的事情复盘；这里不会自动生成问卷或把缺计划记为失败。')
         else:
             plan = value.get('plan') or {}
-            self.daily_heading.setText(self._date + ' · ' + (plan.get('title') or '每日计划'))
-            self.daily_chart.set_summary(value.get('summary') or {})
+            self.daily_heading.setText(self._date + ' · ' + (plan.get('title') or '当天固定安排'))
+            self.daily_chart.set_summary(value.get('summary') or {}, denominator='当日计划事项及固定安排；完成与出勤分别记录')
             items = value.get('items') or []
             if not items:
                 empty = QLabel('这份计划没有需要逐项确认的项目。休整或空计划不等于未完成。')
@@ -276,7 +289,7 @@ class ReviewPage(QWidget):
         self._update_actions()
 
     def _add_row(self, item):
-        target = item['target_id']
+        target = item.get('item_id',item['target_id'])
         card = QFrame()
         card.setObjectName('ReviewItem')
         layout = QVBoxLayout(card)
@@ -291,11 +304,12 @@ class ReviewPage(QWidget):
         if item.get('owner_label'):
             owner = QLabel(item['owner_label']); owner.setObjectName('StatusPill'); owner.setTextFormat(Qt.TextFormat.PlainText); layout.addWidget(owner)
         if item.get('completion_gate'):
-            gate = QLabel('完成条件：' + str(item['completion_gate']))
+            gate = QLabel(('记录说明：' if item.get('fixed_schedule') else '完成条件：') + str(item['completion_gate']))
             gate.setWordWrap(True)
             gate.setTextFormat(Qt.TextFormat.PlainText)
             layout.addWidget(gate)
         detail = []
+        if item.get('fixed_schedule') and not item.get('can_review') and not item.get('target_archived'):detail.append('尚未开始，到时可记录实际情况')
         if item.get('start') and item.get('end'):
             detail.append(str(item['start']) + '–' + str(item['end']))
         if item.get('planned_minutes') is not None:
@@ -310,7 +324,7 @@ class ReviewPage(QWidget):
         layout.addWidget(status)
         choices = QHBoxLayout()
         buttons = {}
-        for result, label in [('done', '完成'), ('incomplete', '未完成')]:
+        for result, label in item.get('choices', [('done', '完成'), ('incomplete', '未完成')]):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setObjectName('ReviewChoice')
@@ -328,13 +342,13 @@ class ReviewPage(QWidget):
         self._update_row(item)
 
     def _update_row(self, item):
-        target = item['target_id']
+        target = item.get('item_id',item['target_id'])
         choices = self._choices.get(self._date, {})
         selected = choices.get(target, item.get('result'))
         if target in choices:
-            label = '本次选择：' + ('完成' if selected == 'done' else '未完成') + ' · 待确认保存'
-        elif item.get('result') in {'done', 'incomplete'}:
-            label = '已保存：' + ('完成' if item['result'] == 'done' else '未完成')
+            label = '本次选择：' + dict(item.get('choices',[('done','完成'),('incomplete','未完成')])).get(selected,selected) + ' · 待确认保存'
+        elif item.get('result') in dict(item.get('choices',[('done','完成'),('incomplete','未完成')])):
+            label = '已保存：' + dict(item.get('choices',[('done','完成'),('incomplete','未完成')])).get(item['result'],item['result'])
         elif item.get('original_completion') is not None or item.get('raw_result') is not None:
             raw = item.get('original_completion', item.get('raw_result'))
             label = '原记录：' + ORIGINAL_LABELS.get(str(raw), str(raw)) + '；保留原义，未替你改选。'
@@ -346,6 +360,8 @@ class ReviewPage(QWidget):
             label = '已删除 · 保留原计划记录 · ' + label + '；恢复任务后可以更正。'
         elif not item.get('available', True):
             label = '原计划对象暂不可用 · ' + label
+        if item.get('catchup_task_id'):
+            label += ' · '+('补课已完成，原出勤不变' if (item.get('catchup_progress') or {}).get('completion_confirmed') else '已关联补课事项')
         self.item_labels[target].setText(label)
         for result, button in self.item_buttons[target].items():
             button.setChecked(selected == result)
@@ -355,7 +371,7 @@ class ReviewPage(QWidget):
         if self._submitting_date is not None or self._date in self._conflicts:
             return
         value = self._states.get(self._date) or {}
-        item = next((i for i in value.get('items', []) if i['target_id'] == target), None)
+        item = next((i for i in value.get('items', []) if i.get('item_id',i['target_id']) == target), None)
         if not item or not item.get('can_review', True) or item.get('target_archived'):
             return
         choices = self._choices.setdefault(self._date, {})
@@ -405,12 +421,16 @@ class ReviewPage(QWidget):
         day = self._date
         value = self._states.get(day) or {}
         choices = self._choices.get(day, {})
-        if self._submitting_date or not choices or day in self._conflicts or not value.get('has_plan'):
+        if self._submitting_date or not choices or day in self._conflicts or not value.get('can_review',value.get('has_plan')):
             return
-        plan = value['plan']
-        payload = {'date': day, 'plan_id': plan['id'], 'plan_version': plan['version'],
-                   'answers': [{'target_id': item['target_id'], 'result': choices[item['target_id']]}
-                               for item in value.get('items', []) if item['target_id'] in choices and item.get('can_review', True) and not item.get('target_archived')]}
+        plan = value.get('plan') or {}
+        payload = {'date':day,'plan_id':plan.get('id'),'plan_version':plan.get('version'),
+                   'schedule_signature':value.get('schedule_signature'),
+                   'answers':[{('item_id' if i.get('item_id') else 'target_id'):i.get('item_id',i['target_id']),
+                               'result':choices[i.get('item_id',i['target_id'])]}
+                              for i in value.get('items',[]) if i.get('item_id',i['target_id']) in choices
+                              and i.get('can_review',True) and not i.get('target_archived')]}
+        if payload.get('schedule_signature') is None: payload.pop('schedule_signature',None)
         if not payload['answers']:
             return
         self._submitting_date = day

@@ -82,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding') or self.headers.get_content_type() != 'application/json':
                 raise BusinessError('protocol', '仅接受有长度的 JSON 请求。')
             length = int(self.headers.get('Content-Length', '0'))
-            if not 0 < length <= 256 * 1024:
+            if not 0 < length <= (1024 * 1024 if self.path in {'/v1/commands/send_message','/v1/commands/add_source','/v1/discussion/begin'} else 256 * 1024):
                 raise BusinessError('request_limit', '请求过大，请将大内容存为附件。')
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
@@ -93,6 +93,9 @@ class Handler(BaseHTTPRequestHandler):
             category, name = parts[2:]
             if category == 'query':
                 value = self.server.core.query(name, **data)
+            elif category == 'discussion':
+                from .session_coordinator import handle
+                value = handle(self.server.core,name,data)
             elif category == 'commands':
                 value = self.server.core.command(name, data['payload'], request_id=data['request_id'], epoch=data['epoch'], expected_revision=data['expected_revision'])
             else:

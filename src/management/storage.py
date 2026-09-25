@@ -108,6 +108,10 @@ class Store:
             initialize_library(c)
             from .conversations import initialize
             initialize(c)
+            from .occurrences import initialize as initialize_occurrences
+            initialize_occurrences(c)
+            from .context_schema import initialize as initialize_context
+            initialize_context(c)
             from .recurring import initialize as initialize_recurring
             initialize_recurring(c)
             for k, value in {"epoch": new_id(), "revision": 0, "schema_version": 1, "settings": DEFAULT_SETTINGS}.items():

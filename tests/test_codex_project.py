@@ -33,8 +33,8 @@ def test_desktop_launch_creates_through_native_registration(tmp_path,monkeypatch
     target=project(tmp_path)
     rpc=RPC([{'data':[]},{'data':[target]}],target)
     launches=[];monkeypatch.setattr(cp,'open_desktop_workspace',launches.append)
-    result,created=cp._desktop_project(rpc,tmp_path)
-    assert result==target and created and launches==[tmp_path]
+    result,created,opened=cp._desktop_project(rpc,tmp_path)
+    assert result==target and created and opened and launches==[tmp_path]
     assert not any(m=='project/create' for m,p in rpc.calls)
     assert rpc.calls[-1][0]=='project/read'
 
@@ -58,20 +58,41 @@ def test_incomplete_listing_never_creates(tmp_path,pages):
     assert not any(m=='project/create' for m,p in rpc.calls)
 
 
-def test_existing_binding_reused_after_native_open(tmp_path,monkeypatch):
+@pytest.mark.parametrize('bound,duplicate', [(False,False),(True,False),(True,True)])
+def test_existing_project_is_verified_without_opening_composer(tmp_path,monkeypatch,bound,duplicate):
     target=project(tmp_path)
-    cp._save_binding(tmp_path,{'status':'ready','workspace':str(tmp_path),'project_id':target['id']})
-    rpc=RPC([{'data':[target]},{'data':[target]}],target)
-    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:None)
-    result,created=cp._desktop_project(rpc,tmp_path)
-    assert result==target and not created
+    if bound:
+        cp._save_binding(tmp_path,{'status':'ready','workspace':str(tmp_path),'project_id':target['id']})
+    rows=[target,project(tmp_path,'other')] if duplicate else [target]
+    rpc=RPC([{'data':rows}],target)
+    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:pytest.fail('Existing project must not open a new composer'))
+    assert cp._desktop_project(rpc,tmp_path)==(target,False,False)
+    assert rpc.calls==[('project/list',{'limit':100}),('project/read',{'projectId':target['id']})]
 
 
-def test_new_desktop_project_wins_over_legacy_orphan(tmp_path,monkeypatch):
-    orphan=project(tmp_path,'orphan');target=project(tmp_path,'desktop')
-    rpc=RPC([{'data':[orphan]},{'data':[orphan,target]}],target)
-    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:None)
-    assert cp._desktop_project(rpc,tmp_path)==(target,True)
+def test_stale_binding_reuses_unique_existing_project(tmp_path,monkeypatch):
+    target=project(tmp_path)
+    cp._save_binding(tmp_path,{'status':'ready','workspace':str(tmp_path),'project_id':'removed'})
+    rpc=RPC([{'data':[target]}],target)
+    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:pytest.fail('Unique project must be reused'))
+    assert cp._desktop_project(rpc,tmp_path)==(target,False,False)
+
+
+def test_ambiguous_existing_projects_never_open_another_composer(tmp_path,monkeypatch):
+    target=project(tmp_path)
+    rpc=RPC([{'data':[target,project(tmp_path,'other')]}],target)
+    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:pytest.fail('Ambiguity must not create another project'))
+    with pytest.raises(BusinessError,match='多个项目'):cp._desktop_project(rpc,tmp_path)
+    assert len(rpc.calls)==1
+
+
+@pytest.mark.parametrize('changed', ['root','id'])
+def test_existing_project_still_requires_matching_readback(tmp_path,monkeypatch,changed):
+    target=project(tmp_path)
+    readback=project(tmp_path/'moved') if changed=='root' else project(tmp_path,'different')
+    rpc=RPC([{'data':[target]}],readback)
+    monkeypatch.setattr(cp,'open_desktop_workspace',lambda p:pytest.fail('Existing project must be read directly'))
+    with pytest.raises(BusinessError):cp._desktop_project(rpc,tmp_path)
 
 
 def test_wrong_readback_root_rejected(tmp_path,monkeypatch):
@@ -169,3 +190,31 @@ def test_failed_setup_marks_existing_binding_unready(tmp_path,monkeypatch):
     with pytest.raises(BusinessError):cp.ensure_project(tmp_path,{'enabled':True})
     assert cp.project_binding(workspace) is None
     assert not cp._LOCK.locked()
+
+
+@pytest.mark.parametrize('existing',[False,True])
+def test_ensure_project_reports_whether_desktop_open_was_requested(tmp_path,monkeypatch,existing):
+    from management import codex_workspace
+    workspace=tmp_path/'Codex事务助手';workspace.mkdir()
+    target=project(workspace)
+    pages=[{'data':[target]}] if existing else [{'data':[]},{'data':[target]}]
+    class SetupRPC(RPC):
+        closed=False
+        def request(self,method,params):
+            if method=='initialize':return {}
+            return super().request(method,params)
+        def send(self,message):assert message['method']=='initialized'
+        def close(self):self.closed=True
+    rpc=SetupRPC(pages,target)
+    monkeypatch.setattr(codex_workspace,'prepare_workspace',lambda d:{'workspace':str(workspace)})
+    monkeypatch.setattr(cp.ai,'find_codex',lambda *a:'codex.exe')
+    monkeypatch.setattr(cp.ai,'_AppServer',lambda *a:rpc)
+    monkeypatch.setattr(cp,'_activate_project_config',lambda *a:None)
+    monkeypatch.setattr(cp,'_probe_mcp',lambda *a:None)
+    opened=[];monkeypatch.setattr(cp,'open_desktop_workspace',opened.append)
+    result=cp.ensure_project(tmp_path,{'enabled':True})
+    assert result['desktop_open_requested'] is (not existing)
+    assert result['created'] is (not existing)
+    assert opened==([] if existing else [workspace])
+    assert cp.project_binding(workspace)['desktop_open_requested'] is (not existing)
+    assert rpc.closed and not cp._LOCK.locked()

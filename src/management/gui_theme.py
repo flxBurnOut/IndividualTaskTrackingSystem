@@ -102,6 +102,9 @@ QFrame#ChatMessage[userMessage="true"] { background: %(chat_user)s; border-radiu
 QFrame#ReviewItem { background: %(surface)s; border: 1px solid %(border)s; border-radius: 8px; }
 QPushButton#ReviewChoice[result="done"]:checked { background: %(done)s; color: %(chart_on_color)s; border: 2px solid %(done)s; font-weight: 600; }
 QPushButton#ReviewChoice[result="incomplete"]:checked { background: %(incomplete)s; color: %(chart_on_color)s; border: 2px solid %(incomplete)s; font-weight: 600; }
+QPushButton#ReviewChoice[result="attended"]:checked { background: %(done)s; color: %(chart_on_color)s; border: 2px solid %(done)s; font-weight: 600; }
+QPushButton#ReviewChoice[result="missed_needs_catchup"]:checked { background: %(incomplete)s; color: %(chart_on_color)s; border: 2px solid %(incomplete)s; font-weight: 600; }
+QPushButton#ReviewChoice[result="absent"]:checked { background: %(danger)s; color: %(chart_on_color)s; border: 2px solid %(danger)s; font-weight: 600; }
 QCalendarWidget { background: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }
 QCalendarWidget QWidget#qt_calendar_navigationbar { background: %(calendar_header)s; padding: 6px; }
 QCalendarWidget QToolButton { color: %(text)s; background: transparent; border: 0; border-radius: 5px; padding: 7px; font-weight: 600; }

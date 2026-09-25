@@ -46,7 +46,14 @@ def overview(core,c,p):
             'events':[dict(presenter.fields(e),id=e['id'],title=e['title'],start=projected_event_times(e)[0],end=projected_event_times(e)[1],event_kind=e['data'].get('event_kind')) for e in events[:3]]})
     sql=rows_sql("e.status NOT IN ('cancelled','draft')")
     totals=c.execute("SELECT count(*) AS total,coalesce(sum(completion_state='done'),0) AS done FROM ("+sql+")").fetchone()
-    owner_rows=c.execute("SELECT * FROM entities WHERE type IN ('course','project') AND archived=0 AND status NOT IN ('done','cancelled','draft') ORDER BY type,title,id LIMIT 9").fetchall()
+    owner_rows=c.execute("""SELECT e.* FROM entities e WHERE e.type IN ('course','project')
+        AND e.archived=0 AND e.status NOT IN ('done','cancelled','draft')
+        AND NOT EXISTS (WITH RECURSIVE ancestors(id,parent_id,type,archived,status) AS (
+            SELECT id,parent_id,type,archived,status FROM entities WHERE id=e.parent_id
+            UNION SELECT p.id,p.parent_id,p.type,p.archived,p.status FROM entities p JOIN ancestors a ON p.id=a.parent_id)
+            SELECT 1 FROM ancestors WHERE type IN ('course','project') AND archived=0
+                AND status NOT IN ('done','cancelled','draft'))
+        ORDER BY e.type,e.title,e.id LIMIT 9""").fetchall()
     owners=[]
     for row in owner_rows[:8]:
         entity=core.store.entity(row);total,done,incomplete=summary(core,c,entity['id'],exclude_draft=True)

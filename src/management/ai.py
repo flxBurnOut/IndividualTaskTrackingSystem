@@ -19,8 +19,11 @@ import time
 import tomllib
 from typing import Any
 
+from .ai_stream import ProposalStream, StreamLimitError, matching_event
 
-ALLOWED_COMMANDS = frozenset({"apply_timetable", "create", "update", "record_feedback", "create_plan", "save_review", "set_recurring_rule", "set_recovery_task", "record_recovery_progress", "correct_recovery_scope"})
+
+from .ai_commands import CANDIDATE_COMMANDS
+ALLOWED_COMMANDS = CANDIDATE_COMMANDS
 MAX_CONTEXT_BYTES = 96_000
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 262_144
@@ -321,7 +324,12 @@ def _arguments(executable: str, cwd: str | Path | None = None) -> list[str]:
 
 class _AppServer:
     def __init__(self, executable: str, cwd: Path, cancel: threading.Event, timeout: float):
-        self.cancel, self.deadline = cancel, time.monotonic() + timeout
+        self.started_at = time.monotonic()
+        self.timeout_seconds = timeout
+        self.cancel, self.deadline = cancel, self.started_at + timeout
+        self.waiting_method = None
+        self.phase = 'preparing'
+        self.last_event = None
         self.events: queue.Queue = queue.Queue(maxsize=128)
         self.seq = 0
         self.thread_id: str | None = None
@@ -383,12 +391,53 @@ class _AppServer:
         except (OSError, ValueError) as exc:
             raise AIError("AI_DISCONNECTED", "无法继续与 Codex 通信。") from exc
 
+    def _timeout_error(self):
+        method = getattr(self, 'waiting_method', None)
+        phase = getattr(self, 'phase', 'preparing')
+        seconds = int(getattr(self, 'timeout_seconds', 0))
+        elapsed = round(max(0, time.monotonic() - getattr(self, 'started_at', time.monotonic())), 1)
+        waiting = {'initialize': '连接 Codex', 'thread/read': '读取讨论',
+                   'thread/resume': '恢复讨论', 'thread/start': '建立讨论',
+                   'thread/metadata/update': '核对项目归属', 'thread/name/set': '设置讨论名称',
+                   'turn/start': '提交消息'}
+        label = waiting.get(method) if method else None
+        if label:
+            message = 'Codex 在“' + label + '”阶段超过等待上限；尚未拿到完整结果。本次没有产生可保存的变更。'
+        else:
+            state = {'reasoning': 'Codex 已开始推理，但尚未完成',
+                     'receiving_result': 'Codex 已开始返回内容，但结果尚不完整',
+                     'provider_retry': 'Codex 正在重试上游连接',
+                     'awaiting_model': '消息已提交，但尚未收到完整回复'}.get(phase, '尚未收到完整结果')
+            message = state + ('（等待上限 %s 秒）' % seconds if seconds else '') + '。本次没有产生可保存的变更；可稍后重试，或在设置中调高单次等待上限。重新保存连接配置不会延长本次等待。'
+        details = {'stage': phase, 'elapsed_seconds': elapsed, 'timeout_seconds': seconds}
+        if method in waiting: details['request_method'] = method
+        if getattr(self, 'last_event', None): details['last_event'] = self.last_event
+        return AIError('AI_TIMEOUT', message, details)
+
+    def _observe(self, event):
+        body = event.get('params', {})
+        if not isinstance(body, dict) or not matching_event(
+                body, getattr(self, 'thread_id', None), getattr(self, 'turn_id', None)):
+            return
+        method = event.get('method')
+        if method in {'turn/started', 'turn/completed', 'item/started', 'item/completed',
+                      'item/agentMessage/delta', 'item/reasoning/textDelta',
+                      'item/reasoning/summaryTextDelta', 'error'}:
+            self.last_event = method
+        if method in {'item/started', 'item/completed'}:
+            kind = event.get('params', {}).get('item', {}).get('type')
+            if kind == 'reasoning': self.phase = 'reasoning'
+            elif kind == 'agentMessage': self.phase = 'receiving_result'
+        elif method == 'item/agentMessage/delta': self.phase = 'receiving_result'
+        elif method == 'error' and event.get('params', {}).get('willRetry') is True:
+            self.phase = 'provider_retry'
+
     def _receive(self) -> dict:
         while True:
             if self.cancel.is_set():
                 raise AIError("AI_CANCELLED", "本次辅助处理已取消。")
             if time.monotonic() >= self.deadline:
-                raise AIError("AI_TIMEOUT", "Codex 处理超时，可检查连接后重新发起。")
+                raise self._timeout_error()
             try:
                 event = self.events.get(timeout=.1)
             except queue.Empty:
@@ -402,11 +451,18 @@ class _AppServer:
                 raise AIError("AI_TOOL_BLOCKED", "辅助推理请求了未开放工具，已停止本次处理。")
             if event.get("method") in {"item/started", "item/completed"}:
                 item = event.get("params", {}).get("item", {})
+                if item.get('type')=='mcpToolCall' and item.get('server')==getattr(self,'allowed_mcp_server',None):
+                    from .context_mcp import TOOL_NAMES
+                    if item.get('tool') in TOOL_NAMES|{'begin_discussion','query_business','submit_candidate'}:
+                        self._observe(event)
+                        return event
                 if item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "collabAgentToolCall"}:
                     raise AIError("AI_TOOL_BLOCKED", "辅助推理尝试执行工具，已停止本次处理。")
+            self._observe(event)
             return event
 
     def request(self, method: str, params: dict) -> dict:
+        self.waiting_method = method
         self.seq += 1
         ident = self.seq
         self.send({"id": ident, "method": method, "params": params})
@@ -417,7 +473,9 @@ class _AppServer:
                     # Upstream errors may contain local paths/account information;
                     # expose only the numeric code, not the raw error body.
                     code = message["error"].get("code")
-                    raise AIError("AI_REQUEST_REJECTED", "Codex 未接受请求，请检查登录、模型和运行版本。", {"protocol_code": code})
+                    raise AIError("AI_REQUEST_REJECTED", "Codex 未接受请求，请检查登录、模型和运行版本。", {"protocol_code": code, "request_method": method})
+                self.waiting_method = None
+                if method == 'turn/start': self.phase = 'awaiting_model'
                 return message.get("result", {})
             if len(self._backlog) >= 128:
                 raise AIError("AI_OUTPUT_LIMIT", "Codex 待处理事件过多。")
@@ -536,18 +594,25 @@ def _discussion_title(input):
     name = {'daily_plan':'每日计划','daily_review':'每日复盘','general':'日常讨论','timetable':'每周课表'}.get(scope.get('kind'))
     if name is None:
         selected = input.get('context', {}).get('selected_records', [])
-        name = next((e.get('title') for e in selected if e.get('id') == scope.get('entity_id')), None) or '课程与项目'
+        name = input.get('scope_title') or next((e.get('title') for e in selected if e.get('id') == scope.get('entity_id')), None) or '课程与项目'
     return ('个人事务 · '+name+(' · '+scope['date'] if scope.get('date') else ''))[:150]
 
 
-def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
+def generate(input: dict, settings: dict, cancel: threading.Event, progress=None) -> dict:
     """Generate only. Persistent provider threads are private to scoped software chats.
 
-    Resume failure before a model turn rebuilds from bounded software history; a
+    Resume failure preserves the existing binding; a
     timeout/cancellation/failed generation is never retried. Images are supplied
     only by the trusted source preparer, not by the public create_job endpoint.
+    Optional progress receives safe snapshots, never partial command payloads.
+    A failed progress consumer stops the turn rather than losing its tracking.
     """
     config = _settings(settings)
+    execution_mode = config.get('execution_mode', 'background')
+    managed_mcp = bool(input.get('conversation_id') or input.get('context_operation_id')) and bool(settings.get('_discussion_epoch'))
+    contract = 'desktop_mcp_v3' if managed_mcp else 'desktop_candidate_tool_v1' if execution_mode == 'desktop_shared' else 'background_json_v1'
+    if execution_mode not in {'background', 'desktop_shared'}:
+        raise AIError('AI_CONFIG_INVALID', 'Codex 连接模式无效，请重新选择。')
     if cancel.is_set():
         raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
     executable = find_codex(config.get('executable'))
@@ -559,7 +624,7 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
     if not allowed.issubset(ALLOWED_COMMANDS):
         raise AIError('AI_SCOPE_ERROR', '调用方请求了未实现的辅助业务命令。')
     images = _image_inputs(input)
-    persistent = bool(input.get('conversation_id'))
+    persistent = bool(input.get('conversation_id') or input.get('context_operation_id'))
     previous = input.get('provider_thread_id') if persistent else None
     if previous is not None and (not isinstance(previous, str) or not previous or len(previous) > 200):
         raise AIError('AI_INPUT_INVALID', '已保存的讨论标识无效。')
@@ -572,38 +637,106 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
     workspace = str(project_directory(settings))
     from .codex_project import project_binding
     binding = project_binding(workspace) if persistent else None
-    if previous and input.get('provider_project_path') != workspace:
-        previous = None
-    rpc = _AppServer(executable, Path(workspace), cancel, timeout)
+    if persistent and settings.get('_discussion_epoch') and not binding:
+        raise AIError('AI_PROJECT_NOT_READY','固定 Codex 项目尚未连接，请在设置中修复连接；未创建游离任务。')
+    if previous and input.get('provider_project_path') and os.path.normcase(input['provider_project_path']) != os.path.normcase(workspace):
+        raise AIError('AI_BINDING_CONFLICT','已有任务属于其他项目路径，未自动另建会话，请核对连接。')
+    if previous and not managed_mcp and input.get('provider_contract','background_json_v1') != contract:
+        raise AIError('AI_BINDING_CONFLICT','已有会话使用不同连接方式，请恢复原连接或明确迁移；未另建同名任务。')
+    snapshot = {}
+
+    def report(phase, **fields):
+        nonlocal snapshot
+        updated = {**snapshot, 'phase': phase, **fields}
+        if updated == snapshot:
+            return
+        snapshot = updated
+        if progress is not None:
+            try:
+                progress(dict(snapshot))
+            except Exception as exc:
+                cancel.set()
+                raise AIError('AI_PROGRESS_FAILED', '无法保存 Codex 的处理进度，已停止本次请求，请稍后重试。') from exc
+        if cancel.is_set():
+            raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
+
+    report('connecting')
+    if execution_mode == 'desktop_shared':
+        from .ai_shared import SharedAppServer
+        rpc = SharedAppServer(executable, Path(workspace), cancel, timeout, settings.get('_codex_bridge_dir'))
+    elif execution_mode == 'background':
+        rpc = _AppServer(executable, Path(workspace), cancel, timeout)
+    else:
+        raise AIError('AI_CONFIG_INVALID', 'Codex 连接模式无效，请重新选择。')
     try:
         rpc.request('initialize', {'clientInfo': {'name': 'personal_management', 'version': __version__}, 'capabilities': {'experimentalApi': True}})
         rpc.send({'method': 'initialized', 'params': {}})
         instructions=INSTRUCTIONS
+        instructions += '\nFor fixed_schedule daily_review items, use submit_daily_review with date, plan_id, plan_version, schedule_signature and answers containing item_id/result. Course results: attended, absent, or missed_needs_catchup only when the user explicitly says the missed class needs catch-up. This atomically links attendance and recovery. Never mark an entire recurring event completed or infer actual absence before a class begins.'
+
         if input.get('plan_requested'):
             from .plan_assistance import GUIDANCE
             instructions += '\n\nDaily planning exception to the generic ambiguity rule:\n'+GUIDANCE
         common = {'cwd': workspace, 'sandbox': 'read-only', 'approvalPolicy': 'untrusted',
                   'baseInstructions': instructions,
                   'developerInstructions': 'No tools or external context. Current software facts and candidate states override earlier discussion. Output only the candidate JSON.'}
+        if execution_mode == 'desktop_shared':
+            from . import ai_shared_turn
+            common['baseInstructions'] = ai_shared_turn.instructions(instructions)
+            common['developerInstructions'] = ai_shared_turn.developer_instructions(fresh_content)
+            # The shared engine also serves ordinary desktop tasks. Restrict
+            # integrations only for this proposal thread, never server-wide.
+            common['config'] = _isolation_overrides(workspace)
+        if managed_mcp:
+            from . import discussion_mcp
+            common['baseInstructions'] = discussion_mcp.instructions(instructions)
+            common['developerInstructions'] = 'Read fresh context through begin_discussion on every turn. Submit candidates through the business MCP, then answer naturally. No direct writes.'
+            common['approvalPolicy'] = 'never'
+            common.setdefault('config',_isolation_overrides(workspace)).update(discussion_mcp.configuration(workspace,input.get('conversation_id') or 'operation:'+input['context_operation_id'],settings['_discussion_epoch']))
+            # app-server JSON config is a tree, unlike CLI -c dotted keys.
+            nested={}
+            for key,value in common['config'].items():
+                node=nested;parts=key.split('.')
+                for part in parts[:-1]:node=node.setdefault(part,{})
+                node[parts[-1]]=value
+            common['config']=nested
+            rpc.allowed_mcp_server = discussion_mcp.SERVER_NAME
         if config.get('model'):
             common['model'] = config['model']
         recovery, started = None, None
+        if previous and managed_mcp and input.get('provider_contract') != contract:
+            # A loaded legacy thread retains its original MCP client set.
+            # Release only this idle task's subscription, then resume the same
+            # persisted identity with the new thread-scoped configuration.
+            remote=rpc.request('thread/read',{'threadId':previous,'includeTurns':False}).get('thread',{})
+            if (remote.get('status') or {}).get('type')=='active':
+                raise AIError('AI_CONVERSATION_BUSY','原 Codex 任务仍在运行，请等待结束后再接入新接口。')
+            released=rpc.request('thread/unsubscribe',{'threadId':previous})
+            if released.get('status') not in {'unsubscribed','notLoaded','notSubscribed'}:
+                raise AIError('AI_PROTOCOL_ERROR','原任务的工具连接未确认重新加载，未另建会话。')
         if previous:
             try:
+                report('resuming')
                 # Resume has a different schema from start. Its unstable
                 # `history` property is deliberately not used.
                 started = rpc.request('thread/resume', {**common, 'threadId': previous, 'excludeTurns': True})
                 recovery = 'resumed'
-            except AIError as error:
-                if error.code != 'AI_REQUEST_REJECTED':
-                    raise
-                recovery = 'history_rebuilt'
+            except AIError:
+                # Rejection is not evidence that a thread is gone. Keep its
+                # identity and never turn a transient failure into a duplicate.
+                raise
         if started is None:
+            report('creating_thread')
             started = rpc.request('thread/start', {**common, **({'projectId': binding['project_id']} if binding else {}), 'ephemeral': not persistent,
-                'environments': [], 'dynamicTools': [], 'selectedCapabilityRoots': [],
+                'environments': [], 'dynamicTools': [ai_shared_turn.tool_definition()] if execution_mode == 'desktop_shared' and not managed_mcp else [], 'selectedCapabilityRoots': None if managed_mcp else [],
                 'serviceName': 'personal_management_proposals'})
             recovery = recovery or ('history_rebuilt' if persistent and input.get('history', {}).get('messages') else 'new')
         rpc.thread_id = started['thread']['id']
+        if not isinstance(rpc.thread_id, str) or not rpc.thread_id or len(rpc.thread_id) > 200:
+            raise AIError('AI_PROTOCOL_ERROR', 'Codex 未返回有效的讨论标识。')
+        # Persist the identity before naming, metadata, or model invocation, so
+        # later failures cannot orphan a newly created provider discussion.
+        report('thread_ready', provider_thread_id=rpc.thread_id, recovery=recovery, provider_contract=contract)
         if binding and recovery == 'resumed':
             rpc.request('thread/metadata/update', {'threadId': rpc.thread_id, 'projectId': binding['project_id']})
         if persistent and recovery != 'resumed':
@@ -611,6 +744,31 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
                 rpc.request('thread/name/set', {'threadId':rpc.thread_id,'name':_discussion_title(input)})
             except AIError as error:
                 if error.code != 'AI_REQUEST_REJECTED':raise
+        if managed_mcp and recovery == 'resumed':
+            remote=rpc.request('thread/read',{'threadId':rpc.thread_id,'includeTurns':False}).get('thread',{})
+            if (remote.get('status') or {}).get('type')=='active':
+                raise AIError('AI_CONVERSATION_BUSY','原任务仍在处理，保留检查点后等待其结束。')
+            prior=input.get('previous_operation') or {}
+            if prior.get('phase') in {'sending','waiting_model','reasoning','receiving','validating','provider_retry','compacting'}:
+                from .context_driver import read_turn
+                turn_id=prior.get('provider_turn_id')
+                terminal=read_turn(rpc,rpc.thread_id,turn_id) if turn_id else None
+                if not terminal or terminal.get('status') not in {'completed','failed','interrupted'}:
+                    raise AIError('AI_DELIVERY_UNKNOWN','上一轮发送结果尚未核实，未重复发送；已保留原操作。')
+                report('reconciled')
+            if input.get('context_operation_id') and hasattr(progress,'compact_context'):
+                # Also bounds cumulative history across separate user turns.
+                from .context_driver import compact
+                compact(rpc,report,progress)
+        if execution_mode == 'desktop_shared' or managed_mcp:
+            result = discussion_mcp.run(rpc,input,workspace,images,allowed,cancel,report,progress.candidate_result) if managed_mcp else ai_shared_turn.run(rpc, input, workspace, images, allowed, cancel, report)
+            result['provider'] = {'kind': 'codex_app_server', 'thread_id': rpc.thread_id,
+                'turn_id': rpc.turn_id, 'model': started.get('model', config.get('model')), 'recovery': recovery,
+                'project_path': workspace, 'contract': contract}
+            if recovery == 'history_rebuilt':
+                result['summary'] = '已根据软件保存的有限讨论记录恢复会话；当前业务事实已重新读取。\n\n' + result['summary']
+            rpc.turn_id = None
+            return result
         content = _content(input, allowed, include_history=False) if recovery == 'resumed' else fresh_content
         schema=PROPOSAL_SCHEMA
         if input.get('plan_requested'):
@@ -620,6 +778,7 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
             schema['properties']['actions']['items']['properties']['command']['enum']=['create_plan']
             if input.get('context',{}).get('planning',{}).get('tasks'):
                 schema['properties']['actions']['minItems']=1
+        report('sending')
         turn = rpc.request('turn/start', {
             'threadId': rpc.thread_id, 'input': [{'type': 'text', 'text': content}, *images],
             'cwd': workspace, 'environments': [], 'approvalPolicy': 'untrusted',
@@ -627,18 +786,36 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
             'outputSchema': schema, 'summary': 'none',
         })
         rpc.turn_id = turn['turn']['id']
-        final_messages, output_bytes = {}, 0
+        if not isinstance(rpc.turn_id, str) or not rpc.turn_id or len(rpc.turn_id) > 200:
+            raise AIError('AI_PROTOCOL_ERROR', 'Codex 未返回有效的本轮处理标识。')
+        report('waiting_model', provider_turn_id=rpc.turn_id)
+        stream = ProposalStream(max_bytes=MAX_OUTPUT_BYTES)
         while True:
+            if cancel.is_set():
+                raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
             event = rpc.next_event()
             method, body = event.get('method'), event.get('params', {})
-            if method == 'item/completed':
+            if not isinstance(body, dict):
+                raise AIError('AI_PROTOCOL_ERROR', 'Codex 返回的事件格式错误。')
+            if not matching_event(body, rpc.thread_id, rpc.turn_id):
+                continue
+            if method == 'item/agentMessage/delta':
+                report('receiving', preview_text=stream.delta(body.get('itemId'), body.get('delta')))
+            elif method in {'item/reasoning/textDelta', 'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded'}:
+                report('reasoning')
+            elif method == 'error' and body.get('willRetry') is True:
+                report('provider_retry')
+            elif method in {'item/started', 'item/completed'}:
                 item = body.get('item', {})
-                if item.get('type') == 'agentMessage':
-                    text = item.get('text', '')
-                    output_bytes += len(text.encode('utf-8'))
-                    if output_bytes > MAX_OUTPUT_BYTES:
-                        raise AIError('AI_OUTPUT_LIMIT', '候选输出超过允许大小。')
-                    final_messages[item.get('id', str(len(final_messages)))] = text
+                if item.get('type') == 'reasoning':
+                    report('reasoning')
+                elif item.get('type') == 'agentMessage':
+                    item_id = item.get('id', 'legacy-' + str(len(stream.completed)))
+                    if method == 'item/started':
+                        preview = stream.start(item_id)
+                    else:
+                        preview = stream.complete(item_id, item.get('text', ''))
+                    report('receiving', preview_text=preview)
             elif method == 'turn/completed':
                 completed = body.get('turn', {})
                 if completed.get('id') != rpc.turn_id:
@@ -650,21 +827,24 @@ def generate(input: dict, settings: dict, cancel: threading.Event) -> dict:
                     raise AIError('AI_GENERATION_FAILED', 'Codex 未完成候选生成，请检查登录、模型权限或网络。')
                 if cancel.is_set():
                     raise AIError('AI_CANCELLED', '本次辅助处理已取消。')
-                if not final_messages:
+                if not stream.completed:
                     raise AIError('AI_EMPTY_OUTPUT', 'Codex 没有返回候选结果。')
+                report('validating')
                 try:
-                    value = json.loads(list(final_messages.values())[-1])
-                except json.JSONDecodeError as exc:
+                    value = json.loads(next(reversed(stream.completed.values())))
+                except (json.JSONDecodeError, RecursionError) as exc:
                     raise AIError('AI_INVALID_PROPOSAL', 'Codex 返回的候选结果不是 JSON。') from exc
                 result = validate_proposal(value, allowed)
                 result['provider'] = {'kind': 'codex_app_server', 'thread_id': rpc.thread_id,
                     'turn_id': rpc.turn_id, 'model': started.get('model', config.get('model')), 'recovery': recovery,
-                    'project_path':workspace}
+                    'project_path':workspace, 'contract': contract}
                 if recovery == 'history_rebuilt':
                     result['summary'] = '已根据软件保存的有限讨论记录恢复会话；当前业务事实已重新读取。\n\n' + result['summary']
                 rpc.turn_id = None
                 return result
-    except (KeyError, TypeError) as exc:
+    except StreamLimitError as exc:
+        raise AIError('AI_OUTPUT_LIMIT', '候选输出超过允许大小。') from exc
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise AIError('AI_PROTOCOL_ERROR', 'Codex 接口返回格式与当前适配器不兼容。') from exc
     finally:
         rpc.close()

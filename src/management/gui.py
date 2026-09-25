@@ -154,7 +154,9 @@ class MainWindow(QMainWindow):
             self.nav_buttons[key] = widget
             side.addWidget(widget)
         side.addStretch()
-        self.new_button = make_button("＋ 新建", primary=True)
+        from .gui_menu import MenuButton
+        self.new_button = MenuButton("＋ 新建")
+        self.new_button.setObjectName("Primary")
         self.create_menu = QMenu(self.new_button)
         self.new_button.setMenu(self.create_menu)
         side.addWidget(self.new_button)

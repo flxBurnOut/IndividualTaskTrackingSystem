@@ -47,7 +47,7 @@ class AddSourceDialog(QDialog):
         layout.addWidget(label('保存一份到软件中，之后原文件移动也能继续查看。提取结果会单独标明。','Quiet'))
         self.title=QLineEdit();self.title.setPlaceholderText('标题（可选，留空使用文件名或内容摘要）');layout.addWidget(self.title)
         self.tabs=QTabWidget();layout.addWidget(self.tabs,1)
-        files=QWidget();fl=QVBoxLayout(files);fl.addWidget(button('选择文件…',self.choose_files));self.files=QListWidget();fl.addWidget(self.files,1);fl.addWidget(label('也可把课件、文档或邮件文件拖到这里。一次最多 30 份。','Quiet'));self.tabs.addTab(files,'文件')
+        files=QWidget();fl=QVBoxLayout(files);fl.addWidget(button('选择文件…',self.choose_files));self.files=QListWidget();fl.addWidget(self.files,1);fl.addWidget(label('也可把课件、文档或邮件文件拖到这里，软件会依次保存并分批读取。','Quiet'));self.tabs.addTab(files,'文件')
         words=QWidget();wl=QVBoxLayout(words);self.text_kind=QComboBox();self.text_kind.addItem('通知文字','notice');self.text_kind.addItem('邮件正文','email');wl.addWidget(self.text_kind);self.text=QTextEdit();self.text.setPlaceholderText('粘贴通知或邮件原文，保留日期、发送者和相关说明。');wl.addWidget(self.text);self.tabs.addTab(words,'文字')
         capture=QWidget();cl=QVBoxLayout(capture);cl.addWidget(button('粘贴剪贴板截图',self.paste_image));self.preview=label('先截图，然后点击上方按钮。','Quiet');self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setMinimumHeight(170);cl.addWidget(self.preview,1);self.tabs.addTab(capture,'截图')
         web=QWidget();web_layout=QVBoxLayout(web);web_layout.addWidget(label('网页地址'));self.url=QLineEdit();self.url.setPlaceholderText('https://…');web_layout.addWidget(self.url);web_layout.addWidget(label('将尝试保存网页内容。需要登录或无法读取的页面会明确提示，可改为粘贴文字或截图。','Quiet'));web_layout.addStretch();self.tabs.addTab(web,'网页')
@@ -58,7 +58,6 @@ class AddSourceDialog(QDialog):
     def set_files(self,paths):
         current=[self.files.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.files.count())]
         all_paths=list(dict.fromkeys(current+[str(Path(p).resolve()) for p in paths]))
-        if len(all_paths)>30:self.error({'message':'一次最多保存 30 份，请分批添加。'});return
         self.files.clear()
         for path in all_paths:
             item=QListWidgetItem(Path(path).name);item.setToolTip(path);item.setData(Qt.ItemDataRole.UserRole,path);self.files.addItem(item)
@@ -115,6 +114,7 @@ class AddSourceDialog(QDialog):
         if not self.payloads:
             self.pending=False;self.uncertain=False;self.cleanup_temp();self.accept();return
         payload=self.payloads[0]
+        self.status.setText(f'已保存 {len(self.saved_sources)} 份，正在依次处理剩余 {len(self.payloads)} 份…')
         def saved(receipt):
             result=receipt.get('result',receipt);entity=result.get('entity',{})
             if entity:self.saved_sources.append(entity)
@@ -167,7 +167,7 @@ class SourceContentDialog(QDialog):
 class SourcePickerDialog(QDialog):
     def __init__(self,bridge,owner_id=None,parent=None,selected=None):
         super().__init__(parent);self.bridge,self.owner_id=bridge,owner_id;self.selected={x['id']:x for x in selected or []};self.offset=0;self.loading=False;self.generation=0;self.dialogs=[]
-        self.setWindowTitle('附带资料');self.resize(600,520);layout=QVBoxLayout(self);layout.addWidget(label('这次讨论参考哪些资料','DialogHeading'));layout.addWidget(label('最多 12 份。取消勾选可从后续讨论中移除，不会删除资料。','Quiet'));self.items=QListWidget();self.items.itemChanged.connect(self.changed);layout.addWidget(self.items,1);self.status=label('','Quiet');layout.addWidget(self.status)
+        self.setWindowTitle('附带资料');self.resize(600,520);layout=QVBoxLayout(self);layout.addWidget(label('这次讨论参考哪些资料','DialogHeading'));layout.addWidget(label('资料将自动分批处理。取消勾选可从后续讨论中移除，不会删除原件。','Quiet'));self.items=QListWidget();self.items.itemChanged.connect(self.changed);layout.addWidget(self.items,1);self.status=label('','Quiet');layout.addWidget(self.status)
         row=QHBoxLayout();row.addWidget(button('添加资料或通知',self.add));self.more=button('加载更多',self.load);row.addWidget(self.more);row.addStretch();row.addWidget(button('使用这些资料',self.accept));layout.addLayout(row);self.load()
     def load(self):
         if self.loading:return
@@ -184,14 +184,12 @@ class SourcePickerDialog(QDialog):
     def changed(self,item):
         entity=item.data(Qt.ItemDataRole.UserRole)
         if item.checkState()==Qt.CheckState.Checked:
-            if len(self.selected)>=12 and entity['id'] not in self.selected:
-                item.setCheckState(Qt.CheckState.Unchecked);self.status.setText('最多附带 12 份，请先移除其他资料。');return
             self.selected[entity['id']]=entity
         else:self.selected.pop(entity['id'],None)
+        self.status.setText(f'已选 {len(self.selected)} 份 · 自动分批处理')
     def add(self):
         def saved(receipt):
             entity=receipt.get('result',receipt).get('entity',{})
-            if entity and (entity['id'] in self.selected or len(self.selected)<12):self.selected[entity['id']]=entity
-            elif entity:self.status.setText('已保存；当前已选12份，请先移除一份再选择新资料。')
+            if entity:self.selected[entity['id']]=entity
             self.generation+=1;self.loading=False;self.offset=0;self.items.clear();self.load()
         dialog=AddSourceDialog(self.bridge,self.owner_id,self,saved);self.dialogs.append(dialog);dialog.open()

@@ -6,10 +6,11 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from .gui_theme import color, LIGHT
+from .review_display import KIND_LABELS, RESULT_LABELS, label as review_label, color_role
 
 COLORS = {key: LIGHT[key] for key in ('done','incomplete','unreported','other_reported')}
-LABELS = {'done': '完成', 'incomplete': '未完成', 'unreported': '未反馈', 'other_reported': '其他已反馈'}
-ORIGINAL_LABELS = {'partial': '部分完成', 'not_started': '未开始', 'blocked': '受阻', 'cancelled': '已取消', 'unknown': '待确认', 'done': '已完成', 'incomplete': '未完成'}
+LABELS = {'done': '完成', 'incomplete': '未完成', 'unreported': '未反馈', 'other_reported': '已反馈 · 状态待核对'}
+ORIGINAL_LABELS = {'attended':'已参加','absent':'未参加','missed_needs_catchup':'缺课需补','partial': '部分完成', 'not_started': '未开始', 'blocked': '受阻', 'cancelled': '已取消', 'unknown': '待确认', 'done': '已完成', 'incomplete': '未完成'}
 
 
 def count(value):
@@ -24,17 +25,41 @@ def coverage(summary):
     return total, values
 
 
+def display_segments(summary):
+    total,values=coverage(summary)
+    if 'breakdown' in summary:
+        rows=[dict(row) for row in summary['breakdown'] if count(row.get('count'))]
+    else:
+        rows=[]
+        for key in ('done','incomplete'):
+            if values[key]:rows.append({'key':key,'kind':'task','result':key,'count':values[key]})
+        remaining=values['other_reported']
+        for raw,n in (summary.get('original_results') or {}).items():
+            n=min(remaining,count(n))
+            if not n:continue
+            kind='attendance' if raw in {'attended','absent','missed_needs_catchup'} else 'task'
+            rows.append({'key':'legacy:'+str(raw),'kind':kind,'result':raw,'count':n});remaining-=n
+        if remaining:rows.append({'key':'other_reported','kind':'task','result':'reported','count':remaining})
+        if values['unreported']:rows.append({'key':'unreported','kind':'task','result':'unreported','count':values['unreported']})
+    for row in rows:
+        row['label']=review_label(row);row['color']=color_role(row)
+    return rows
+
+
 class CoverageBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.total, self.values = 0, {key: 0 for key in LABELS}
+        self.segments=[]
         self.setMinimumHeight(18)
         self.setMaximumHeight(22)
         self.setMinimumWidth(100)
 
     def set_summary(self, summary):
         self.total, self.values = coverage(summary)
-        self.setAccessibleName('；'.join(f'{LABELS[k]} {v} 项' for k, v in self.values.items()))
+        self.segments=display_segments(summary)
+        self.setAccessibleName('；'.join(f"{row['label']} {row['count']} 项" for row in self.segments))
+        self.setToolTip(self.accessibleName())
         self.update()
 
     def paintEvent(self, event):
@@ -47,10 +72,10 @@ class CoverageBar(QWidget):
         painter.fillRect(rect, QColor(color('chart_track')))
         if self.total:
             left = 0.0
-            for key in ('done', 'incomplete', 'other_reported', 'unreported'):
-                width = self.width() * self.values[key] / self.total
+            for row in self.segments:
+                width = self.width() * row['count'] / self.total
                 if width:
-                    painter.fillRect(QRectF(left, 2, width, rect.height()), QColor(color(key)))
+                    painter.fillRect(QRectF(left, 2, width, rect.height()), QColor(color(row['color'])))
                     left += width
         painter.end()
 
@@ -86,12 +111,15 @@ class CoverageChart(QWidget):
         total, values = coverage(summary)
         self.bar.set_summary(summary)
         self.heading.setText(f'已完成 {values["done"]} / {total} 项' if total else '没有可统计的计划项目')
-        self.legend.setText('    '.join(f'{LABELS[key]} {values[key]}' for key in ('done', 'incomplete', 'unreported', 'other_reported') if values[key] or key != 'other_reported'))
+        if summary.get('fixed_scheduled'):
+            reported=total-values['unreported']
+            self.heading.setText(f"已反馈 {reported} / {total} 项 · 任务完成与课程出勤分别统计")
+        self.legend.setText('    '.join(f"{row['label']} {row['count']}" for row in display_segments(summary)))
         self.denominator.setText(f'分母：{denominator}，共 {total} 项。按项目计数，不代表工作量、工时或掌握程度。' if total else '没有计划项目不表示失败，也不按 0% 完成处理。')
         originals = summary.get('original_results') or {}
         text = '原有反馈：' + '；'.join(f'{ORIGINAL_LABELS.get(str(k), str(k))} {count(v)} 项' for k, v in originals.items() if count(v))
         self.originals.setText(text if text != '原有反馈：' else '')
-        self.originals.setVisible(bool(self.originals.text()))
+        self.originals.setVisible(bool(self.originals.text()) and 'breakdown' not in summary)
 
 
 class VerticalCoverageBar(QWidget):
@@ -100,7 +128,8 @@ class VerticalCoverageBar(QWidget):
         super().__init__(parent)
         self.day = dict(day)
         self.total, self.values = coverage(day.get('summary') or {})
-        self.kind = 'missing_plan' if not day.get('has_plan') else 'empty_plan' if not self.total else 'data'
+        self.segments=display_segments(day.get('summary') or {})
+        self.kind = 'missing_plan' if not day.get('can_review',day.get('has_plan')) else 'empty_plan' if not self.total else 'data'
         self.setFixedHeight(228)
         self.setMinimumWidth(36)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -113,7 +142,7 @@ class VerticalCoverageBar(QWidget):
         if self.kind == 'empty_plan':
             return str(self.day.get('date', '')) + '：空计划；没有计划项目，不计算完成占比。'
         return str(self.day.get('date', '')) + f'：分母为当日 {self.total} 个计划项目。\n' + '\n'.join(
-            f'{LABELS[key]}：{value} 项（{value / self.total:.0%}）' for key, value in self.values.items()) + '\n按项目计数，不代表工作量或掌握程度。'
+            f"{row['label']}：{row['count']} 项（{row['count'] / self.total:.0%}）" for row in self.segments) + '\n按项目计数，不代表工作量或掌握程度。'
 
     def plot_rect(self):
         width = max(16, min(88, self.width() - 12))
@@ -125,11 +154,10 @@ class VerticalCoverageBar(QWidget):
         rect = self.plot_rect()
         bottom = rect.bottom()
         result = []
-        for key in ('done', 'incomplete', 'other_reported', 'unreported'):
-            if self.values[key]:
-                height = rect.height() * self.values[key] / self.total
-                bottom -= height
-                result.append((key, QRectF(rect.left(), bottom, rect.width(), height), self.values[key] / self.total))
+        for row in self.segments:
+            height = rect.height() * row['count'] / self.total
+            bottom -= height
+            result.append((row['key'], QRectF(rect.left(), bottom, rect.width(), height), row['count'] / self.total))
         return result
 
     def paintEvent(self, event):
@@ -149,11 +177,13 @@ class VerticalCoverageBar(QWidget):
             painter.setClipPath(path)
             painter.fillRect(rect, QColor(color('chart_track')))
             for key, segment, ratio in self.segment_rects():
-                painter.fillRect(segment, QColor(color(key)))
-                painter.setPen(QColor(color('chart_on_unknown' if key == 'unreported' else 'chart_on_color')))
+                row=next(row for row in self.segments if row['key']==key)
+                painter.fillRect(segment, QColor(color(row['color'])))
+                painter.setPen(QColor(color('chart_on_unknown' if row['color']=='unreported' else 'chart_on_color')))
                 percent = f'{ratio:.0%}'
-                label = {'done':'完成','incomplete':'未完成','other_reported':'其他','unreported':'未反馈'}[key]
-                text = label + '\n' + percent if segment.height() >= self.fontMetrics().height() * 2 + 4 and segment.width() >= self.fontMetrics().horizontalAdvance(label) + 4 else percent
+                lines=[KIND_LABELS.get(row['kind'],'事项'),RESULT_LABELS.get(str(row['result']),str(row['result'])),percent]
+                fits=segment.height()>=self.fontMetrics().height()*len(lines)+4 and segment.width()>=max(self.fontMetrics().horizontalAdvance(line) for line in lines)+4
+                text='\n'.join(lines) if fits else percent
                 if segment.height() >= self.fontMetrics().height() + 2 and segment.width() >= self.fontMetrics().horizontalAdvance(percent) + 2:
                     painter.drawText(segment.adjusted(1, 1, -1, -1), Qt.AlignmentFlag.AlignCenter, text)
         painter.end()
@@ -183,14 +213,11 @@ class WeekDaysChart(QWidget):
     @staticmethod
     def _detail(day):
         total, values = coverage(day.get('summary') or {})
-        if not day.get('has_plan'):
+        if not day.get('can_review',day.get('has_plan')):
             return '缺计划 · 请按实际情况复盘'
         if not total:
             return '空计划 · 当日没有计划项目'
-        text = f'完成 {values["done"]} · 未完成 {values["incomplete"]} · 未反馈 {values["unreported"]}'
-        if values['other_reported']:
-            text += f' · 其他已反馈 {values["other_reported"]}'
-        return text
+        return '；'.join(f"{row['label']} {row['count']}" for row in display_segments(day.get('summary') or {}))
 
     def _date_button(self, date):
         button = QPushButton(date[5:] if len(date) == 10 else date)
@@ -206,8 +233,8 @@ class WeekDaysChart(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self.day_labels, self.bars = [], []
-        hint = QLabel('每天同高为 100%；柱内按当日计划项目数分段，缺计划和空计划不计算占比。' if self.layout_style == 'columns'
-                      else '每行按当日计划项目数展示反馈覆盖；缺计划和空计划不计算占比。')
+        hint = QLabel('每天同高为 100%；按事项类别和实际结果分段，课程出勤与任务完成分别标明。未反馈保持未知。' if self.layout_style == 'columns'
+                      else '每行按事项类别和实际结果展示反馈；没有计划项目的日期不计算占比。')
         hint.setWordWrap(True)
         hint.setObjectName('Hint')
         self.layout.addWidget(hint)
@@ -242,11 +269,15 @@ class WeekDaysChart(QWidget):
             layout.addWidget(bar)
             layout.addWidget(self._date_button(date))
             text = '缺计划' if bar.kind == 'missing_plan' else '空计划' if bar.kind == 'empty_plan' else f'{bar.total} 项'
+            if bar.kind=='data':
+                text+='\n'+'\n'.join(f"{entry['label']} {entry['count']}" for entry in bar.segments)
             label = QLabel(text)
+            label.setWordWrap(True)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setToolTip(self._detail(day))
             label.setObjectName('Hint')
             layout.addWidget(label)
+            layout.addStretch()
             row.addWidget(column, 1)
             self.day_labels.append(label)
             self.bars.append(bar)

@@ -365,6 +365,7 @@ def apply_timetable(core,c,p,rid):
         raise BusinessError('timetable_rows_required','修改学期日期、时区或休息周规则需要明确提交全部已有行及版本，不能悄悄移动未列出的日程。',{'missing_keys':sorted(set(old_by_key)-set(supplied_keys))})
     # Allocate the container first only inside this caller-owned atomic transaction.
     table_data={**copy.deepcopy(prior),**metadata,'timetable_key':identity,'source_text':source,'source_versions':versions}
+    if p.get('source_context_operation'):table_data['source_context_operation']=p['source_context_operation']
     created_table=False
     if old:
         table=old
@@ -417,6 +418,7 @@ def apply_timetable(core,c,p,rid):
             reused_ids.append(existing['id']);continue
         desired['data']['timetable_source_version']=table['version']
         desired['data']['source_versions']=versions
+        if p.get('source_context_operation'):desired['data']['source_context_operation']=p['source_context_operation']
         if existing:
             target={**existing,**desired}
             core._validate(c,target)

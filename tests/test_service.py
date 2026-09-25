@@ -186,7 +186,7 @@ def test_cancel_generation_discards_late_model_output(tmp_path, monkeypatch):
         worker.join(5)
 
 
-def test_old_ai_proposal_cannot_overwrite_new_state(tmp_path, monkeypatch):
+def test_unrelated_new_task_does_not_invalidate_independent_candidate(tmp_path, monkeypatch):
     from management import ai
     core = Core(tmp_path / 'stale-proposal-synthetic')
     cmd(core, 'settings', {'settings': {'ai': {'enabled': True}}})
@@ -196,11 +196,9 @@ def test_old_ai_proposal_cannot_overwrite_new_state(tmp_path, monkeypatch):
     try:
         wait_core_job(core, id, 'awaiting_review')
         cmd(core, 'create', {'type': 'task', 'title': 'Synthetic later edit'})
-        with pytest.raises(BusinessError) as error:
-            cmd(core, 'apply_proposal', {'id': id})
-        assert error.value.code == 'stale_proposal'
-        assert [e['title'] for e in core.query('list', type='task')['items']] == ['Synthetic later edit']
-        assert core.query('job', id=id)['job']['status'] == 'awaiting_review'
+        cmd(core,'apply_proposal',{'id':id})
+        assert {e['title'] for e in core.query('list',type='task')['items']}=={'Synthetic later edit','Synthetic candidate'}
+        assert core.query('job',id=id)['job']['status']=='applied'
     finally:
         stop.set()
         worker.join(5)

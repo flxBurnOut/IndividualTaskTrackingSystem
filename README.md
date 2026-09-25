@@ -1,6 +1,6 @@
 # 个人事务管理
 
-Windows 原生个人事务管理软件，当前版本 0.11.2。基于 Python 3.12、PySide6 和 SQLite，桌面界面、MCP 接口与后台作业共用本机业务服务。
+Windows 原生个人事务管理软件，当前版本 0.14.1。基于 Python 3.12、PySide6 和 SQLite，桌面界面、MCP 接口与后台作业共用本机业务服务。
 
 ## 功能
 
@@ -8,6 +8,7 @@ Windows 原生个人事务管理软件，当前版本 0.11.2。基于 Python 3.1
 - 总览、每周课表、教学周与假期设置、日常习惯和提前提醒。
 - 资料托管、原文件目录、备份与恢复。
 - 可选的本机 Codex 协助：资料整理、计划候选和共享业务记录的普通对话入口。
+- 统一按需分页读取、长资料自动分批、原任务检查点接续和完整业务校验。
 
 ## 从源码运行
 
@@ -28,7 +29,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe packaging/build.py
 ```
 
-构建结果位于 `release/PersonalManagement-0.11.2/`。可打开 `PersonalManagement.exe`，或使用项目根目录的 `启动个人事务管理.vbs`（使用项目下的 `data` 数据空间）。便携版默认使用 `%LOCALAPPDATA%/PersonalManagement/data`。
+构建结果位于 `release/PersonalManagement-0.14.1/`。可打开 `PersonalManagement.exe`，或使用项目根目录的 `启动个人事务管理.vbs`（使用项目下的 `data` 数据空间）。便携版默认使用 `%LOCALAPPDATA%/PersonalManagement/data`。
 
 ## 仓库范围与数据边界
 
@@ -43,3 +44,6 @@ python -m venv .venv
 [使用说明](docs/使用说明.md) · [Codex 接口](docs/Codex接口与后台推理.md) · [开发与扩展](docs/开发与扩展.md) · [会话与原文件目录](docs/固定会话与原文件目录.md)
 
 保存、导入、到课、完成、提交与掌握是不同状态。模型生成的是待核对候选；业务事实以本机服务成功保存的记录为准。电脑关闭期间不执行定时任务。自动化测试不能替代真实模型、安装包和长时间稳定性验收。
+
+
+0.12.0 新增“在 Codex 桌面同步显示”连接模式，使用本机适配器复用桌面连接；首次启用需退出 Codex，再从管理软件设置启动连接模式。运行模式可以切回“仅在管理软件中处理”。适配不改 Codex 内部数据库和全局配置，连接不就绪时明确报错，不自动退回隐藏后台。桌面适配的发布与验收状态见 `docs/Codex接口与后台推理.md`。

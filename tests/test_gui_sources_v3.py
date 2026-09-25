@@ -79,8 +79,9 @@ def test_explicit_organize_sources_replace_history_and_send_once_after_ready(app
 def test_too_many_explicit_sources_are_not_silently_truncated(app):
     bridge=ControlledBridge();dialog=AssistanceDialog(bridge,prompt='Organize',source_ids=[str(i) for i in range(13)])
     try:
-        ready_conversation(dialog,bridge);dialog.start_job();assert bridge.commands==[]
-        assert len(dialog.selected_ids)==13 and '12' in dialog.status.text()
+        ready_conversation(dialog,bridge);dialog.start_job();assert bridge.commands
+        assert len(dialog.selected_ids)==13
+        assert len(bridge.commands[-1]['payload']['source_ids'])==13
     finally:dialog.close()
 
 def test_picker_preserves_selection_over_source_pages(app):

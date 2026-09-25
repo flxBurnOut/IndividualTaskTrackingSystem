@@ -35,6 +35,7 @@ def clear_layout(layout):
         item = layout.takeAt(0)
         widget = item.widget()
         if widget:
+            widget.hide()
             widget.deleteLater()
         elif item.layout():
             clear_layout(item.layout())
@@ -86,6 +87,12 @@ class CountProgress(QFrame):
             self.bar.hide()
             self.count.setText("还没有任务")
             self.explanation.setText("添加第一项任务后，这里会显示任务条目的完成情况。")
+            return
+        if summary.get('fixed_scheduled'):
+            reported=total-(unknown or 0)
+            self.count.setText(f"已反馈 {reported} / {total} 项")
+            self.bar.setRange(0,total);self.bar.setValue(reported);self.bar.show()
+            self.explanation.setText(f"已参加 {summary.get('attended',0)} 次 · 未参加 {summary.get('absent',0)} 次 · 仍需补课 {summary.get('catchup_needed',0)} 次。出勤不等于学习完成。")
             return
         self.count.setText(f"明确完成 {done} / {total} 项")
         self.bar.setRange(0, total)

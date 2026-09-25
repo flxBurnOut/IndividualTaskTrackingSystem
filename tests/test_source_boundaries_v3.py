@@ -55,6 +55,8 @@ def candidate(core,owner,source,actions):
     scope={'kind':'course','entity_id':owner['id']}
     sent=cmd(core,'send_message',{'scope':scope,'text':'Synthetic course extraction','source_ids':[source['id']]})
     id=sent['job']['id']
+    from context_harness import ready
+    ready(core,id,planning=any(a['command']=='create_plan' for a in actions))
     result={'summary':'Synthetic candidate, no actual model invoked','unknowns':[],'sources':[],
             'actions':actions,'provider':{'kind':'synthetic'}}
     with core.store.lock,core.store.connect() as c:
@@ -75,7 +77,7 @@ def test_managed_pdf_original_text_and_scan_images_survive_delete_backup_restore
     entity=result['entity'];extraction=entity['data']['extraction']
     assert entity['data']['managed_copy'] is True
     assert extraction['text_sha256'] and len(extraction['images'])==1
-    assert extraction['images'][0]['label']=='PDF第2页'
+    assert extraction['images'][0]['label']=='PDF 第 2 页图像'
     original.unlink()
     opened=core.query('open_resource',id=entity['id'])
     assert Path(opened['path']).read_bytes()==original_bytes
@@ -88,38 +90,38 @@ def test_managed_pdf_original_text_and_scan_images_survive_delete_backup_restore
     restored=Core(destination)
     assert restored.query('get',id=entity['id'])['entity']['data']['sha256']==hashlib.sha256(original_bytes).hexdigest()
     assert 'sixty percent' in restored.query('source_content',id=entity['id'])['text']
-    context=sources.prepare_context(restored,{'scope':{'kind':'course','entity_id':owner['id']},'source_ids':[entity['id']]})
-    assert len(context['local_images'])==1
-    image=Path(context['local_images'][0])
-    assert destination in image.parents and image.is_file()
-    assert hashlib.sha256(image.read_bytes()).hexdigest()==extraction['images'][0]['sha256']
-    assert not (destination/'runtime.json').exists()
-    image.write_bytes(b'Tampered derived cache')
-    with pytest.raises(BusinessError) as error:
-        sources.prepare_context(restored,{'scope':{'kind':'course','entity_id':owner['id']},'source_ids':[entity['id']]})
+    context=restored.query('prepare_context',goal='Verify restored evidence',scope={'kind':'course','entity_id':owner['id']},source_ids=[entity['id']])
+    from context_harness import read
+    from management.materials import image_bytes
+    op=context['operation_id'];image_ref=None
+    while True:
+        step=read(restored,'next_context_step',operation_id=op)
+        if step.get('all_steps_processed'):break
+        if step['content']['kind']=='image':
+            image_ref=step['content']['image_ref']
+            assert hashlib.sha256(image_bytes(restored,op,image_ref)).hexdigest()==extraction['images'][0]['sha256']
+        restored.query('checkpoint_context',operation_id=op,step_key=step['step_key'],delivery_token=step['delivery_token'],result={'facts':[]})
+    assert image_ref and not (destination/'runtime.json').exists()
+    restored.resources._blob(extraction['images'][0]['sha256']).write_bytes(b'Tampered derived cache')
+    with pytest.raises(BusinessError) as error:image_bytes(restored,op,image_ref)
     assert error.value.code=='source_integrity'
-    assert restored.resources._blob(extraction['images'][0]['sha256']).is_file()
 
 
-def test_nine_scanned_pdf_pages_are_explicitly_partial_with_only_eight_visuals(tmp_path):
-    core=Core(tmp_path/'data')
-    path=tmp_path/'scanned.pdf';make_pdf(path,text_pages=0,scan_pages=9)
-    result=cmd(core,'add_source',{'kind':'file','path':str(path)})
-    extraction=result['extraction']
-    assert extraction['status']=='partial'
-    assert extraction['coverage']['complete'] is False
-    assert extraction['coverage']['visual_pages']==list(range(1,9))
-    assert extraction['coverage']['unread_visual_pages']==[9]
-    assert len(extraction['images'])==8
-    assert core.query('source_content',id=result['entity']['id'])['text']==''
-    context=sources.prepare_context(core,{'scope':{'kind':'daily_plan','date':'2030-01-07'},'source_ids':[result['entity']['id']]})
-    assert context['source_context'][0]['coverage']['complete'] is False
-    assert len(context['local_images'])==8
-    extra=tmp_path/'extra.png';Image.new('RGB',(16,16),'red').save(extra)
-    additional=cmd(core,'add_source',{'kind':'image','path':str(extra)})['entity']
-    with pytest.raises(BusinessError) as error:
-        sources.prepare_context(core,{'scope':{'kind':'daily_plan','date':'2030-01-07'},'source_ids':[result['entity']['id'],additional['id']]})
-    assert error.value.code=='source_image_limit'
+def test_nine_scanned_pdf_pages_continue_until_all_nine_are_read(tmp_path):
+    core=Core(tmp_path/'data');owner=create(core);path=tmp_path/'nine.pdf'
+    make_pdf(path,text_pages=0,scan_pages=9)
+    result=cmd(core,'add_source',{'kind':'file','owner_id':owner['id'],'path':str(path)})
+    assert len(result['extraction']['images'])<=4
+    envelope=core.query('prepare_context',goal='Read all nine pages',source_ids=[result['entity']['id']])
+    op=envelope['operation_id'];count=0
+    from context_harness import read
+    while True:
+        step=read(core,'next_context_step',operation_id=op)
+        if step.get('all_steps_processed'):break
+        assert step['content']['kind']=='image'
+        count+=1
+        core.query('checkpoint_context',operation_id=op,step_key=step['step_key'],delivery_token=step['delivery_token'],result={'facts':[]})
+    assert count==9
 
 
 def test_pdf_page_limit_and_text_limit_cannot_report_full_coverage(tmp_path):
@@ -288,7 +290,7 @@ def test_parser_budget_kills_child_tree_and_retains_registered_original(tmp_path
     times=iter([0,46] if budget=='time' else [0,0])
     monkeypatch.setattr(sources.time,'monotonic',lambda:next(times))
     result=cmd(core,'add_source',{'kind':'file','path':str(original)})
-    assert result['extraction']['status']=='failed'
+    assert result['extraction']['coverage']['extraction_status'] in {'pending','paused'}
     assert result['extraction']['coverage']['complete'] is False
     assert killed==['child','parent']
     assert core.resources._blob(result['entity']['data']['sha256']).read_text('utf-8')=='Retain this original'
@@ -309,11 +311,12 @@ def test_prepare_context_replacement_limits_and_no_silent_text_truncation(tmp_pa
     assert sources.prepare_context(core,{'scope':scope,'source_ids':[]})['source_context']==[]
     oversized=source_fixture(core,tmp_path,'X'*(sources.MAX_CONTEXT_TEXT+1),owner)
     before=core.query('jobs')['total']
-    with pytest.raises(BusinessError) as error:
-        cmd(core,'send_message',{'scope':scope,'text':'Too large','source_ids':[oversized['id']]})
-    assert error.value.code=='source_context_limit'
-    assert core.query('jobs')['total']==before
-    assert core.query('conversation',scope=scope)['conversation']['source_ids']==[a['id']]
+    sent=cmd(core,'send_message',{'scope':scope,'text':'Read long material','source_ids':[oversized['id']]})
+    assert core.query('jobs')['total']==before+1
+    assert core.query('conversation',scope=scope)['conversation']['source_ids']==[oversized['id']]
+    from context_harness import materials
+    chunks=materials(core,sent['job'])
+    assert ''.join(step['content'].get('text','') for step in chunks)=='X'*(sources.MAX_CONTEXT_TEXT+1)
 
 
 def test_more_than_twelve_sources_requires_selection_instead_of_truncating(tmp_path):
@@ -321,10 +324,10 @@ def test_more_than_twelve_sources_requires_selection_instead_of_truncating(tmp_p
     items=[source_fixture(core,tmp_path,'Synthetic '+str(i),owner) for i in range(13)]
     scope={'kind':'course','entity_id':owner['id']}
     context=sources.prepare_context(core,{'scope':scope})
-    assert context['source_context']==[] and context['source_versions']=={}
+    assert context['source_context']==[] and context['source_versions']=={} and context['source_owner_scope']==owner['id']
     selected=sources.prepare_context(core,{'scope':scope,'source_ids':[item['id'] for item in items[:12]]})
-    assert len(selected['source_context'])==12
-    with pytest.raises(BusinessError): sources.prepare_context(core,{'scope':scope,'source_ids':[item['id'] for item in items]})
+    assert len(selected['source_versions'])==12
+    assert len(sources.prepare_context(core,{'scope':scope,'source_ids':[item['id'] for item in items]})['source_versions'])==13
 
 
 @pytest.mark.parametrize('operation',['update','feedback','plan','event_move','event_clear'])

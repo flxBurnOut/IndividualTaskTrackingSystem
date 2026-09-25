@@ -12,7 +12,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.11.2') / 'PersonalManagementService.exe'
+EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.14.1') / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
 
 async def main():
@@ -28,6 +28,11 @@ async def main():
         if result.returncode:
             raise RuntimeError(result.stderr or result.stdout)
         client = Client(data, autostart=False)
+        shim = EXE.with_name('PersonalManagementCodex.exe')
+        assert shim.is_file(), 'Missing desktop connection adapter'
+        connection = client.query('codex_connection')
+        assert connection['ready'] is False and 'token' not in connection
+        report['desktop_connection_adapter'] = {'packaged': True, 'not_ready_without_desktop': True, 'no_secrets_in_status': True}
         report['fresh_empty'] = client.state()['counts'] == {}
         report['diagnostic'] = json.loads(result.stdout)
         runtime = json.loads((data/'runtime.json').read_text('utf-8'))
@@ -143,8 +148,16 @@ async def main():
         document.drawString(40,350,'Synthetic timetable Monday Wednesday')
         document.drawString(40,300,'09:00 - 10:00 Math Physics');document.rect(35,280,450,60);document.showPage();document.save()
         timetabledoc=client.command('add_source',{'owner_id':table['entity']['id'],'kind':'file','path':str(timetable_pdf)})['result']['entity']
-        extraction=timetabledoc['data']['extraction'];assert extraction['coverage']['visual_complete'] and len(extraction['images'])==1
+        extraction=timetabledoc['data']['extraction'];assert extraction['coverage']['extraction_status']=='complete' and not extraction['coverage']['analysis_complete'] and len(extraction['images'])==1
         report['packaged_timetable']['pdf_layout_worker']=True
+        from openpyxl import Workbook
+        book=Workbook();sheet=book.active;sheet.append(['Week','Class']);sheet.append([1,'Synthetic tutorial'])
+        xlsx=root/'synthetic-schedule.xlsx';book.save(xlsx);book.close()
+        spreadsheet=client.command('add_source',{'owner_id':table['entity']['id'],'kind':'file','path':str(xlsx)})['result']['entity']
+        assert spreadsheet['data']['extraction']['coverage']['extraction_status']=='complete'
+        content=client.query('source_content',id=spreadsheet['id'])
+        assert 'Synthetic tutorial' in content['text']
+        report['packaged_xlsx_reader']=True
 
         recovery=client.command('set_recovery_task',{'course_id':owner['id'],'title':'Synthetic missed lessons','completion_gate':'Complete lessons and exercises','unit':'lessons','total_quantity':8,'completed_quantity':3,'source_text':'Explicit synthetic 3 of 8','reason':'self_reported'})['result']['entity']
         progress=client.query('recovery_summary',course_id=owner['id'])['items'][0]['progress']

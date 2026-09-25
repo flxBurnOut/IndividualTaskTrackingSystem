@@ -33,7 +33,7 @@ def _latest_plan(core, c, day):
 def _daily_record(core, c, day, plan_id):
     row = c.execute("""SELECT * FROM entities WHERE type='review' AND archived=0
         AND json_extract(data,'$.review_kind')='daily' AND json_extract(data,'$.date')=?
-        AND json_extract(data,'$.plan_id')=? ORDER BY created_at DESC,rowid DESC LIMIT 1""", (day, plan_id)).fetchone()
+        AND json_extract(data,'$.plan_id') IS ? ORDER BY created_at DESC,rowid DESC LIMIT 1""", (day, plan_id)).fetchone()
     return core.store.entity(row) if row else None
 
 
@@ -60,8 +60,13 @@ def _completion_feedback(core, c, start, end, targets):
 
 def _summary(items):
     counts = {'total': len(items), 'done': 0, 'incomplete': 0, 'unreported': 0,
-              'other_reported': 0, 'original_results': {}, 'archived': 0, 'pending_review': 0}
+              'other_reported': 0, 'original_results': {}, 'archived': 0, 'pending_review': 0,
+              'fixed_scheduled':0, 'attended':0, 'absent':0, 'catchup_needed':0}
     for item in items:
+        counts['fixed_scheduled'] += bool(item.get('fixed_schedule'))
+        counts['attended'] += item.get('result') == 'attended'
+        counts['absent'] += item.get('result') in {'absent','missed_needs_catchup'}
+        counts['catchup_needed'] += bool(item.get('catchup_task_id') and not (item.get('catchup_progress') or {}).get('completion_confirmed'))
         counts['archived'] += bool(item.get('target_archived'))
         if item.get('can_review', True) and not item['reported']:
             counts['pending_review'] += 1
@@ -73,16 +78,18 @@ def _summary(items):
             counts['original_results'][raw] = counts['original_results'].get(raw, 0) + 1
         else:
             counts['unreported'] += 1
+    from .review_display import aggregate
+    counts['breakdown']=aggregate(items)
     return counts
 
 
 def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
     if not plan_loaded:
         plan = _latest_plan(core, c, day)
-    if plan is None:
-        return {'date': day, 'has_plan': False, 'plan': None, 'items': [],
-                'summary': _summary([]), 'needs_codex': True,
-                'review_id': None, 'review_version': None}
+    from . import occurrences
+    fixed = occurrences.project(core,c,day)
+    manual_plan = plan
+    plan = plan or {'id':None,'version':None,'title':day+' 固定安排','data':{}}
     targets = {(day, b['target_id']) for b in plan['data'].get('blocks', []) if isinstance(b.get('target_id'), str) and b['target_id']}
     feedback = feedback if feedback is not None else _completion_feedback(core, c, day, day, targets)
     from .presentation import Presenter
@@ -95,6 +102,9 @@ def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
         seen.add(target_id)
         row = c.execute('SELECT * FROM entities WHERE id=?', (target_id,)).fetchone()
         target = core.store.entity(row) if row else None
+        if target and target['type'] == 'event':
+            # Fixed events are projected once, even when AI included a time block.
+            continue
         record = feedback.get((day, target_id))
         raw = record['data']['dimensions']['completion'] if record else None
         item = {'target_id': target_id,
@@ -118,10 +128,13 @@ def _daily(core, c, day, *, plan=None, feedback=None, plan_loaded=False):
         if record:
             item['feedback_id'] = record['id']
         items.append(item)
+    items.extend(fixed)
     review = _daily_record(core, c, day, plan['id'])
-    return {'date': day, 'has_plan': True,
-            'plan': {k: plan[k] for k in ('id', 'version', 'title')} | {'mode': plan['data'].get('mode', 'standard')},
-            'items': items, 'summary': _summary(items), 'needs_codex': False,
+    return {'date': day, 'has_plan': manual_plan is not None,
+            'can_review': bool(manual_plan or fixed), 'has_fixed_schedule': bool(fixed),
+            'schedule_signature': occurrences.signature(items),
+            'plan': ({k: plan[k] for k in ('id', 'version', 'title')} | {'mode': plan['data'].get('mode', 'standard')}) if manual_plan else None,
+            'items': items, 'summary': _summary(items), 'needs_codex': not bool(manual_plan or fixed),
             'historical_import':bool(plan['data'].get('historical_import')),
             'historical_source_asset_id':plan['data'].get('source_asset_id'),
             'review_id': review['id'] if review else None, 'review_version': review['version'] if review else None}
@@ -149,18 +162,20 @@ def query_weekly(core, c, p):
     feedback = _completion_feedback(core, c, start, end, targets)
     days, items = [], []
     total = {'planned': 0, 'done': 0, 'incomplete': 0, 'unreported': 0, 'other_reported': 0,
-             'days_with_plan': 0, 'days_without_plan': 0, 'original_results': {}, 'archived': 0, 'pending_review': 0}
+             'days_with_plan': 0, 'days_without_plan': 0, 'original_results': {}, 'archived': 0, 'pending_review': 0,
+             'fixed_scheduled':0, 'attended':0, 'absent':0, 'catchup_needed':0, 'days_with_fixed_schedule':0}
     item_index = 0
     for number in range((last - first).days + 1):
         day = (first + dt.timedelta(days=number)).isoformat()
         daily = _daily(core, c, day, plan=plans.get(day), plan_loaded=True, feedback=feedback)
         counts = daily['summary']
-        days.append({'date': day, 'has_plan': daily['has_plan'], 'summary': counts,
+        days.append({'date': day, 'has_plan': daily['has_plan'], 'can_review':daily['can_review'], 'has_fixed_schedule':daily['has_fixed_schedule'], 'summary': counts,
                      'historical_import':daily.get('historical_import',False),
                      'needs_codex': daily['needs_codex'], 'plan_id': daily['plan']['id'] if daily['plan'] else None})
         total['days_with_plan' if daily['has_plan'] else 'days_without_plan'] += 1
+        total['days_with_fixed_schedule'] += daily['has_fixed_schedule']
         total['planned'] += counts['total']
-        for key in ('done', 'incomplete', 'unreported', 'other_reported', 'archived', 'pending_review'):
+        for key in ('done', 'incomplete', 'unreported', 'other_reported', 'archived', 'pending_review', 'fixed_scheduled','attended','absent','catchup_needed'):
             total[key] += counts[key]
         for key, value in counts['original_results'].items():
             total['original_results'][key] = total['original_results'].get(key, 0) + value
@@ -168,6 +183,8 @@ def query_weekly(core, c, p):
             if offset <= item_index < offset + limit:
                 items.append({'date': day, **item})
             item_index += 1
+    from .review_display import merge
+    total['breakdown']=merge(row for day in days for row in day['summary']['breakdown'])
     reported = total['done'] + total['incomplete'] + total['other_reported']
     binary = total['done'] + total['incomplete']
     return {'start': start, 'end': end, 'days': days, 'summary': total, 'items': items,
@@ -176,7 +193,7 @@ def query_weekly(core, c, p):
                          'items_complete': offset == 0 and len(items) == item_index,
                          'next_offset': offset + len(items) if offset + len(items) < item_index else None,
                          'metrics_complete': not any(d.get('historical_import') for d in days),
-                         'historical_import_days':sum(bool(d.get('historical_import')) for d in days), 'denominator': 'latest_plan_unique_target_per_business_date',
+                         'historical_import_days':sum(bool(d.get('historical_import')) for d in days), 'denominator': ('daily_plan_and_dated_fixed_occurrences' if total['fixed_scheduled'] else 'latest_plan_unique_target_per_business_date'),
                          'feedback_coverage': reported / total['planned'] if total['planned'] else None,
                          'confirmed_completion_rate': total['done'] / binary if binary else None,
                          'missing_plan_is_failure': False, 'unknown_is_zero': False}}
@@ -185,34 +202,45 @@ def query_weekly(core, c, p):
 def submit_daily(core, c, p, rid):
     day = _date(p['date'])
     plan = _latest_plan(core, c, day)
-    if plan is None:
-        raise BusinessError('review_no_plan', '这一天没有每日计划，请到 Codex 按实际情况复盘。', {'date': day, 'needs_codex': True})
-    if p.get('plan_id') != plan['id'] or type(p.get('plan_version')) is not int or p['plan_version'] != plan['version']:
-        raise BusinessError('review_plan_conflict', '每日计划已经更新，请保留你的选择并重新读取后核对。',
-                            {'date': day, 'plan_id': plan['id'], 'plan_version': plan['version']})
-    daily = _daily(core, c, day, plan=plan, plan_loaded=True)
-    targets = {item['target_id']: item for item in daily['items']}
+    daily = _daily(core,c,day,plan=plan,plan_loaded=True)
+    if not daily['can_review']:
+        raise BusinessError('review_no_plan','这一天没有计划或固定安排，请到 Codex 按实际情况复盘。',{'date':day,'needs_codex':True})
+    if (plan and (p.get('plan_id') != plan['id'] or type(p.get('plan_version')) is not int or p['plan_version'] != plan['version'])) or (not plan and p.get('plan_id') is not None):
+        raise BusinessError('review_plan_conflict','每日计划已经更新，请保留你的选择并重新读取后核对。')
+    from . import occurrences
+    targets = {item.get('item_id',item['target_id']): item for item in daily['items']}
     answers = p.get('answers')
-    if not isinstance(answers, list) or len(answers) > 100:
-        raise BusinessError('validation', '每日复盘需要不超过 100 个明确结果。')
+    if not isinstance(answers,list) or len(answers)>100:
+        raise BusinessError('validation','每日复盘需要不超过 100 个明确结果。')
     seen = set()
     for answer in answers:
-        if not isinstance(answer, dict) or set(answer) != {'target_id', 'result'}:
-            raise BusinessError('validation', '复盘只接受对象与明确完成结果。')
-        target = answer['target_id']
-        if target not in targets or target in seen or answer['result'] not in RESULTS:
-            raise BusinessError('validation', '复盘对象需属于当前计划且不能重复，结果请选择完成或未完成。')
-        if targets[target].get('target_archived'):
-            raise BusinessError('task_deleted', '这项任务已删除，原计划和反馈保留。请先恢复任务再记录或更正反馈。')
-        if not targets[target]['available']:
-            raise BusinessError('not_found', '原计划对象已不可用，请到 Codex 核对。')
-        seen.add(target)
+        if not isinstance(answer,dict) or set(answer) not in ({'target_id','result'}, {'item_id','result'}):
+            raise BusinessError('validation','复盘只接受对象与明确结果。')
+        key = answer.get('item_id',answer.get('target_id'))
+        item = targets.get(key)
+        if not item or key in seen or answer['result'] not in dict(item.get('choices',occurrences.TASK_CHOICES)):
+            raise BusinessError('validation','复盘对象需属于当前日程且不能重复，请选择有效结果。')
+        if item.get('target_archived'):
+            raise BusinessError('task_deleted','这项记录已删除，历史反馈保留。请先恢复再更正。')
+        if not item.get('available'):
+            raise BusinessError('not_found','原计划对象已不可用，请到 Codex 核对。')
+        if item.get('fixed_schedule'):
+            if p.get('schedule_signature') != daily['schedule_signature']:
+                raise BusinessError('review_plan_conflict','课表或本次反馈已更新，请重新读取后核对。')
+            if not item['can_review']:
+                raise BusinessError('occurrence_feedback','未来课程不能提前登记为实际出勤或缺课。')
+        seen.add(key)
+    plan = plan or {'id':None,'version':None}
     review = _daily_record(core, c, day, plan['id'])
     if not answers:
         return {'review': review, 'feedback_ids': [], 'changed_count': 0, 'summary': daily['summary']}
     feedback_ids = []
     for answer in answers:
-        existing = targets[answer['target_id']]
+        existing = targets[answer.get('item_id',answer.get('target_id'))]
+        if existing.get('fixed_schedule'):
+            identifier = occurrences.record(core,c,existing,answer['result'],rid)
+            if identifier: feedback_ids.append(identifier)
+            continue
         if existing['raw_result'] == answer['result']:
             continue
         payload = {'target_id': answer['target_id'], 'business_date': day,
@@ -222,8 +250,8 @@ def submit_daily(core, c, p, rid):
             payload['supersedes_id'] = existing['feedback_id']
         record = core.feedback(c, payload, rid)
         feedback_ids.append(record['id'])
-    after = _daily(core, c, day, plan=plan, plan_loaded=True)
-    results = {item['target_id']: {'completion': item['raw_result'], 'feedback_id': item.get('feedback_id')}
+    after = _daily(core, c, day)
+    results = {item.get('item_id',item['target_id']): {item.get('review_dimension','completion'): item['raw_result'], 'feedback_id': item.get('feedback_id')}
                for item in after['items'] if item['reported']}
     data = {'review_kind': 'daily', 'date': day, 'start': day, 'end': day,
             'plan_id': plan['id'], 'plan_version': plan['version'], 'results': results,

@@ -73,6 +73,11 @@ def fetch_web(url):
 
 
 def extract(core,metadata,name,directory,*,layout_mode=None):
+    from .materials import prepare_extraction
+    return prepare_extraction(core,metadata,name,layout=layout_mode)
+
+
+def _legacy_extract(core,metadata,name,directory,*,layout_mode=None):
     root=Path(directory)
     (root/'input.json').write_text(json.dumps({'source_path':str(core.resources._blob(metadata['sha256'])),'original_name':name,'layout_mode':layout_mode}),encoding='utf-8')
     args=[sys.executable]
@@ -145,7 +150,7 @@ def prepare(core,p):
             text=p.get('text')
             if not isinstance(text,str) or not text.strip():raise BusinessError('source_text','请粘贴需要保存的正文。')
             if len(text)>MAX_INPUT_TEXT:raise BusinessError('source_limit','正文过长，请分成多份资料。')
-            name='邮件正文.txt' if kind=='email' else '通知.txt';source=root/name;source.write_text(text,encoding='utf-8')
+            name='邮件正文.txt' if kind=='email' else '通知.txt';source=root/name;source.write_bytes(text.encode('utf-8'))
         elif kind=='web':
             fetched=fetch_web(p.get('url',''));source_url=fetched['url']
             name='网页快照.html' if fetched['media_type']=='text/html' else '网页快照.txt'
@@ -208,49 +213,59 @@ def list_sources(core,c,p):
 def content(core,p):
     with core.store.connect() as c:entity=core.store.get(c,p['id'])
     extraction=entity['data'].get('extraction') or {'status':'unsupported','coverage':{'complete':False},'warnings':['这份旧记录没有可读取快照。请先保存到软件。']}
+    key=extraction.get('material_key')
+    if key:
+        from .materials import extraction_summary
+        extraction=extraction_summary(core,key)
+        offset=max(0,int(p.get('offset',0)));limit=max(1,min(24000,int(p.get('limit',12000))))
+        parts=[];position=0;length=0;has_more=False
+        with core.store.connect() as c:
+            for row in c.execute("SELECT sha256 FROM material_chunks WHERE material_key=? AND kind='text' ORDER BY seq",(key,)):
+                from .materials import verified_bytes
+                piece=verified_bytes(core,row['sha256']).decode('utf-8')
+                end=position+len(piece)
+                if end>offset:
+                    selected=piece[max(0,offset-position):max(0,offset-position)+limit-length]
+                    parts.append(selected);length+=len(selected)
+                    if length==limit:has_more=end>offset+limit or c.execute("SELECT status FROM material_catalog WHERE key=?",(key,)).fetchone()[0]=='pending';break
+                position=end
+            total=extraction.get('characters',position)
+        following=offset+length if offset+length<total else None
+        return {'entity_id':entity['id'],'text':''.join(parts),'extraction':extraction,'coverage':extraction['coverage'],'next_offset':following,'characters':total,
+                'extraction_pending':extraction['coverage'].get('extraction_status')=='pending'}
     sha=extraction.get('text_sha256');text=core.resources._blob(sha).read_text('utf-8') if sha else ''
     offset=max(0,int(p.get('offset',0)));limit=max(1,min(24000,int(p.get('limit',12000))))
     return {'entity_id':entity['id'],'text':text[offset:offset+limit],'extraction':extraction,'coverage':extraction.get('coverage',{}),'next_offset':offset+limit if offset+limit<len(text) else None,'characters':len(text)}
 
 
 def prepare_context(core,p):
-    scope=p.get('scope') or {};owner=scope.get('entity_id');selected=p.get('source_ids') or []
-    if not isinstance(selected,list) or len(selected)>MAX_SOURCES or any(not isinstance(i,str) for i in selected):raise BusinessError('source_limit','一次讨论最多附带12份资料。')
+    scope=p.get('scope') or {};owner=scope.get('entity_id');selected=p.get('source_ids',[])
+    if not isinstance(selected,list) or any(not isinstance(i,str) or not i for i in selected):
+        raise BusinessError('source_limit','资料编号格式无效。')
     with core.store.connect() as c:
         from .conversations import query as query_conversation
         conversation=query_conversation(core,c,{'scope':scope})['conversation']
         previous=conversation['source_ids'] if conversation else []
-        ids=list(dict.fromkeys(selected if 'source_ids' in p else previous))
-        if 'source_ids' not in p and conversation is None and owner:
-            available=list_sources(core,c,{'owner_id':owner,'limit':MAX_SOURCES+1})
-            # Bulk collections require explicit attachments, but normal discussion remains available.
-            ids=[x['id'] for x in available['items']] if available['total']<=MAX_SOURCES else []
-        if len(ids)>MAX_SOURCES:raise BusinessError('source_limit','本次讨论累计资料超过12份，请分批另开资料范围。')
-        entities=[core.store.get(c,i) for i in ids]
-    materials=[];images=[];versions={};total=0
-    for entity in entities:
-        if entity['archived'] or entity['type'] not in {'asset','artifact'}:raise BusinessError('source_unavailable','资料尚未保存为软件副本，请先在所属课程中选择保存到软件。')
-        data=entity['data'];extraction=data.get('extraction') or {};sha=extraction.get('text_sha256')
-        text=core.resources._blob(sha).read_text('utf-8') if sha else ''
-        total+=len(text)
-        if total>MAX_CONTEXT_TEXT:raise BusinessError('source_context_limit','资料正文超过本次讨论预算，请选择较少资料或拆分课件；没有截断后假称已完整读取。')
-        if scope.get('kind') == 'timetable' and Path(data.get('original_name') or '').suffix.lower() == '.pdf' and extraction.get('coverage', {}).get('layout_mode') != 'timetable':
-            raise BusinessError('timetable_layout_missing', '这份PDF以前只提取了文字，请在每周课表里重新添加原文件，以核对课表行列。')
-        current_images=extraction.get('images') or []
-        if len(images)+len(current_images)>8:raise BusinessError('source_image_limit','本次最多读取8张图片或扫描页，请分批提供。')
-        for item in current_images:
-            blob=core.resources._blob(item['sha256'])
-            directory=_plain_path(core.root/'exports'/'source-images');directory.mkdir(parents=True,exist_ok=True)
-            imagepath=_plain_path(directory/(item['sha256']+'.png'))
-            if not imagepath.exists():
-                with core.resources._reservation(blob.stat().st_size):
-                    import shutil
-                    with blob.open('rb') as src,imagepath.open('xb') as dst:shutil.copyfileobj(src,dst,1024*1024)
-            elif _digest(imagepath)[0]!=item['sha256']:raise BusinessError('source_integrity','资料图片缓存与保存版本不一致，请重新登记该图片。')
-            images.append(str(imagepath))
-        materials.append({'id':entity['id'],'title':entity['title'],'version':entity['version'],'kind':data.get('source_kind','file'),'text':text,'coverage':extraction.get('coverage',{'complete':False}),'warnings':extraction.get('warnings',['资料未提取正文，不能声称已读取。']),'sha256':data.get('sha256'),'visuals':[item['label'] for item in current_images]})
-        versions[entity['id']]=entity['version']
-    return {'source_context':materials,'local_images':images,'source_versions':versions}
+        source_owner=owner if 'source_ids' not in p and (conversation is None or conversation.get('source_scope_owner')) else None
+        ids=dict.fromkeys(selected if 'source_ids' in p else previous)
+        if source_owner:ids={}
+        versions={}
+        for identifier in ids:
+            e=core.store.get(c,identifier)
+            if e['archived'] or e['type'] not in {'asset','artifact'}:raise BusinessError('source_unavailable','资料尚未保存为软件副本。')
+            versions[identifier]=e['version']
+    import re
+    new_selection='source_ids' in p and bool(ids) and set(ids)!=set(previous)
+    requested=bool(p.get('skill_id')) or bool(re.search(r'课件|资料|评分|考核|笔记|提取|导入|解析|全文|课表|syllabus|material|extract|read.*(?:source|file|timetable)',p.get('text',''),re.I))
+    analyze=bool((versions or source_owner) and (new_selection or requested))
+    return {'source_context':[],'local_images':[],'source_versions':versions,
+            'source_owner_scope':source_owner,'analyze_materials':analyze}
+
+
+def scope_source_sql(alias='e'):
+    return f"""({alias}.parent_id=? OR json_extract({alias}.data,'$.source_owner_id')=?
+        OR EXISTS(SELECT 1 FROM links l WHERE l.source_id=? AND l.target_id={alias}.id
+          OR l.target_id=? AND l.source_id={alias}.id))"""
 
 
 def apply_source_action(core,c,job,action,rid):
@@ -267,22 +282,27 @@ def apply_source_action(core,c,job,action,rid):
             raise BusinessError('timetable_scope', '课表整理候选只能更新当前课表，请核对后重新生成。')
         if not payload.get('source_text'):
             raise BusinessError('source_evidence', '课表候选需要保留实际资料或用户补充作为依据。')
-        payload = {**payload, 'source_versions': value.get('source_versions', {})}
+        if value.get('context_operation_id'):
+            payload={**payload,'source_versions':{},'source_context_operation':value['context_operation_id']}
+        else:payload = {**payload, 'source_versions': value.get('source_versions', {})}
         return core._dispatch(c, action['command'], payload, rid)
-    if scope.get('kind')!='course'  or not value.get('source_versions'):
+    if scope.get('kind')!='course' or not (value.get('source_versions') or value.get('source_owner_scope')):
         return core._dispatch(c,action['command'],payload,rid)
     owner=scope['entity_id']
-    owned={row[0] for row in c.execute('WITH RECURSIVE tree(id) AS (SELECT ? UNION SELECT e.id FROM entities e JOIN tree t ON e.parent_id=t.id) SELECT id FROM tree',(owner,))}
+    def belongs(identifier):
+        return bool(c.execute('''WITH RECURSIVE ancestors(id,parent_id) AS
+            (SELECT id,parent_id FROM entities WHERE id=? UNION SELECT e.id,e.parent_id FROM entities e JOIN ancestors a ON e.id=a.parent_id)
+            SELECT 1 FROM ancestors WHERE id=? LIMIT 1''',(identifier,owner)).fetchone())
     def in_scope(identifier):
-        if identifier in owned:return True
+        if belongs(identifier):return True
         row=c.execute("SELECT data FROM entities WHERE id=? AND type='event'",(identifier,)).fetchone()
-        return bool(row and json.loads(row[0]).get('owner_id') in owned)
+        return bool(row and belongs(json.loads(row[0]).get('owner_id')))
     if action['command'] in {'update','record_feedback'}:
         target=payload.get('id') if action['command']=='update' else payload.get('target_id')
         if not in_scope(target):raise BusinessError('course_scope','课程资料候选不能修改另一课程或范围外的事项。')
         if action['command']=='update':
             patch=payload.get('patch') or {};new_owner=(patch.get('data') or {}).get('owner_id')
-            if 'owner_id' in (patch.get('data') or {}) and new_owner not in owned:raise BusinessError('course_scope','课程候选不能把日程改归其他课程。')
+            if 'owner_id' in (patch.get('data') or {}) and not belongs(new_owner):raise BusinessError('course_scope','课程候选不能把日程改归其他课程。')
     if action['command']=='set_recovery_task':
         if payload.get('course_id') != owner or any(payload.get(key) and not in_scope(payload[key]) for key in ('id', 'original_task_id')):
             raise BusinessError('course_scope', '补课与补欠候选只能登记当前课程的任务。')
@@ -306,7 +326,7 @@ def apply_source_action(core,c,job,action,rid):
         raise BusinessError('course_scope','课程整理生成的事项需要归属当前课程，请让 Codex 修正候选。')
     if not data.get('source_text'):
         raise BusinessError('source_evidence','课程整理候选需要附上来源页码或原文，请让 Codex 补充后保存。')
-    ignored={'source_text','source_ids','source_versions','captured_at'}
+    ignored={'source_text','source_ids','source_versions','source_context_operation','captured_at'}
     expected={k:v for k,v in data.items() if k not in ignored and v is not None and v!=''}
     rows=c.execute("SELECT * FROM entities WHERE type=? AND title=? AND archived=0 AND " + ("json_extract(data,'$.owner_id')=?" if kind=='event' else 'parent_id=?'),(kind,payload['title'],owner))
     for row in rows:
@@ -317,5 +337,9 @@ def apply_source_action(core,c,job,action,rid):
         # definitions must be updated deliberately, never silently duplicated.
         if kind!='event' or known.get('date')==expected.get('date'):
             raise BusinessError('source_conflict','已有同名课程事项且内容不同，请核对后更新原记录，避免重复创建。',{'entity_id':existing['id']})
-    data['source_versions']=value['source_versions']
+    if value.get('context_operation_id'):
+        data['source_context_operation']=value['context_operation_id']
+        explicit=data.get('source_ids') or []
+        data['source_versions']={identifier:value['source_versions'][identifier] for identifier in explicit if identifier in value['source_versions']}
+    else:data['source_versions']=value['source_versions']
     return core._dispatch(c,'create',{**payload,'data':data},rid)

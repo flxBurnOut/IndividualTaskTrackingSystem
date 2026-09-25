@@ -20,12 +20,13 @@ INSTRUCTIONS = (
     "必须携带读取所得 epoch、revision 和唯一 request_id；重试使用同一 ID 与同一内容。"
     "旧聊天不是当前事实。未确认保持未知，完成/出席/学习/提交/掌握分别记录。"
     "事实更新不自动重排计划。不要访问数据库、工作簿或生成写库脚本。普通操作由你推理，"
-    "不会再次启动后台 AI。生成计划前读取完整 plan_context；遇到冲突重新读取并处理，"
+    "不会再次启动后台 AI。优先 prepare_context 并用统一分页工具读取完整约束；遇到冲突重新读取并处理，"
     "不可更换版本号盲重试。只有成功回执表示写入成功。"
 )
 
 QueryName = Literal[
-    "timetables", "timetable_week",
+    "conversation_targets",
+    "codex_connection", "timetables", "timetable_week",
     "skills", "habits_overview", "dashboard",
     "recovery_summary",
     "daily_tasks", "recurring_rules", "preview_recurring", "codex_models",
@@ -36,6 +37,8 @@ QueryName = Literal[
     "learning_summary", "assessment_summary", "collection_summary", "project_summary", "coverage_gaps",
 ]
 CommandName = Literal[
+    "resume_context_operation",
+    "attach_conversation",
     "set_task_completion", "revise_plan",
     "delete_task", "restore_task",
     "apply_timetable",
@@ -84,7 +87,22 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
 
     def query(name: str, **params: Any) -> dict[str, Any]:
         try:
-            return client.query(name, **params)
+            value=client.query(name, **params)
+            from .context_service import size,MAX_PAGE_BYTES,QUERY_NAMES
+            if name not in QUERY_NAMES and name not in {'material_image','state','settings'} and size(value)>MAX_PAGE_BYTES:
+                scope={'kind':'general'}
+                if params.get('date'):scope['date']=params['date']
+                if params.get('owner_id'):scope['entity_id']=params['owner_id']
+                if name=='conversation' and value.get('conversation'):scope['conversation_id']=value['conversation']['id']
+                context=client.query('prepare_context',goal='读取 '+name,scope=scope)
+                operation=context['operation_id']
+                if name=='receipt':return client.query('read_context_item',operation_id=operation,id='receipt:'+params['request_id'])
+                if name=='job':return client.query('read_context_item',operation_id=operation,id='job:'+params['id'])
+                if name=='get':return client.query('read_context_item',operation_id=operation,id=params['id'])
+                if name=='list':return client.query('query_context',operation_id=operation,collection='records',
+                    filters={k:params[k] for k in ('type','status','search','parent_id') if params.get(k)})
+                return {'context':context,'requested_view':name,'instruction':'结果按统一分页接口读取，未将截断正文当作完整结果。'}
+            return value
         except Exception as exc:
             if hasattr(exc, "code"):
                 raise ToolError(json.dumps({"code": exc.code, "message": str(exc), "details": getattr(exc, "details", {})}, ensure_ascii=False)) from exc
@@ -108,17 +126,10 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         jobs and saved drafts are in the shared service, not this conversation.
         Read plan_context separately before planning. No hidden background AI.
         """
-        for _ in range(2):
-            before = query("state")
-            capabilities = query("capabilities")
-            jobs = query("jobs")
-            today = query("today", date=business_date) if business_date else None
-            after = query("state")
-            if (before.get("epoch"), before.get("revision")) == (after.get("epoch"), after.get("revision")):
-                return {**after, "capabilities": capabilities, "jobs": jobs, "today": today,
-                        "instructions": INSTRUCTIONS,
-                        "continuity": "界面和全部对话读取同一数据；先查未完成工作，再按最新版本修改。"}
-        raise ToolError("上下文读取期间数据连续变化，请重新读取。")
+        state=query('state')
+        envelope=query('prepare_context',goal='读取当前个人事务',scope={'kind':'general',**({'date':business_date} if business_date else {})})
+        return {**state,'context':envelope,'instructions':INSTRUCTIONS,
+                'continuity':'先按需读取本次记录和未完成操作；软件与全部对话共用同一业务服务。'}
 
     @server.tool(annotations=READ, structured_output=True)
     def query_business(name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -157,7 +168,7 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         Missing capacity is unknown. Preserve hard constraints even when candidate
         tasks are paginated; do not treat incomplete task coverage as exhaustive.
         """
-        return query("plan_context", date=date, mode=mode)
+        return query("prepare_context", goal="生成每日计划", scope={"kind":"daily_plan","date":date})
 
     @server.tool(annotations=READ, structured_output=True)
     def review_period(start: str, end: str) -> dict[str, Any]:
@@ -263,6 +274,8 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             raise ToolError(json.dumps({"code": "unknown_command", "message": "Command is not registered."}))
         return command(name, payload, request_id, epoch, expected_revision)
 
+    from .context_mcp import register_tools
+    register_tools(server,query)
     return server
 
 

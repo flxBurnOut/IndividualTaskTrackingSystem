@@ -23,17 +23,19 @@ def test_fresh_timetable_discussion_uploads_sources_and_rereads_current_records(
  result=cmd(core,'send_message',{'scope':{'kind':'timetable','entity_id':table['id']},'text':'Read my weekly timetable'})
  context=result['job']['input']
  assert context['allowed_commands']==['apply_timetable']
- assert context['source_versions']=={source['id']:source['version']}
- assert 'Every Monday' in context['context']['materials'][0]['text']
- assert context['context']['discussion_scope']['owner']['id']==table['id']
+ assert context['source_owner_scope']==table['id'] and context['source_versions']=={}
+ from context_harness import materials,item,rows
+ chunks=materials(core,result['job'])
+ assert any('Every Monday' in part['content'].get('text','') for part in chunks)
+ assert item(core,result['job'],table['id'])['id']==table['id']
  assert not core.query('list',type='event')['total']
  assert not core.query('list',type='plan')['total']
  cmd(core,'cancel_job',{'id':result['job']['id']})
  cmd(core,'apply_timetable',payload(table))
  again=cmd(core,'send_message',{'scope':{'kind':'timetable','entity_id':table['id']},'text':'Read current adopted schedule','source_ids':[]})
  assert again['conversation']['id']==result['conversation']['id']
- assert again['job']['input']['context']['discussion_scope']['owner']['version']>table['version']
- assert len(again['job']['input']['context']['discussion_scope']['timetable']['rows'])==1
+ assert item(core,again['job'],table['id'])['version']>table['version']
+ assert len(rows(core,again['job'],'events'))==1
 
 
 def test_source_scope_rejects_unrelated_mutations_and_keeps_provenance(tmp_path):

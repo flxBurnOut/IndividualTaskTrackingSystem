@@ -29,7 +29,15 @@ class _Worker(QObject):
                     factory = Client
                 self.client = factory(self.data_dir)
             if method == "command":
-                result = self.client.command(name, arguments["payload"], **arguments.get("options", {}))
+                options=dict(arguments.get("options", {}))
+                if name=='send_message':
+                    # A raw message requests fresh reasoning, not adoption of an
+                    # edited business snapshot. Refresh its revision after native
+                    # desktop turns while retaining the original epoch and ID.
+                    state=self.client.query('state')
+                    if options.get('epoch')==state.get('epoch'):
+                        options['expected_revision']=state['revision']
+                result = self.client.command(name, arguments["payload"], **options)
             else:
                 result = self.client.query(name, **arguments)
             self.completed.emit(serial, result, None)
@@ -67,6 +75,7 @@ class ServiceBridge(QObject):
         manager = install_gui_gc()
         super().__init__(parent)
         self._closing = False
+        self.data_dir = data_dir
         self.thread = QThread(self)
         self.worker = _Worker(data_dir, client_factory)
         self.worker.moveToThread(self.thread)

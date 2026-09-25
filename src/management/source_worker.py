@@ -186,6 +186,11 @@ def parse(source,name,workspace,*,layout_mode=None):
 def worker(workspace):
     root=Path(workspace).resolve();request=json.loads((root/'input.json').read_text('utf-8'))
     try:
+        if request.get('batch'):
+            from .material_worker import parse_batch
+            result=parse_batch(request['source_path'],request['original_name'],root,cursor=request.get('cursor'),layout=request.get('layout_mode'),batch_units=request.get('batch_units',40))
+            (root/'result.json').write_text(json.dumps(result,ensure_ascii=False),encoding='utf-8')
+            return 0
         value=parse(request['source_path'],request['original_name'],root,layout_mode=request.get('layout_mode'))
         (root/'text.txt').write_text(value.pop('text'),encoding='utf-8')
         result={'ok':True,**value}

@@ -27,6 +27,8 @@ def proposal(targets,day='2030-01-01',mode='no_precise_time'):
 
 
 def finish(core,job,result):
+    from context_harness import ready
+    ready(core,job,planning=True)
     with core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         result=normalize(core,c,job,result)
@@ -39,9 +41,9 @@ def test_large_task_bodies_do_not_drop_most_of_the_planning_universe(tmp_path):
     core=Core(tmp_path)
     tasks=[task(core,f'Existing task {i}',data={'notes':'Long imported history. '*400,'next_action':'Use the recorded materials','priority':'normal','due_date':'2030-01-02'}) for i in range(48)]
     cmd(core,'create',{'type':'event','title':'Future exam date unknown','data':{'hard':True}})
-    job=request(core);planning=job['input']['context']['planning']
-    assert planning['coverage']['task_index_complete']
-    assert {t['id'] for t in planning['tasks']}=={t['id'] for t in tasks}
+    job=request(core)
+    from context_harness import rows
+    assert {t['id'] for t in rows(core,job,'tasks')}=={t['id'] for t in tasks}
     assert len(encode(job['input']['context']))<42000
     assert job['input']['allowed_commands']==['create_plan']
     assert core.query('list',type='plan')['total']==0
@@ -89,9 +91,10 @@ def test_invalid_candidate_never_leaks_a_plan_or_audit_record(tmp_path,bad):
 
 
 def test_other_client_edit_requires_reread_before_adoption(tmp_path):
-    core=Core(tmp_path);t=task(core);job=request(core);finish(core,job,proposal([t]));task(core,'Added elsewhere')
+    core=Core(tmp_path);t=task(core);job=request(core);finish(core,job,proposal([t]))
+    cmd(core,'update',{'id':t['id'],'version':t['version'],'patch':{'title':'Changed target'}})
     with pytest.raises(BusinessError) as error:cmd(core,'apply_proposal',{'id':job['id']})
-    assert error.value.code=='stale_proposal'
+    assert error.value.code=='context_changed'
     assert core.query('list',type='plan')['total']==0
 
 

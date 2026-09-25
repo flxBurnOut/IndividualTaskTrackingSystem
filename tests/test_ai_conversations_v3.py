@@ -84,18 +84,17 @@ def test_resume_same_id_without_unstable_history_or_start_only_fields(rpc):
     assert result['provider']['recovery'] == 'resumed'
 
 
-def test_missing_provider_thread_rebuilds_once_from_software_history(rpc, monkeypatch):
-    monkeypatch.setattr(RPC, 'resume_error', 'AI_REQUEST_REJECTED')
-    result = ai.generate(request(provider_thread_id='unavailable'), {'enabled': True}, threading.Event())
-    instance = rpc.instances[-1]
-    assert [name for name, p in instance.requests] == ['initialize', 'thread/resume', 'thread/start', 'thread/name/set', 'turn/start']
-    assert result['provider']['recovery'] == 'history_rebuilt'
-    assert result['provider']['thread_id'] == 'new-provider-thread'
-    content = json.loads(instance.requests[-1][1]['input'][0]['text'])
-    assert content['software_discussion_history']['messages'][0]['text'] == 'Old discussion, not a fact'
+def test_resume_rejection_preserves_thread_and_never_rebuilds(rpc, monkeypatch):
+    monkeypatch.setattr(RPC,'resume_error','AI_REQUEST_REJECTED')
+    with pytest.raises(ai.AIError) as error:
+        ai.generate(request(provider_thread_id='unavailable'),{'enabled':True},threading.Event())
+    assert error.value.code=='AI_REQUEST_REJECTED'
+    instance=rpc.instances[-1]
+    assert [name for name,p in instance.requests]==['initialize','thread/resume']
+    assert instance.closed
 
 
-@pytest.mark.parametrize('code', ['AI_CANCELLED', 'AI_TIMEOUT', 'AI_TOOL_BLOCKED', 'AI_DISCONNECTED'])
+@pytest.mark.parametrize('code',['AI_CANCELLED','AI_TIMEOUT','AI_TOOL_BLOCKED'])
 def test_resume_cancel_timeout_or_tool_request_never_retries(rpc, monkeypatch, code):
     monkeypatch.setattr(RPC, 'resume_error', code)
     with pytest.raises(ai.AIError) as error:

@@ -45,8 +45,10 @@ def test_notice_email_and_image_become_owned_readable_sources(tmp_path):
     saved=command(c,'add_source',{'owner_id':owner['id'],'kind':'image','path':str(image)})
     assert saved['extraction']['status']=='vision_ready'
     prepared=sources.prepare_context(c,{'scope':{'kind':'course','entity_id':owner['id']},'source_ids':[notice['entity']['id'],saved['entity']['id']]})
-    assert len(prepared['local_images'])==1 and Path(prepared['local_images'][0]).is_file()
-    assert len(prepared['source_context'])==2
+    assert prepared['local_images']==[] and prepared['source_context']==[]
+    assert len(prepared['source_versions'])==2
+    # Images are supplied as actual MCP image blocks during the bounded read,
+    # rather than all being injected into the initial request.
 
 
 def test_unowned_chat_attachment_and_explicit_empty_selection(tmp_path):

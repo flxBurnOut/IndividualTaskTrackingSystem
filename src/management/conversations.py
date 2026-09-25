@@ -30,8 +30,14 @@ def initialize(c):
         text TEXT NOT NULL,job_id TEXT,state TEXT NOT NULL,proposal_state TEXT NOT NULL DEFAULT 'none',
         source_ids TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL,
         UNIQUE(conversation_id,job_id,role))""")
+    if 'source_scope_owner' not in {r[1] for r in c.execute('PRAGMA table_info(conversations)')}:
+        c.execute('ALTER TABLE conversations ADD COLUMN source_scope_owner TEXT')
     c.execute('CREATE INDEX IF NOT EXISTS conversation_message_page ON conversation_messages(conversation_id,seq)')
     c.execute('CREATE INDEX IF NOT EXISTS conversation_message_job ON conversation_messages(job_id,role)')
+    from .conversation_progress import initialize as initialize_progress
+    initialize_progress(c)
+    from .session_coordinator import initialize as initialize_coordinator
+    initialize_coordinator(c)
 
 
 def _scope(c, value):
@@ -106,7 +112,7 @@ def query(core, c, p):
         scope = _scope(c, p['scope'])
         row = c.execute('SELECT * FROM conversations WHERE scope_key=?', (_scope_key(scope),)).fetchone()
     if row is None:
-        return {'conversation': None, 'messages': [], 'next_before': None, 'has_more': False}
+        return {'conversation': None, 'messages': [], 'next_before': None, 'has_more': False, 'active_progress': None, 'latest_progress': None}
     args = [row['id']]
     where = 'conversation_id=?'
     if before is not None:
@@ -117,7 +123,8 @@ def query(core, c, p):
     messages = [_message(item) for item in reversed(records[:limit])]
     conversation = _conversation(row)
     conversation['sources'] = _sources(c, conversation['source_ids'])
-    return {'conversation': conversation, 'messages': messages,
+    from .conversation_progress import query as query_progress
+    return {**query_progress(c, conversation), 'conversation': conversation, 'messages': messages,
             'next_before': messages[0]['seq'] if has_more and messages else None, 'has_more': has_more}
 
 
@@ -208,8 +215,8 @@ def send(core, c, p, rid, prepared=None):
     if type(p.get('request_plan',False)) is not bool or p.get('request_plan') and scope['kind']!='daily_plan':
         raise BusinessError('validation','生成计划需要明确的每日计划范围。')
     text = p.get('text')
-    if not isinstance(text, str) or not text.strip() or len(text) > 12000:
-        raise BusinessError('validation', '请输入不超过 12000 字符的讨论内容；长资料请作为附件选择。')
+    if not isinstance(text, str) or not text.strip() or len(text.encode('utf-8')) > 800000:
+        raise BusinessError('validation', '请输入讨论内容；超过单次传输大小的原文可作为文件添加。')
     source_ids = p.get('source_ids', [])
     if not isinstance(source_ids, list) or any(not isinstance(id, str) or not id for id in source_ids):
         raise BusinessError('validation', '资料编号格式无效。')
@@ -223,9 +230,7 @@ def send(core, c, p, rid, prepared=None):
     # Prepared keys include automatic first-course selection. Explicit [] clears
     # attachments; omitted source_ids reuses the current set without accumulating.
     sources = list(source_versions)
-    if len(sources) > MAX_SOURCES:
-        raise BusinessError('context_limit', '每轮讨论最多附带 12 项资料，请替换附件后分批整理。')
-    if (conversation or 'source_ids' in p) and set(requested) != set(sources):
+    if not prepared.get('source_owner_scope') and (conversation or 'source_ids' in p) and set(requested) != set(sources):
         raise BusinessError('source_context_missing', '已选资料与本轮读取结果不一致，未开始推理。')
     for id, version in source_versions.items():
         if core.store.get(c, id)['version'] != version:
@@ -239,21 +244,34 @@ def send(core, c, p, rid, prepared=None):
         c.execute('INSERT INTO conversations(id,scope_key,scope,source_ids,created_at,updated_at) VALUES (?,?,?,?,?,?)',
                   (id, _scope_key(scope), encode(scope), encode(sources), stamp, stamp))
         conversation = _conversation(c.execute('SELECT * FROM conversations WHERE id=?', (id,)).fetchone())
+    from .session_coordinator import previous
+    prior_operation = previous(c,conversation['id'],core.store.meta(c,'epoch'))
+    if prior_operation and prior_operation['phase']=='creating_thread' and not prior_operation['provider_thread_id']:
+        raise BusinessError('conversation_delivery_unknown','上次创建任务的结果尚未确认，未重复创建。请先核对原 Codex 任务。',prior_operation)
     old_candidate = conversation['current_proposal_job_id']
     if old_candidate:
         c.execute("UPDATE jobs SET status='superseded',generation=generation+1,updated_at=? WHERE id=? AND status='awaiting_review'", (now(), old_candidate))
         c.execute("UPDATE conversation_messages SET proposal_state='superseded' WHERE conversation_id=? AND job_id=? AND proposal_state='available'", (conversation['id'], old_candidate))
-    history = _history(c, conversation['id'])
+    history = {'reader':'query_context','collection':'history','messages':[]}
     value = {'prompt': text.strip(), 'conversation_id': conversation['id'], 'conversation_scope': scope,
              'history': history, 'provider_thread_id': conversation['provider_thread_id'],
-             'context_ids': [scope['entity_id']] if scope.get('entity_id') else []}
+             'context_ids': [scope['entity_id']] if scope.get('entity_id') else [], 'source_ids':sources,
+             'source_owner_scope':prepared.get('source_owner_scope'),'analyze_materials':prepared.get('analyze_materials',bool(sources))}
+    value['previous_operation'] = prior_operation
+    value['ai_config'] = dict(core.store.meta(c,'settings').get('ai',{}))
     if conversation['provider_thread_id']:
         previous = c.execute('''SELECT j.result FROM conversation_messages m JOIN jobs j ON j.id=m.job_id
             WHERE m.conversation_id=? AND m.role='assistant'
             AND json_extract(j.result,'$.provider.thread_id')=? ORDER BY m.seq DESC LIMIT 1''',
             (conversation['id'],conversation['provider_thread_id'])).fetchone()
         if previous:
-            value['provider_project_path'] = json.loads(previous['result']).get('provider',{}).get('project_path')
+            provider = json.loads(previous['result']).get('provider', {})
+            value['provider_project_path'] = provider.get('project_path')
+            value['provider_contract'] = provider.get('contract', 'background_json_v1')
+        binding = c.execute('SELECT provider_project_path,provider_contract FROM conversation_progress WHERE conversation_id=? AND provider_thread_id=? AND provider_project_path IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1', (conversation['id'], conversation['provider_thread_id'])).fetchone()
+        if binding:
+            value['provider_project_path'] = binding['provider_project_path']
+            value['provider_contract'] = binding['provider_contract'] or 'background_json_v1'
     if scope.get('date'):
         value['date'] = scope['date']
     from .plan_assistance import requested_day
@@ -261,17 +279,11 @@ def send(core, c, p, rid, prepared=None):
     if planning_day:value.update(plan_requested=True,date=planning_day)
     job = core.create_job(c, 'create_job', {'kind': 'ai', 'input': value}, rid)
     value = job['input']
-    value['context']['discussion_scope'] = _scope_facts(core, c, scope)
     if scope.get('entity_id'):
-        owner = core.store.get(c, scope['entity_id'])
-        if owner['type'] == 'course' or owner['type'] == 'task' and (owner['data'].get('catchup_enabled') or owner['data'].get('task_kind') == 'catchup'):
-            from .catchup import recovery_summary
-            recovery = recovery_summary(core, c, {'course_id': owner['id']} if owner['type'] == 'course' else {'task_id': owner['id']})
-            value['context']['recovery'] = {**recovery, 'items': [{k: item.get(k) for k in ('id','version','title','progress')} for item in recovery.get('items', [])]}
-    value['context']['materials'] = prepared.get('source_context', [])
-    value['context']['asset_content_coverage'] = 'Selected material content and per-source coverage are attached; do not claim unprovided coverage.'
+        value['scope_title']=core.store.get(c,scope['entity_id'])['title']
     if selected_skill:
-        value['context']['selected_skill'] = skill_context(selected_skill)
+        selected=skill_context(selected_skill)
+        value['context']['selected_skill'] = {'id':selected['id'],'sha256':selected['sha256'],'reader':'read_context_item(@skill)'}
         value['skill_id'] = selected_skill
     if scope['kind'] == 'timetable':
         value['allowed_commands'] = ['apply_timetable']
@@ -279,14 +291,14 @@ def send(core, c, p, rid, prepared=None):
     value['source_versions'] = source_versions
     value['local_images'] = prepared.get('local_images', [])
     value['source_ids'] = sources
-    if len(encode({'prompt': value['prompt'], 'context': value['context'], 'history': history}).encode('utf-8')) > 90000:
-        raise BusinessError('context_limit', '本轮资料、事实和讨论历史超过预算，请缩小资料或对象范围。')
+    if len(value['prompt'].encode('utf-8'))>6000:
+        value['prompt']=value['context']['goal']+'\n（完整原文已保存在本操作，必须通过 read_context_item(@goal) 继续读取。）'
     c.execute('UPDATE jobs SET input=? WHERE id=?', (encode(value), job['id']))
     message_id, stamp = new_id(), now()
     c.execute("INSERT INTO conversation_messages(id,conversation_id,role,text,job_id,state,source_ids,created_at) VALUES (?,?,'user',?,?,'queued',?,?)",
               (message_id, conversation['id'], text.strip(), job['id'], encode(value['source_ids']), stamp))
-    c.execute('UPDATE conversations SET source_ids=?,active_job_id=?,current_proposal_job_id=NULL,version=version+1,updated_at=? WHERE id=?',
-              (encode(value['source_ids']), job['id'], stamp, conversation['id']))
+    c.execute('UPDATE conversations SET source_ids=?,source_scope_owner=?,active_job_id=?,current_proposal_job_id=NULL,version=version+1,updated_at=? WHERE id=?',
+              (encode(value['source_ids']), value.get('source_owner_scope'), job['id'], stamp, conversation['id']))
     conversation = _conversation(c.execute('SELECT * FROM conversations WHERE id=?', (conversation['id'],)).fetchone())
     conversation['sources'] = _sources(c, sources)
     message = _message(c.execute('SELECT * FROM conversation_messages WHERE id=?', (message_id,)).fetchone())
@@ -323,8 +335,12 @@ def complete_job(core, c, job, result):
     c.execute("UPDATE conversation_messages SET state='completed' WHERE job_id=? AND role='user'", (job['id'],))
     c.execute("INSERT OR IGNORE INTO conversation_messages(id,conversation_id,role,text,job_id,state,proposal_state,source_ids,created_at) VALUES (?,?,'assistant',?,?,'completed',?,?,?)",
               (new_id(), conversation['id'], text, job['id'], proposal_state, encode(value.get('source_ids', [])), now()))
-    c.execute('UPDATE conversations SET active_job_id=NULL,current_proposal_job_id=?,provider_thread_id=?,recovery=?,version=version+1,updated_at=? WHERE id=?',
+    c.execute('UPDATE conversations SET active_job_id=NULL,current_proposal_job_id=?,provider_thread_id=COALESCE(?,provider_thread_id),recovery=COALESCE(?,recovery),version=version+1,updated_at=? WHERE id=?',
               (job['id'] if actions else None, provider.get('thread_id'), provider.get('recovery'), now(), conversation['id']))
+    from .session_coordinator import settle
+    settle(c,job['id'],'completed')
+    from .conversation_progress import finish
+    finish(c, job['id'])
     return True
 
 
@@ -344,6 +360,8 @@ def update_job(core, c, job, status, error=None):
         c.execute("INSERT INTO conversation_messages(id,conversation_id,role,text,job_id,state,source_ids,created_at) VALUES (?,?,'assistant',?,?,?, ?,?)",
                   (new_id(), conversation['id'], text, job['id'], status, encode(value.get('source_ids', [])), now()))
     c.execute('UPDATE conversations SET active_job_id=NULL,current_proposal_job_id=NULL,version=version+1,updated_at=? WHERE id=?', (now(), conversation['id']))
+    from .conversation_progress import finish
+    finish(c, job['id'])
     return True
 
 
@@ -371,6 +389,8 @@ def reconcile(core, c):
 
 
 def reset_after_restore(c):
+    from .conversation_progress import reset
+    reset(c)
     c.execute("UPDATE conversation_messages SET state='cancelled' WHERE state IN ('queued','running')")
     c.execute("UPDATE conversation_messages SET proposal_state='superseded' WHERE proposal_state='available'")
     c.execute("UPDATE conversations SET active_job_id=NULL,current_proposal_job_id=NULL,provider_thread_id=NULL,recovery='restored_history',version=version+1")

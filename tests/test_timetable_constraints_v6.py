@@ -201,7 +201,9 @@ def test_discussion_candidate_apply_receipt_and_reopened_client_share_one_schedu
     scope = {'kind':'timetable', 'entity_id':table['id']}
     sent = command(core, 'send_message', {'scope':scope, 'text':'Use the supplied dates and weekly class; prepare a candidate for my confirmation.'})['result']
     job_id = sent['job']['id']
-    assert sent['job']['input']['source_versions'] == {source['id']:source['version']}
+    assert sent['job']['input']['source_owner_scope']==table['id']
+    from context_harness import rows
+    assert [r['id'] for r in rows(core,sent['job'],'materials')]==[source['id']]
     assert core.query('list', type='event')['total'] == 0
     candidate = {'summary':'Synthetic model candidate; no model invoked', 'unknowns':[], 'sources':[source['id']],
         'actions':[{'command':'apply_timetable', 'payload':{
@@ -210,6 +212,8 @@ def test_discussion_candidate_apply_receipt_and_reopened_client_share_one_schedu
             'source_text':'Synthetic notice explicitly states term dates and Monday class.',
             'rows':[{'key':'monday-lecture', 'title':'Synthetic Monday lecture', 'weekday':0,
                      'start':'09:00', 'end':'10:00', 'source_text':'Saved notice: Mondays 09:00-10:00'}]}}]}
+    from context_harness import ready
+    ready(core,job_id)
     with core.store.lock, core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         job = core._job(c, job_id)
@@ -224,8 +228,11 @@ def test_discussion_candidate_apply_receipt_and_reopened_client_share_one_schedu
     applied = reopened.command('apply_proposal', {'id':job_id}, request_id=request_id,
         epoch=before['epoch'], expected_revision=before['revision'])
     adopted = applied['result']['results'][0]
-    assert adopted['entity']['data']['source_versions'] == {source['id']:source['version']}
-    assert adopted['rows'][0]['data']['source_versions'] == {source['id']:source['version']}
+    operation=sent['job']['input']['context_operation_id']
+    assert adopted['entity']['data']['source_context_operation']==operation
+    assert adopted['rows'][0]['data']['source_context_operation']==operation
+    with core.store.connect() as c:
+        assert dict(c.execute('SELECT entity_id,version FROM context_sources WHERE operation_id=?',(operation,)))=={source['id']:source['version']}
     assert core.query('receipt', request_id=request_id)['found']
     assert core.query('job', id=job_id)['job']['status'] == 'applied'
     replay = core.command('apply_proposal', {'id':job_id}, request_id=request_id,

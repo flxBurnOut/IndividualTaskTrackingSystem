@@ -16,6 +16,7 @@ from .gui_theme import available_font_families, apply_appearance, resolved_font_
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QScrollArea, QFrame, QAbstractSpinBox, QLayout,
     QMessageBox, QPushButton, QTimeEdit, QSpinBox, QSplitter, QTabWidget, QTableWidget,
     QTextBrowser, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -524,6 +525,15 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         outer.addWidget(tabs, 1)
         self.tabs = tabs
+        def add_page(widget,title):
+            if isinstance(widget,QScrollArea):
+                return tabs.addTab(widget,title)
+            scroll=QScrollArea();scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setMinimumSize(0,0)
+            if widget.layout():widget.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            scroll.setWidget(widget)
+            return tabs.addTab(scroll,title)
         reminder = QWidget()
         reminder_layout = QVBoxLayout(reminder)
         intro = QLabel('直接设置你希望什么时候复盘。开启后，本机服务在约定时间提示；保存时间不会重复增加提醒。')
@@ -573,7 +583,7 @@ class SettingsDialog(QDialog):
         reminder_layout.addStretch()
         from .gui_habits import HabitsPanel
         self.habits=HabitsPanel(bridge,reminder,self,on_changed=self.saved)
-        tabs.addTab(self.habits, '日常习惯')
+        add_page(self.habits, '日常习惯')
         display=QWidget()
         display_layout=QVBoxLayout(display)
         appearance_form=QFormLayout()
@@ -608,7 +618,7 @@ class SettingsDialog(QDialog):
         self.weekly_chart_style.addItem('纵向等高柱形图 · 比较每天内部占比','columns')
         self.weekly_chart_style.addItem('横向进度条 · 逐日阅读','rows')
         display_layout.addWidget(self.weekly_chart_style)
-        chart_help=QLabel('颜色分别表示完成、未完成、未反馈及原有细分反馈。缺少计划的日期独立标示，不算作失败。')
+        chart_help=QLabel('图表按课程、项目等类别标明实际结果；课程参加与否和任务完成情况分别展示。未反馈不算作失败。')
         chart_help.setWordWrap(True);display_layout.addWidget(chart_help)
         self.chart_save=QPushButton('保存显示偏好')
         self.chart_save.setObjectName('Primary');self.chart_save.setEnabled(False)
@@ -621,10 +631,10 @@ class SettingsDialog(QDialog):
             combo.currentIndexChanged.connect(self.display_edited)
         self.font_size.valueChanged.connect(self.display_edited)
         display_layout.addStretch()
-        tabs.addTab(display,'显示')
+        add_page(display,'显示')
         from .gui_timetable_settings import TimetableSettingsPage
         self.timetable_settings = TimetableSettingsPage(bridge, self, on_changed=on_changed)
-        tabs.addTab(self.timetable_settings, '课表')
+        add_page(self.timetable_settings, '课表')
 
         provider = QWidget()
         provider_layout = QVBoxLayout(provider)
@@ -656,6 +666,11 @@ class SettingsDialog(QDialog):
         self.timeout.setValue(180)
         self.timeout.setSuffix(" 秒")
         form.addRow(self.ai_enabled)
+        self.ai_mode = QComboBox()
+        self.ai_mode.addItem('在 Codex 桌面同步显示', 'desktop_shared')
+        self.ai_mode.addItem('仅在管理软件中处理', 'background')
+        self.ai_mode.setCurrentIndex(1)
+        form.addRow('处理方式', self.ai_mode)
         form.addRow("Codex 程序位置", self.executable)
         model_row = QHBoxLayout()
         model_row.addWidget(self.model, 1)
@@ -675,10 +690,23 @@ class SettingsDialog(QDialog):
         self.codex_project_note.setObjectName('Hint')
         self.codex_project_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         provider_layout.addWidget(self.codex_project_note)
+        self.codex_open_project = QPushButton('打开 Codex 事务助手')
+        self.codex_open_project.setEnabled(False)
+        self.codex_open_project.clicked.connect(self.open_codex_project)
+        provider_layout.addWidget(self.codex_open_project)
         connection_help = QLabel('新对话会通过同一业务服务读取与更新数据，保存结果以业务回执为准。关闭上方开关只停止软件内的后台协助，已创建的 Codex 项目与接口仍然保留。')
         connection_help.setWordWrap(True)
         connection_help.setObjectName('Hint')
         provider_layout.addWidget(connection_help)
+        self.codex_bridge_note = QLabel('桌面同步模式首次需要退出 Codex，再从下方启动；以后在管理软件发送一次，即可在 Codex 中看到全过程。此连接适配需要与当前 Codex 版本共同验证。')
+        self.codex_bridge_note.setWordWrap(True)
+        self.codex_bridge_note.setObjectName('Hint')
+        provider_layout.addWidget(self.codex_bridge_note)
+        self.codex_bridge_start = QPushButton('启动 Codex 连接模式')
+        self.codex_bridge_start.clicked.connect(self.launch_codex_desktop)
+        provider_layout.addWidget(self.codex_bridge_start)
+        self.ai_mode.currentIndexChanged.connect(self.show_codex_mode)
+        self.show_codex_mode()
         advanced_connection = QPushButton('高级：查看接口配置')
         advanced_connection.setCheckable(True)
         provider_layout.addWidget(advanced_connection)
@@ -688,7 +716,7 @@ class SettingsDialog(QDialog):
         advanced_connection.toggled.connect(copy_config.setVisible)
         provider_layout.addWidget(copy_config)
         provider_layout.addStretch()
-        self._provider_tab = tabs.addTab(provider, "Codex 协助")
+        self._provider_tab = add_page(provider, "Codex 协助")
         tabs.currentChanged.connect(self._model_tab_changed)
 
         rules = QWidget()
@@ -759,7 +787,7 @@ class SettingsDialog(QDialog):
         advanced.toggled.connect(advanced_tabs.setVisible)
         data_layout.addWidget(advanced_tabs)
         data_layout.addStretch()
-        tabs.addTab(data, '数据与高级')
+        add_page(data, '数据与高级')
 
         self.message = QLabel()
         self.message.setWordWrap(True)
@@ -768,8 +796,27 @@ class SettingsDialog(QDialog):
         close.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         close.rejected.connect(self.reject)
         outer.addWidget(close)
+        for editor_form in (reminder_form,appearance_form,form):
+            editor_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            editor_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        from .gui_theme import bind_theme
+        bind_theme(self,self.fit_settings_fields)
+        self.fit_settings_fields()
         self.load()
         self.load_review_times()
+
+    def fit_settings_fields(self):
+        # Scroll pages keep the content's natural height; font changes must
+        # never squeeze edit fields below their text and padding.
+        for widget in self.findChildren(QWidget):
+            if not isinstance(widget,(QComboBox,QLineEdit,QAbstractSpinBox,QPushButton)):continue
+            if isinstance(widget,QLineEdit) and isinstance(widget.parentWidget(),(QComboBox,QAbstractSpinBox)):continue
+            widget.ensurePolished()
+            widget.setMinimumHeight(max(widget.sizeHint().height(),widget.fontMetrics().height()+18))
+        for index in range(self.tabs.count()):
+            page=self.tabs.widget(index)
+            if isinstance(page,QScrollArea) and page.widget():
+                page.widget().updateGeometry()
 
     def review_fields_enabled(self, enabled):
         for widget in (self.daily_enabled, self.weekly_enabled, self.review_timezone):
@@ -842,6 +889,7 @@ class SettingsDialog(QDialog):
             config = self.current_settings.get("ai", {})
             self.show_codex_project(self.current_settings.get("codex_project"), enabled=config.get("enabled", False))
             self.ai_enabled.setChecked(config.get("enabled", False))
+            self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(config.get("execution_mode", "background"))))
             self.executable.blockSignals(True)
             self.executable.setText(config.get("executable") or "")
             self.executable.blockSignals(False)
@@ -1034,7 +1082,46 @@ class SettingsDialog(QDialog):
 
         self.bridge.query('codex_models', loaded, failed, executable=path)
 
+    def show_codex_mode(self):
+        desktop = self.ai_mode.currentData() == 'desktop_shared'
+        self.codex_bridge_note.setVisible(desktop)
+        self.codex_bridge_start.setVisible(desktop)
+
+    def launch_codex_desktop(self):
+        config = self.current_settings.get('ai', {})
+        if config.get('execution_mode') != 'desktop_shared':
+            self.message.setText('请先保存“在 Codex 桌面同步显示”的设置，再启动连接模式。')
+            return
+        try:
+            from .codex_desktop import launch
+            result = launch(self.bridge.data_dir)
+        except Exception as exc:
+            self.error({'message': getattr(exc, 'message', str(exc))})
+            return
+        self.codex_bridge_note.setText('已连接，可直接发送。' if result.get('ready') else '已启动 Codex，正在等待桌面建立连接…')
+        self.refresh_codex_connection(8)
+
+    def refresh_codex_connection(self, attempts=0):
+        if self._models_closed:
+            return
+        def loaded(value):
+            if self._models_closed:
+                return
+            self.codex_bridge_note.setText(value.get('message', '连接状态待确认。'))
+            if not value.get('ready') and attempts:
+                QTimer.singleShot(1500, lambda: self.refresh_codex_connection(attempts-1))
+        self.bridge.query('codex_connection', loaded, lambda error: self.error(error) if not self._models_closed else None)
+
+    def open_codex_project(self):
+        project = self.current_settings.get('codex_project') or {}
+        try:
+            from .codex_links import open_workspace
+            open_workspace(project.get('workspace') or project.get('project_path') or '')
+        except (OSError, ValueError) as exc:
+            self.error({'message': str(exc)})
+
     def show_codex_project(self, project, *, enabled):
+        self.codex_open_project.setEnabled(bool(project and project.get('status') == 'ready'))
         if project and project.get('status') == 'ready':
             path = project.get('workspace') or project.get('project_path') or ''
             self.codex_project_note.setText('上次已连接：' + project.get('name', 'Codex事务助手') + '\n' + path + '\n软件或数据位置改变后，再次保存可检查并修复连接。' + ('' if enabled else '\n软件后台协助已关闭；此对话项目仍可独立使用。'))
@@ -1044,7 +1131,7 @@ class SettingsDialog(QDialog):
             self.codex_project_note.setText('软件后台协助已关闭。首次启用并保存时会自动创建固定对话项目与 MCP 连接，并打开空白对话，不会自动发送消息。')
 
     def _ai_fields_enabled(self, enabled):
-        for widget in (self.ai_enabled, self.executable, self.model, self.timeout):
+        for widget in (self.ai_enabled, self.executable, self.model, self.timeout, self.ai_mode):
             widget.setEnabled(enabled)
         self.model_refresh.setEnabled(enabled and not self._models_loading)
         self.ai_save.setEnabled(enabled)
@@ -1054,6 +1141,8 @@ class SettingsDialog(QDialog):
             return
         config = {"enabled": self.ai_enabled.isChecked(), "timeout_seconds": self.timeout.value(),
                   "executable": self.executable.text().strip(), "model": self.model.currentData() or ''}
+        if self.ai_mode.currentData() == 'desktop_shared' or 'execution_mode' in self.current_settings.get('ai', {}):
+            config['execution_mode'] = self.ai_mode.currentData()
         self._ai_configuring = True
         self._models_generation += 1
         self._model_debounce.stop()
@@ -1076,7 +1165,10 @@ class SettingsDialog(QDialog):
             self.show_codex_project(self.current_settings.get('codex_project'), enabled=config['enabled'])
             self.saved(result)
             self.message.setObjectName('Hint')
-            self.message.setText('设置已保存；事务助手已连接，已请求 Codex 打开项目的空白对话。' if config['enabled'] else '软件后台协助已关闭；已创建的对话项目和接口保留。')
+            self.message.setText(('设置已保存；事务助手已连接。' + ('已请求 Codex 打开项目的空白对话。' if project.get('desktop_open_requested') else '以后可直接打开事务助手，无需重复刷新配置。')) if config['enabled'] else '软件后台协助已关闭；已创建的对话项目和接口保留。')
+            if config.get('execution_mode') == 'desktop_shared' and config['enabled']:
+                self.message.setText('设置已保存。首次启用请保存并退出 Codex，再点“启动 Codex 连接模式”。')
+                self.refresh_codex_connection()
         def failed(error):
             if self._models_closed:
                 return

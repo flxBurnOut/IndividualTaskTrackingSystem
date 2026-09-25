@@ -38,6 +38,8 @@ def result(actions=True):
 
 
 def complete(core, id, actions=True):
+    from context_harness import ready
+    ready(core,id)
     value = result(actions)
     with core.store.lock, core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE')
@@ -96,8 +98,10 @@ def test_durable_messages_and_current_candidate_replaced(core):
     second = send(core, 'Adjust this same proposal')
     value = second['job']['input']
     assert value['provider_thread_id'] == 'provider-synthetic'
-    assert value['history']['messages'][-1]['proposal_state'] == 'superseded'
-    assert value['history']['messages'][-1]['candidate_actions']
+    from context_harness import rows
+    history=rows(core,second['job'],'history')
+    assert [m for m in history if m['role']=='assistant'][-1]['proposal_state']=='superseded'
+    assert value['history']['messages']==[]
     assert core.query('job', id=first['job']['id'])['job']['status'] == 'superseded'
     with pytest.raises(BusinessError) as error:
         command(core, 'apply_proposal', {'id': first['job']['id']})
@@ -122,7 +126,7 @@ def test_attachment_replace_clear_and_omission_are_distinct(core):
     command(core, 'cancel_job', {'id': replaced['job']['id']})
     cleared = send(core, source_ids=[])
     assert cleared['conversation']['source_ids'] == []
-    assert cleared['job']['input']['context']['materials'] == []
+    assert next(x['total'] for x in cleared['job']['input']['context']['collections'] if x['name']=='materials')==0
     assert core.query('conversation', scope=SCOPE)['conversation']['sources'] == []
 
 
@@ -134,10 +138,11 @@ def test_course_context_includes_children_events_and_autoselected_sources(core):
     command(core, 'link', {'source_id': course['id'], 'target_id': source['id'], 'kind': 'uses'})
     scope = {'kind': 'course', 'entity_id': course['id']}
     first = send(core, scope=scope)
-    assert first['conversation']['source_ids'] == [source['id']]
-    records = first['job']['input']['context']['discussion_scope']['records']
+    assert first['conversation']['source_scope_owner']==course['id'] and first['conversation']['source_ids']==[]
+    from context_harness import rows
+    records=rows(core,first['job'],'records')
     assert {course['id'], task['id'], event['id']} <= {record['id'] for record in records}
-    assert first['conversation']['sources'][0]['title'] == source['title']
+    assert rows(core,first['job'],'materials')[0]['title']==source['title']
 
 
 def test_prepare_version_race_rolls_back_entire_send(core, monkeypatch):
@@ -173,7 +178,8 @@ def test_page_cursor_is_stable_and_history_bounded(core):
     assert older['messages'][-1]['seq'] < page['messages'][0]['seq']
     latest = send(core, 'Continue')
     assert len(latest['job']['input']['history']['messages']) <= conversations.MAX_HISTORY_MESSAGES
-    assert latest['job']['input']['history']['older_messages_omitted'] is True
+    from context_harness import rows
+    assert len(rows(core,latest['job'],'history'))==17
 
 
 def test_worker_reply_persists_without_changing_facts_revision(core, monkeypatch):
@@ -273,12 +279,13 @@ def test_large_previous_candidate_does_not_permanently_block_scope(core):
         c.execute("UPDATE jobs SET status='awaiting_review',result=? WHERE id=?", (encode(oversized), first['job']['id']))
         conversations.complete_job(core,c,core._job(c,first['job']['id']),oversized)
     next_turn = send(core,'Discard the long candidate and answer this small question')
-    history = next_turn['job']['input']['history']
-    assert history['older_messages_omitted']
-    assert history['messages'][-1]['content_excerpted']
-    assert history['messages'][-1]['candidate_actions_omitted'] == 1
-    assert len(encode(history)) < conversations.MAX_HISTORY_CHARACTERS
-
+    history=next_turn['job']['input']['history']
+    assert history['messages']==[] and len(encode(history))<1000
+    from context_harness import rows,item
+    messages=rows(core,next_turn['job'],'history')
+    previous=next(m for m in messages if m['role']=='assistant')
+    full=item(core,next_turn['job'],previous['id'])
+    assert len(full['text'])>1000
 
 def test_questions_without_actions_are_visible_in_chat(core):
     sent = send(core)
