@@ -1,12 +1,12 @@
 # 个人事务管理
 
-**v1.1.0 · 保留资料的版本升级（安装包待 Release 发布）**
+**v1.1.0 · 保留资料的版本升级**
 
 Windows 本地个人事务管理软件。课程、项目、任务、计划、复盘、资料与可选的 Codex 协助，共用一份本机业务记录。基于 Python、PySide6 和 SQLite。
 
 ## 安装与开始使用
 
-本地 1.1.0 构建输出安装包 `release/PersonalManagement-1.1.0-Setup-x64.exe` 及同名 `.sha256` 文件；尚未作为远端 Release 发布。此前的 [v1.0.1 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.0.1) 使用旧版升级流程。仓库为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。
+从 [v1.1.0 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.1.0) 下载 `PersonalManagement-1.1.0-Setup-x64.exe` 和 `SHA256SUMS.txt`，运行安装程序，再从“个人事务管理”快捷方式启动。仓库为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。旧版用户请先阅读下方升级说明，安装时核对原数据位置。
 
 | 内容 | 默认位置 |
 | --- | --- |
