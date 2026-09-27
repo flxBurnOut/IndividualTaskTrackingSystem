@@ -17,6 +17,8 @@
 !/docs/固定会话与原文件目录.md
 !/docs/发布说明_1.0.0.md
 !/docs/发布说明_1.0.1.md
+!/docs/发布说明_1.0.2.md
+!/docs/发布说明_1.1.0.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -26,6 +28,7 @@
 !/packaging/render_icon.py
 !/packaging/version_info.py
 !/packaging/smoke.py
+!/packaging/upgrade_smoke.py
 !/packaging/codex_entry.py
 !/packaging/installer.iss
 !/packaging/build_installer.py

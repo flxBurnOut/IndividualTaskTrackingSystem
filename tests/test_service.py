@@ -15,6 +15,7 @@ from management.client import Client
 from management.core import Core
 from management.scheduler import Background
 from management.schemas import BusinessError
+from management.runtime_contract import client_headers
 
 
 def stop_owned_service(root):
@@ -43,7 +44,7 @@ def service(tmp_path):
 
 def raw_post(client, body=b'{}', headers=None, path='/v1/query/state'):
     runtime = client.runtime
-    base = {'Authorization': 'Bearer ' + runtime['token'], 'Content-Type': 'application/json'}
+    base = {'Authorization': 'Bearer ' + runtime['token'], 'Content-Type': 'application/json', **client_headers()}
     base.update(headers or {})
     conn = http.client.HTTPConnection('127.0.0.1', runtime['port'], timeout=5)
     try:

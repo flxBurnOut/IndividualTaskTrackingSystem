@@ -1,19 +1,21 @@
 # 个人事务管理
 
-**v1.0.1 · 计划修改与依赖保护修复**
+**v1.1.0 · 保留资料的版本升级（安装包待 Release 发布）**
 
 Windows 本地个人事务管理软件。课程、项目、任务、计划、复盘、资料与可选的 Codex 协助，共用一份本机业务记录。基于 Python、PySide6 和 SQLite。
 
 ## 安装与开始使用
 
-从 [v1.0.1 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.0.1) 下载 `PersonalManagement-1.0.1-Setup-x64.exe` 和 `SHA256SUMS.txt`，运行安装程序，再从“个人事务管理”快捷方式启动。仓库当前为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。
+本地 1.1.0 构建输出安装包 `release/PersonalManagement-1.1.0-Setup-x64.exe` 及同名 `.sha256` 文件；尚未作为远端 Release 发布。此前的 [v1.0.1 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.0.1) 使用旧版升级流程。仓库为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。
 
 | 内容 | 默认位置 |
 | --- | --- |
 | 程序 | `%LOCALAPPDATA%\Programs\PersonalManagement` |
 | 业务数据 | `%LOCALAPPDATA%\PersonalManagement\data` |
 
-首次打开新目录会建立空数据空间，不附带课程、账号或示例个人记录。已有用户应使用“为已有数据创建快捷方式”或包内“创建快捷方式.vbs”，选择原数据目录，之后从新建的快捷方式进入；升级不要求重新导入或迁移。普通卸载保留业务数据。升级遇到正在使用的程序文件会停止并提示处理，不强行结束正在工作的进程。
+首次打开新目录会建立空数据空间，不附带课程、账号或示例个人记录。已有安装版升级时继承原数据目录，替换原程序；无法确认原空间时要求选择，不静默创建空库。便携版用户可选择原数据目录，无需重新导入。普通卸载保留业务数据。更新前用主窗口“版本与更新 → 退出并准备更新”；后台有任务时会提示等待，文件被 Codex 接口占用时需在任务结束后暂时退出 Codex。1.0.x 首次升级仍需先退出其旧后台。
+
+旧数据库升级前保存并核验数据库快照，迁移失败回滚，资料文件保持原位置。软件、后台和 MCP 请求分别核验版本，旧接口不能因网络连通就被当作更新成功。完整流程及边界见[使用说明](docs/使用说明.md)。
 
 本版本未进行代码签名，Windows 可能显示来源或发布者提醒。请核对下载来源及发布文件信息。
 
@@ -37,6 +39,7 @@ Windows 本地个人事务管理软件。课程、项目、任务、计划、复
 - [会话与原文件目录](docs/固定会话与原文件目录.md)：事项归属、数据位置与资料版本。
 - [Codex 接口](docs/Codex接口与后台推理.md)：MCP、候选和桌面连接的技术边界。
 - [开发与扩展](docs/开发与扩展.md)：源码运行、接口和发布检查。
+- [v1.1.0 发布说明](docs/发布说明_1.1.0.md)：保留资料、版本核验和安全更新退出。
 - [v1.0.1 发布说明](docs/发布说明_1.0.1.md)：计划修改与依赖保护修复。
 - [v1.0.0 发布说明](docs/发布说明_1.0.0.md)：首发范围和已知限制。
 
@@ -67,7 +70,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe packaging/build.py
 ```
 
-便携构建输出为 `release/PersonalManagement-1.0.1/`。可运行其中的 `PersonalManagement.exe`；用 `--choose-data` 或“选择数据空间”入口只改变本次打开的数据目录，不永久改写默认入口。长期使用已有数据请创建指向该目录的快捷方式。安装器及验证步骤见开发文档。
+便携构建输出为 `release/PersonalManagement-1.1.0/`。可运行其中的 `PersonalManagement.exe`；用 `--choose-data` 或“选择数据空间”入口只改变本次打开的数据目录，不永久改写默认入口。长期使用已有数据请创建指向该目录的快捷方式。安装器及验证步骤见开发文档。
 
 ## 仓库范围
 

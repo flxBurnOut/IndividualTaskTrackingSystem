@@ -184,6 +184,9 @@ class MainWindow(QMainWindow):
         self.settings_button.setObjectName("QuietButton")
         header.addWidget(self.search_button)
         header.addWidget(self.settings_button)
+        self.update_button = make_button('版本与更新', self.open_update)
+        self.update_button.setObjectName('QuietButton')
+        header.addWidget(self.update_button)
         main_layout.addLayout(header)
         self.notice = plain_label("", "Notice")
         self.notice.hide()
@@ -466,6 +469,14 @@ class MainWindow(QMainWindow):
         if page:
             for index in range(dialog.tabs.count()):
                 if dialog.tabs.tabText(index)==page:dialog.tabs.setCurrentIndex(index)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def open_update(self):
+        from .gui_update import UpdateDialog
+        dialog = UpdateDialog(self)
         try:
             dialog.exec()
         finally:

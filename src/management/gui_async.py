@@ -28,7 +28,9 @@ class _Worker(QObject):
                     from .client import Client
                     factory = Client
                 self.client = factory(self.data_dir)
-            if method == "command":
+            if method == "maintenance":
+                result = self.client.prepare_update()
+            elif method == "command":
                 options=dict(arguments.get("options", {}))
                 if name=='send_message':
                     # A raw message requests fresh reasoning, not adoption of an
@@ -103,6 +105,9 @@ class ServiceBridge(QObject):
             params.setdefault('display', True)
         return self._submit("query", name, params, callback, error)
 
+    def prepare_update(self, callback=None, error=None):
+        return self._submit('maintenance', 'prepare_update', {}, callback, error)
+
     def command(self, name, payload, callback=None, error=None, **options):
         options.setdefault("epoch", self.epoch)
         options.setdefault("expected_revision", self.revision)
@@ -123,7 +128,7 @@ class ServiceBridge(QObject):
             return self.serial
         self.callbacks[self.serial] = (callback, error)
         self.activity.emit(True)
-        signal = self.mutation_requested if method == "command" else self.requested
+        signal = self.mutation_requested if method in {"command", "maintenance"} else self.requested
         signal.emit(self.serial, method, name, arguments)
         return self.serial
 

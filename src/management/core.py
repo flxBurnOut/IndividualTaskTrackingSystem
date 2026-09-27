@@ -261,9 +261,14 @@ class Core:
             context = self.plan_context(c, day, p.get("mode", "standard"))
             if name == "plan_context":
                 return context
-            plans = [self.store.entity(r) for r in c.execute("SELECT * FROM entities WHERE type='plan' AND archived=0 AND json_extract(data,'$.date')=? ORDER BY updated_at DESC LIMIT 20", (day,))]
+            plans = [self.store.entity(r) for r in c.execute("SELECT * FROM entities WHERE type='plan' AND archived=0 AND json_extract(data,'$.date')=? ORDER BY updated_at DESC,rowid DESC LIMIT 20", (day,))]
+            from .reviews import _latest_plan
+            current_plan = _latest_plan(self,c,day)
             notices = [self.store.entity(r) for r in c.execute("SELECT * FROM entities WHERE type='notification' AND archived=0 AND (json_extract(data,'$.seen') IS NULL OR json_extract(data,'$.seen')=0) ORDER BY created_at DESC LIMIT 30")]
-            return {"date": day, "tasks": context["tasks"], "events": context["hard_events"], "plans": plans, "notifications": notices, "counts": context["coverage"], "unknowns": context["unknowns"]}
+            return {"date": day, "tasks": context["tasks"], "events": context["hard_events"], "plans": plans,
+                    "current_plan_id": current_plan['id'] if current_plan else None,
+                    "current_plan_version": current_plan['version'] if current_plan else None,
+                    "notifications": notices, "counts": context["coverage"], "unknowns": context["unknowns"]}
         if name == "review":
             return self.review(c, p["start"], p["end"])
         if name == "jobs":
@@ -462,7 +467,8 @@ class Core:
                     WHERE a.sha256 IN (SELECT json_extract(data,'$.sha256') FROM entities WHERE type IN ('asset','artifact'))'''):
                     found[row[0]]={'sha256':row[0],'size':row[1],'path':'blobs/'+row[0]}
                 return list(found.values())
-            return self.resources.create_backup(self.store.path, select_assets, app_lock=self.store.lock, metadata={"app_version": "0.7.1", "operation_id": p.get("_operation_id")})
+            from . import __version__
+            return self.resources.create_backup(self.store.path, select_assets, app_lock=self.store.lock, metadata={"app_version": __version__, "operation_id": p.get("_operation_id")})
         if name == "restore_backup":
             target = Path(p["target_dir"]).resolve()
             if target == self.root or self.root in target.parents:

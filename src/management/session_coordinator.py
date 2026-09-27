@@ -26,6 +26,21 @@ def initialize(c):
         PRIMARY KEY(epoch,provider_thread_id,provider_turn_id))""")
     if 'candidate_fingerprint' not in {r[1] for r in c.execute('PRAGMA table_info(conversation_operations)')}:
         c.execute('ALTER TABLE conversation_operations ADD COLUMN candidate_fingerprint TEXT')
+    if 'pending_terminal' not in {r[1] for r in c.execute('PRAGMA table_info(conversation_operations)')}:
+        c.execute('ALTER TABLE conversation_operations ADD COLUMN pending_terminal INTEGER NOT NULL DEFAULT 0')
+    if 'provider_generation' not in {r[1] for r in c.execute('PRAGMA table_info(conversation_operations)')}:
+        c.execute('ALTER TABLE conversation_operations ADD COLUMN provider_generation INTEGER')
+        # Old operations have no generation stamp. Only matching durable
+        # progress proves it; never assign a resumed job's new generation to an
+        # old turn. Manual native turns have same-generation progress from begin.
+        c.execute('''UPDATE conversation_operations AS o SET provider_generation=(
+            SELECT p.generation FROM conversation_progress p JOIN jobs j ON j.id=p.job_id
+            WHERE p.job_id=o.job_id AND p.epoch=o.epoch AND j.epoch=o.epoch
+              AND p.generation=j.generation AND o.provider_turn_id IS NOT NULL
+              AND (p.provider_turn_id=o.provider_turn_id OR
+                (p.provider_turn_id IS NULL AND j.status='running'
+                 AND json_extract(j.input,'$.execution_owner')='desktop'
+                 AND json_extract(j.input,'$.desktop_transport')='native_ipc_v1')))''')
     c.execute('CREATE INDEX IF NOT EXISTS conversation_operation_scope ON conversation_operations(conversation_id,updated_at)')
     c.execute("""CREATE TABLE IF NOT EXISTS conversation_bindings(
         conversation_id TEXT NOT NULL,provider_thread_id TEXT NOT NULL,epoch TEXT NOT NULL,
@@ -56,8 +71,11 @@ def observe(c, job, conversation_id, values, project_path):
         VALUES (?,?,?,?,?) ON CONFLICT(job_id) DO NOTHING""",
         (job['id'],conversation_id,job['epoch'],'prepared',stamp))
     c.execute("""UPDATE conversation_operations SET phase=?,provider_thread_id=coalesce(?,provider_thread_id),
-        provider_turn_id=coalesce(?,provider_turn_id),project_path=?,contract=coalesce(?,contract),updated_at=? WHERE job_id=?""",
-        (values['phase'],values.get('provider_thread_id'),values.get('provider_turn_id'),project_path,
+        provider_turn_id=coalesce(?,provider_turn_id),
+        provider_generation=CASE WHEN ? IS NOT NULL THEN ? ELSE provider_generation END,
+        project_path=?,contract=coalesce(?,contract),updated_at=? WHERE job_id=?""",
+        (values['phase'],values.get('provider_thread_id'),values.get('provider_turn_id'),
+         values.get('provider_turn_id'),job['generation'],project_path,
          values.get('provider_contract'),stamp,job['id']))
     thread = values.get('provider_thread_id')
     if thread:
@@ -111,6 +129,18 @@ def recover_candidates(core,c):
         AND coalesce(json_extract(j.input,'$.desktop_transport'),'')!='native_ipc_v1'""",
         (core.store.meta(c,'epoch'),)).fetchall():
         complete_candidate(core,c,dict(row),get_candidate(c,row['id']))
+
+
+def recover_pending_native_candidates(core,c):
+    """Exception observers survive service restart without becoming dispatches."""
+    c.execute("""UPDATE jobs SET status='running' WHERE status='queued' AND epoch=?
+        AND json_extract(input,'$.desktop_transport')='native_ipc_v1'
+        AND EXISTS(SELECT 1 FROM conversation_operations o WHERE o.job_id=jobs.id
+            AND o.epoch=jobs.epoch AND o.provider_generation=jobs.generation
+            AND o.pending_terminal=1 AND o.candidate IS NOT NULL)
+        AND (json_extract(input,'$.conversation_id') IS NULL OR EXISTS(
+            SELECT 1 FROM conversations v WHERE v.active_job_id=jobs.id
+              AND v.id=json_extract(jobs.input,'$.conversation_id')))""", (core.store.meta(c,'epoch'),))
 
 
 def _require_native_turn(payload):
@@ -179,7 +209,9 @@ def handle(core, action, payload):
                 FROM context_operations o JOIN jobs j ON j.id=o.job_id WHERE o.id=?''',(params.get('operation_id'),)).fetchone()
             if not row or row['epoch']!=payload.get('epoch') or row['conversation_id']!=conversation_id:
                 raise BusinessError('conversation_binding_conflict','读取操作不属于当前事项。')
-        return core.query(name,**params)
+        from .discussion_identity import bound_context
+        with bound_context(core, payload, params.get('operation_id')):
+            return core.query(name,**params)
     # Material extraction runs before the transaction, like ordinary send_message.
     prepared=None
     if action=='begin':
@@ -224,10 +256,12 @@ def handle(core, action, payload):
                     value=json.loads(active['input'])
                     if value.get('desktop_transport') == 'native_ipc_v1':
                         _require_native_turn(payload)
-                        bound = c.execute('SELECT provider_turn_id FROM conversation_operations WHERE job_id=?',
+                        bound = c.execute('SELECT provider_turn_id,provider_generation FROM conversation_operations WHERE job_id=?',
                                           (active['id'],)).fetchone()
                         if bound and bound['provider_turn_id'] not in (None, payload['_native_provider_turn_id']):
                             raise BusinessError('conversation_busy', '此事项仍绑定另一真实回合，未用新的调用替换它。')
+                        if bound and bound['provider_turn_id'] is not None and bound['provider_generation'] != active['generation']:
+                            raise BusinessError('discussion_turn_stale', '原回合属于旧处理代次，不能领取恢复后的操作。')
                     owner=c.execute('SELECT request_id FROM conversation_native_requests WHERE job_id=? LIMIT 1',(active['id'],)).fetchone()
                     if owner and owner['request_id']!=payload['request_id']:
                         raise BusinessError('conversation_busy','这一轮已经开始；相同调用重试请复用原请求编号。')
@@ -279,12 +313,8 @@ def handle(core, action, payload):
                 from .ai import validate_proposal
                 value=json.loads(job['input'])
                 if value.get('desktop_transport') == 'native_ipc_v1' or payload.get('_native_provider_thread_id'):
-                    _require_native_turn(payload)
-                    bound = c.execute('SELECT provider_thread_id,provider_turn_id FROM conversation_operations WHERE job_id=?',
-                                      (job['id'],)).fetchone()
-                    if (not bound or bound['provider_thread_id'] != payload['_native_provider_thread_id']
-                            or bound['provider_turn_id'] != payload['_native_provider_turn_id']):
-                        raise BusinessError('conversation_binding_conflict', '候选的真实回合与原作业不一致，未接收或改写归属。')
+                    from .discussion_identity import check_turn
+                    check_turn(core,c,job,payload,active=False,generation=payload.get('generation'))
                 candidate=validate_proposal(payload.get('proposal'),set(value['allowed_commands']))
                 fingerprint=hashlib.sha256(encode(payload.get('proposal')).encode()).hexdigest()
                 old=c.execute('SELECT candidate_fingerprint FROM conversation_operations WHERE job_id=?',(job['id'],)).fetchone()
@@ -439,8 +469,14 @@ def check_native_turns(core, rpc_factory=None):
     from .ai import find_codex
     from .ai_shared import SharedAppServer
     with core.store.connect() as c:
-        jobs=[dict(r) for r in c.execute("""SELECT j.* FROM jobs j JOIN conversations v ON v.active_job_id=j.id
-            WHERE j.status='running' AND json_extract(j.input,'$.execution_owner')='desktop' LIMIT 4""")]
+        jobs=[dict(r) for r in c.execute("""SELECT j.* FROM jobs j
+            LEFT JOIN conversations v ON v.active_job_id=j.id
+            LEFT JOIN conversation_operations o ON o.job_id=j.id
+            WHERE j.status='running' AND (
+                (json_extract(j.input,'$.execution_owner')='desktop' AND v.id IS NOT NULL)
+                OR (json_extract(j.input,'$.desktop_transport')='native_ipc_v1'
+                    AND o.pending_terminal=1 AND o.candidate IS NOT NULL
+                    AND (v.id IS NOT NULL OR json_extract(j.input,'$.conversation_id') IS NULL))) LIMIT 4""")]
         settings=core.store.meta(c,'settings');epoch=core.store.meta(c,'epoch')
     if not jobs:return
     native_jobs = [job for job in jobs if json.loads(job['input']).get('desktop_transport') == 'native_ipc_v1']

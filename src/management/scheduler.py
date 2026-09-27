@@ -23,6 +23,8 @@ class Background:
             recover_candidates(self.core,c)
             from .native_desktop import recover as recover_desktop
             recover_desktop(self.core,c)
+            from .session_coordinator import recover_pending_native_candidates
+            recover_pending_native_candidates(self.core,c)
             from .context_driver import recover as recover_context
             recover_context(self.core,c)
             from .context_driver import upgrade_queued
@@ -41,6 +43,8 @@ class Background:
         while not self.stop.is_set():
             job = None
             with self.core.store.lock, self.core.store.connect() as c:
+                if self.stop.is_set():
+                    return
                 row = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY updated_at,created_at LIMIT 1").fetchone()
                 if row:
                     job = dict(row)
@@ -145,7 +149,14 @@ class Background:
                     candidate=get_candidate(c,job['id'])
                     current=self.core._job(c,job['id'])
                     if candidate and current['status']=='running' and current['generation']==job['generation'] and current['epoch']==self.core.store.meta(c,'epoch') and not cancel.is_set():
-                        complete_candidate(self.core,c,current,candidate)
+                        if json.loads(current['input']).get('desktop_transport')=='native_ipc_v1':
+                            # A saved candidate is not proof that the desktop's
+                            # actual turn ended. Hand only this failed worker's
+                            # wait to the read-only observer; never queue a send.
+                            c.execute('UPDATE conversation_operations SET pending_terminal=1 WHERE job_id=?', (job['id'],))
+                            c.execute('UPDATE jobs SET error=?,updated_at=? WHERE id=?', (encode(failure),now(),job['id']))
+                        else:
+                            complete_candidate(self.core,c,current,candidate)
                         c.commit()
                         continue
                     if not cancel.is_set() and current['status']=='running' and current['generation']==job['generation']:

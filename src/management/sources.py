@@ -273,10 +273,9 @@ def apply_source_action(core,c,job,action,rid):
     value=json.loads(job['input']) if isinstance(job.get('input'),str) else job.get('input') or {}
     scope=value.get('conversation_scope') or {}
     payload=action['payload']
-    if action['command']=='correct_recovery_scope' and scope.get('kind')=='course':
-        from .catchup import _belongs
-        if not _belongs(core,c,core.store.get(c,payload.get('id')),scope['entity_id']):
-            raise BusinessError('course_scope','范围更正只能修改当前课程的补欠任务。')
+    if scope.get('kind')=='course':
+        from .course_scope import check
+        check(core,c,scope['entity_id'],action)
     if scope.get('kind') == 'timetable':
         if action['command'] != 'apply_timetable' or payload.get('id') != scope['entity_id']:
             raise BusinessError('timetable_scope', '课表整理候选只能更新当前课表，请核对后重新生成。')
@@ -289,34 +288,12 @@ def apply_source_action(core,c,job,action,rid):
     if scope.get('kind')!='course' or not (value.get('source_versions') or value.get('source_owner_scope')):
         return core._dispatch(c,action['command'],payload,rid)
     owner=scope['entity_id']
-    def belongs(identifier):
-        return bool(c.execute('''WITH RECURSIVE ancestors(id,parent_id) AS
-            (SELECT id,parent_id FROM entities WHERE id=? UNION SELECT e.id,e.parent_id FROM entities e JOIN ancestors a ON e.id=a.parent_id)
-            SELECT 1 FROM ancestors WHERE id=? LIMIT 1''',(identifier,owner)).fetchone())
-    def in_scope(identifier):
-        if belongs(identifier):return True
-        row=c.execute("SELECT data FROM entities WHERE id=? AND type='event'",(identifier,)).fetchone()
-        return bool(row and belongs(json.loads(row[0]).get('owner_id')))
-    if action['command'] in {'update','record_feedback'}:
-        target=payload.get('id') if action['command']=='update' else payload.get('target_id')
-        if not in_scope(target):raise BusinessError('course_scope','课程资料候选不能修改另一课程或范围外的事项。')
-        if action['command']=='update':
-            patch=payload.get('patch') or {};new_owner=(patch.get('data') or {}).get('owner_id')
-            if 'owner_id' in (patch.get('data') or {}) and not belongs(new_owner):raise BusinessError('course_scope','课程候选不能把日程改归其他课程。')
     if action['command']=='set_recovery_task':
-        if payload.get('course_id') != owner or any(payload.get(key) and not in_scope(payload[key]) for key in ('id', 'original_task_id')):
-            raise BusinessError('course_scope', '补课与补欠候选只能登记当前课程的任务。')
         if not payload.get('source_text'):
             raise BusinessError('source_evidence', '补欠登记需要用户明确陈述或实际未完成记录作为依据。')
-    if action['command']=='record_recovery_progress' and not in_scope(payload.get('task_id')):
-        raise BusinessError('course_scope', '补欠反馈只能更新当前课程的任务。')
     if action['command']=='set_recurring_rule':
-        if not in_scope(payload.get('anchor_id')) or (payload.get('id') and not in_scope(payload['id'])):
-            raise BusinessError('course_scope','准备规则只能绑定当前课程内的节点。')
         if not payload.get('source_text'):
             raise BusinessError('source_evidence','课程准备规则需要附上资料或用户明确要求作为依据。')
-    if action['command']=='create_plan' and any(not in_scope(block.get('target_id')) for block in payload.get('blocks',[])):
-        raise BusinessError('course_scope','当前课程的计划候选包含其他范围的事项，请重新核对。')
     if action['command']!='create':return core._dispatch(c,action['command'],payload,rid)
     kind=payload.get('type');data=dict(payload.get('data') or {})
     if kind not in {'assessment','milestone','event','task','topic','note'}:

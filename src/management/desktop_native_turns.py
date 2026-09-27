@@ -33,13 +33,26 @@ def _binding(core, c, expected):
         return None
     current = dict(row)
     value = json.loads(current['input'])
-    if (value.get('execution_owner') != 'desktop'
-            or value.get('desktop_transport') != 'native_ipc_v1'):
+    if value.get('desktop_transport') != 'native_ipc_v1':
         return None
     op = c.execute('SELECT * FROM conversation_operations WHERE job_id=? AND epoch=?',
                    (current['id'], current['epoch'])).fetchone()
-    if (not op or op['conversation_id'] != value.get('conversation_id')
-            or not _uuid(op['provider_thread_id']) or not _uuid(op['provider_turn_id'])):
+    if (not op or not _uuid(op['provider_thread_id']) or not _uuid(op['provider_turn_id'])
+            or op['provider_generation'] != current['generation']):
+        return None
+    if value.get('execution_owner') != 'desktop':
+        if (not op['pending_terminal'] or not op['candidate']
+                or current['id'] in core.cancel_events):
+            return None  # Never compete with a live software worker.
+    if value.get('conversation_id') is None:
+        if value.get('execution_owner') == 'desktop' or op['conversation_id'] != 'operation:'+str(value.get('context_operation_id')):
+            return None
+        context = c.execute('SELECT job_id,epoch FROM context_operations WHERE id=?',
+                            (value.get('context_operation_id'),)).fetchone()
+        if not context or context['job_id'] != current['id'] or context['epoch'] != current['epoch']:
+            return None
+        return current, value, dict(op)
+    if op['conversation_id'] != value['conversation_id']:
         return None
     conversation = c.execute('SELECT active_job_id,provider_thread_id FROM conversations WHERE id=?',
                              (op['conversation_id'],)).fetchone()

@@ -78,4 +78,6 @@ def install_shortcuts(data_dir, executable=None):
         if destination.exists() and read_shortcut(destination)['app_id']!=APP_USER_MODEL_ID:
             destination=destination.with_name(APP_NAME+'（本机数据）.lnk')
         items.append(write_shortcut(destination,executable,data_dir))
+    from .installation_state import remember_installed_data_dir
+    remember_installed_data_dir(data_dir, executable)
     return {'shortcuts':items,'data_dir':str(Path(data_dir).resolve())}

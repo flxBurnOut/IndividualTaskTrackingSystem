@@ -46,19 +46,8 @@ class Store:
             raise BusinessError("sqlite_version", "SQLite 版本缺少所需的 WAL 修复，请使用随软件提供的运行时。")
         if v[:2] == (3, 44) and v < (3, 44, 6) or v[:2] == (3, 50) and v < (3, 50, 7):
             raise BusinessError("sqlite_version", "SQLite 版本缺少 WAL 修复。")
-        if self.path.exists() and self.path.stat().st_size:
-            probe = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True)
-            try:
-                exists = probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
-                if not exists:
-                    raise BusinessError('unknown_database', '此文件不是软件创建的数据空间，未修改。')
-                row = probe.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-                if not row or json.loads(row[0]) != 1:
-                    raise BusinessError('schema_version', '此数据空间需要不同版本的软件；未改动业务数据。')
-            finally:
-                probe.close()
-        with self.connect() as c:
-            c.execute("PRAGMA journal_mode=WAL")
+        from .upgrade_storage import schema_upgrade
+        with schema_upgrade(self.root) as c:
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS entities(

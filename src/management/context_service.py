@@ -84,6 +84,8 @@ def _operation(core, c, identifier, *, writable=False):
     op = dict(row); op['scope'] = json.loads(op['scope']); op['checkpoint'] = json.loads(op['checkpoint'])
     if op['epoch'] != core.store.meta(c, 'epoch'):
         raise BusinessError('epoch_mismatch', '数据空间已切换，旧读取引用不能继续使用。')
+    from .discussion_identity import check_context
+    check_context(core, c, op)
     if writable and op['phase']=='ready':raise BusinessError('context_finished','候选已经封存，不能再修改其批次。')
     if writable and op['job_id']:
         job = core._job(c, op['job_id'])
@@ -611,17 +613,33 @@ def handle(core,name,p):
     identifier=p.get('operation_id')
     if identifier:
         with core.store.lock,core.store.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             _operation(core,c,identifier)
             c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+?,tool_calls=tool_calls+1 WHERE id=?',
                       (size(p),identifier))
+            c.commit()
     try:
         return _handle(core,name,p)
     finally:
         if identifier:
-            with core.store.lock,core.store.connect() as c:
+            _stop_budget(core, identifier)
+
+
+def _stop_budget(core, identifier, *, required=False):
+    # A stale callback must not change the new stage even in error/finally paths.
+    with core.store.lock,core.store.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            _operation(core,c,identifier)
+            if required:
+                c.execute("UPDATE context_operations SET phase='budget_stop' WHERE id=? AND phase NOT IN ('ready','checkpointed')",(identifier,))
+            else:
                 c.execute("""UPDATE context_operations SET phase='budget_stop'
                     WHERE id=? AND phase='reading' AND (delivered_bytes>=? OR tool_calls>=128)""",
                     (identifier,STAGE_BYTES-RESERVE_BYTES-2048))
+            c.commit()
+        except BusinessError:
+            c.rollback()
 
 
 def _handle(core,name,p):
@@ -678,5 +696,5 @@ def _handle(core,name,p):
         except Exception as error:
             c.rollback()
             if getattr(error,'code',None)=='context_checkpoint_required' and p.get('operation_id'):
-                c.execute("UPDATE context_operations SET phase='budget_stop' WHERE id=? AND phase NOT IN ('ready','checkpointed')",(p['operation_id'],))
+                _stop_budget(core,p['operation_id'],required=True)
             raise

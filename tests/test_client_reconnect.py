@@ -11,13 +11,15 @@ from mcp import Client as MCPClient
 from management import client as client_module
 from management.client import Client, ClientError
 from management.mcp_server import create_server
+from management.runtime_contract import service_contract
 
 
 THREAD = '00000000-0000-4000-8000-000000000001'
 
 
 class Service:
-    def __init__(self, *, token='synthetic-initial', epoch='epoch-one', revision=3):
+    def __init__(self, data_dir, *, token='synthetic-initial', epoch='epoch-one', revision=3):
+        self.data_dir = str(data_dir.resolve())
         self.token, self.epoch, self.revision = token, epoch, revision
         self.requests = []
         self.mutations = []
@@ -36,7 +38,8 @@ class Service:
                 if self.path == '/v1/query/state':
                     if service.reject_state:
                         return self.reply(400, {'error': {'code': service.reject_state, 'message': 'Synthetic state error'}})
-                    return self.reply(200, {'epoch': service.epoch, 'revision': service.revision})
+                    return self.reply(200, {'epoch': service.epoch, 'revision': service.revision,
+                                            'data_dir': service.data_dir, 'service_contract': service_contract()})
                 if self.path.startswith('/v1/query/'):
                     return self.reply(200, {'epoch': service.epoch, 'revision': service.revision, 'items': []})
                 if self.path == '/v1/native-discussion/binding':
@@ -64,7 +67,7 @@ class Service:
         self.closed = False
 
     def runtime(self):
-        return {'port': self.http.server_address[1], 'token': self.token}
+        return {'port': self.http.server_address[1], 'token': self.token, 'data_dir': self.data_dir}
 
     def close(self):
         if not self.closed:
@@ -76,7 +79,8 @@ class Service:
 
 @pytest.fixture
 def services(monkeypatch, tmp_path):
-    first = Service()
+    path = tmp_path / 'synthetic-data'
+    first = Service(path)
     created = [first]
     state = {'current': first, 'discovery_calls': [], 'starts': []}
     def discover(path):
@@ -84,17 +88,17 @@ def services(monkeypatch, tmp_path):
         return state['current'].runtime() if state['current'] else None
     def start(path):
         state['starts'].append(path)
-        next_service = Service()
+        next_service = Service(path)
         created.append(next_service)
         state['current'] = next_service
     monkeypatch.setattr(client_module, 'discovery', discover)
     monkeypatch.setattr(client_module, 'start_service', start)
     def replace(**kwargs):
-        next_service = Service(**kwargs)
+        next_service = Service(path, **kwargs)
         created.append(next_service)
         state['current'] = next_service
         return next_service
-    yield state, replace, tmp_path / 'synthetic-data'
+    yield state, replace, path
     for service in created:
         service.close()
 
@@ -104,7 +108,7 @@ def test_state_preflight_refreshes_rotated_token_without_any_write(services):
     client = Client(path, autostart=False)
     state['current'].token = 'synthetic-rotated'
     reply = client.ensure_connected()
-    assert reply == {'epoch': 'epoch-one', 'revision': 3}
+    assert reply == {'epoch': 'epoch-one', 'revision': 3, 'data_dir': str(path.resolve()), 'service_contract': service_contract()}
     assert client.runtime == state['current'].runtime()
     assert not state['current'].mutations and not state['starts']
     assert any(not authorized for _, authorized, _ in state['current'].requests)

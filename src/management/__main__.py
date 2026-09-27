@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--install-shortcuts', action='store_true', help='为所选数据空间创建桌面与开始菜单快捷方式')
     parser.add_argument('--service', action='store_true')
     parser.add_argument('--bootstrap-service', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--resume-update', help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
     parser.add_argument('--mcp-discussion')
     parser.add_argument('--discussion-epoch')
@@ -30,11 +31,11 @@ def main():
         return worker(args.document_worker)
     if args.bootstrap_service:
         from .runtime import bootstrap_service
-        bootstrap_service(args.data_dir)
+        bootstrap_service(args.data_dir, resume_token=args.resume_update)
         return 0
     if args.service:
         from .service import run_service
-        return run_service(args.data_dir)
+        return run_service(args.data_dir, resume_token=args.resume_update)
     if args.mcp_discussion:
         from .discussion_mcp import create_server
         return create_server(args.data_dir,args.mcp_discussion,args.discussion_epoch).run(transport='stdio')
@@ -68,6 +69,14 @@ def main():
             return 1
         QMessageBox.information(None, '快捷方式已创建', '桌面和开始菜单中都可以找到“个人事务管理”。\n\n打开的数据空间：'+result['data_dir'])
         return 0
+    from .installation_state import resume_after_update
+    try:
+        resume_after_update(args.data_dir)
+    except (ValueError, OSError) as error:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        app = QApplication.instance() or QApplication([])
+        QMessageBox.warning(None, '更新尚未完成', str(error))
+        return 1
     from .gui import run
     return run(args.data_dir)
 

@@ -6,13 +6,14 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 from .mcp_routing import DiscussionRouting, RoutedMCPServer, is_context_query
+from .mcp_pages import PAGE_QUERIES, PageQuery, page as business_page, validate_request as validate_page_request
 
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
@@ -73,7 +74,7 @@ class PlanBlock(BaseModel):
     target_id: str
     start: str | None = None
     end: str | None = None
-    minutes: float | None = Field(default=None, gt=0)
+    minutes: Annotated[int, Field(strict=True, ge=1, le=1440)] | None = None
     completion_gate: str | None = None
 
 
@@ -181,7 +182,7 @@ def _capabilities_page(value: dict[str, Any], params: dict[str, Any]) -> dict[st
 def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     if client is None:
         from .client import Client
-        client = Client(data_dir)
+        client = Client(data_dir, entrance='mcp')
     server = RoutedMCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
     routing = DiscussionRouting(server, client)
 
@@ -203,6 +204,8 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
                 return _capabilities_page(raw_capabilities(), params)
             value=client.query(name, **params)
             from .context_service import size,MAX_PAGE_BYTES,QUERY_NAMES
+            if name in PAGE_QUERIES and size(value)>MAX_PAGE_BYTES:
+                return business_page(name, params, value)
             if name not in QUERY_NAMES and name not in {'material_image','state','settings'} and size(value)>MAX_PAGE_BYTES:
                 scope={'kind':'general'}
                 if params.get('date'):scope['date']=params['date']
@@ -210,12 +213,13 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
                 if name=='conversation' and value.get('conversation'):scope['conversation_id']=value['conversation']['id']
                 context=client.query('prepare_context',goal='读取 '+name,scope=scope)
                 operation=context['operation_id']
-                if name=='receipt':return client.query('read_context_item',operation_id=operation,id='receipt:'+params['request_id'])
                 if name=='job':return client.query('read_context_item',operation_id=operation,id='job:'+params['id'])
-                if name=='get':return client.query('read_context_item',operation_id=operation,id=params['id'])
-                if name=='list':return client.query('query_context',operation_id=operation,collection='records',
-                    filters={k:params[k] for k in ('type','status','search','parent_id') if params.get(k)})
-                return {'context':context,'requested_view':name,'instruction':'结果按统一分页接口读取，未将截断正文当作完整结果。'}
+                result={'context':context,'requested_view':name,'instruction':'结果按统一分页接口读取，未将截断正文当作完整结果。'}
+                if name=='today':
+                    # The history body can require context readers without
+                    # making the explicit current-plan identity disappear.
+                    result.update({key:value[key] for key in ('current_plan_id','current_plan_version') if key in value})
+                return result
             return value
         except Exception as exc:
             if hasattr(exc, "code"):
@@ -257,7 +261,10 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         for detail names, then params.name for a paged JSON detail. Extension
         names use kind:name; workflow names use module_id:id. For action payloads
         use prepare_context then describe_action. list is also paged: follow
-        next_offset; never claim the first page is complete.
+        next_offset; never claim the first page is complete. Large get/receipt/
+        list/source_content responses use business-query-json/1: call the exact
+        continuation tool/arguments, concatenate json_fragment from offset zero,
+        then parse the original response. Only then use its business next_offset.
         receipt(request_id) reconciles an interrupted write without repeating it.
         settings excludes secrets. This does not execute SQL or arbitrary code.
         """
@@ -272,6 +279,34 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         return query(name, **(params or {}))
 
     @server.tool(annotations=READ, structured_output=True)
+    def read_business_page(name: PageQuery, params: dict[str, Any],
+                           offset: Annotated[int, Field(strict=True, ge=0)] = 0,
+                           version: str | None = None) -> dict[str, Any]:
+        """Continue an ordinary large get/receipt/list/source_content response.
+
+        Use the returned continuation arguments exactly, including explicit nulls
+        and the original query's row/character offsets. Concatenate json_fragment
+        in fragment_offset order from zero, then parse JSON once complete=true
+        and continuation=null. Fragment offsets are not business next_offset.
+        Changed results/queries/epochs reject continuation; restart the original
+        read instead of joining versions. found confirms a receipt exists, while
+        complete only marks the end of its serialized response, never a new write.
+        Managed discussions must use their scoped context tools instead.
+        """
+        if routing.is_managed():
+            raise _capability_error('discussion_query_forbidden',
+                '此普通业务续读入口不适用于受管讨论；请使用当前事项的 read_context_item 或 read_material。')
+        try:
+            validate_page_request(name, params, offset, version)
+            value = client.query(name, **params)
+            return business_page(name, params, value, offset=offset, version=version)
+        except Exception as exc:
+            if hasattr(exc, 'code'):
+                raise ToolError(json.dumps({'code': exc.code, 'message': str(exc),
+                    'details': getattr(exc, 'details', {})}, ensure_ascii=False)) from exc
+            raise
+
+    @server.tool(annotations=READ, structured_output=True)
     def list_entities(type: str | None = None, parent_id: str | None = None, search: str | None = None,
                       status: str | None = None, archived: bool = False,
                       limit: int = 100, offset: int = 0) -> dict[str, Any]:
@@ -282,7 +317,9 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
 
     @server.tool(annotations=READ, structured_output=True)
     def get_entity(id: str) -> dict[str, Any]:
-        """Read an object, its version, children, relationships and bounded history."""
+        """Read an object, its version, children, relationships and bounded history.
+        For a business-query-json/1 response, follow continuation and concatenate
+        all json_fragment values before parsing the complete original view."""
         return query("get", id=id)
 
     @server.tool(annotations=READ, structured_output=True)
@@ -301,7 +338,10 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
 
     @server.tool(annotations=READ, structured_output=True)
     def recover_receipt(request_id: str) -> dict[str, Any]:
-        """Recover a committed result after timeout or in another conversation."""
+        """Recover a committed result after timeout or in another conversation.
+        A large receipt retains found/request_id/receipt_metadata; follow its
+        continuation to reconstruct the full receipt. Never repeat the write
+        merely because the result requires more than one fragment."""
         return query("receipt", request_id=request_id)
 
     @server.tool(annotations=WRITE, structured_output=True)

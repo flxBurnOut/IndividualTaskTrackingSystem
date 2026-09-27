@@ -8,11 +8,12 @@ import time
 import uuid
 import psutil
 from management.client import Client
+from management import __version__
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-1.0.1') / 'PersonalManagementService.exe'
+EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-'+__version__) / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
 
 

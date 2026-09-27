@@ -106,6 +106,7 @@ def operation_handle(core,identifier,action,payload):
     """The same bounded protocol for jobs created through the public API.
     These handles cannot create a second job or turn a read into a business write."""
     from .context_service import _operation,QUERY_NAMES,envelope,validate
+    from .discussion_identity import check_turn, bound_context
     with core.store.connect() as c:
         from .session_coordinator import _check_native_caller
         _check_native_caller(core, c, payload)
@@ -117,24 +118,31 @@ def operation_handle(core,identifier,action,payload):
             if params.get('operation_id')!=identifier or name not in (QUERY_NAMES-{'prepare_context'})|{'material_image'}:
                 raise BusinessError('context_scope','查询超出当前作业。')
         elif action=='begin':
+            check_turn(core,c,job,payload)
             value=json.loads(job['input'])
             if payload.get('text','').strip()!=value['prompt'].strip() or job['status']!='running':
                 raise BusinessError('context_scope','这条消息不属于当前作业。')
             return {'job_id':job['id'],'generation':job['generation'],'epoch':job['epoch'],
                     'context':envelope(core,c,op),'allowed_commands':value['allowed_commands']}
         elif action!='submit':raise BusinessError('context_query','未注册作业接口。')
-    if action=='context':return core.query(name,**params)
+    if action=='context':
+        with bound_context(core,payload,identifier):
+            return core.query(name,**params)
     from .ai import validate_proposal
     from .session_coordinator import get_candidate
     from .context_service import digest
     with core.store.lock,core.store.connect() as c:
-        c.execute('BEGIN IMMEDIATE');_check_native_caller(core,c,payload);op=_operation(core,c,identifier,writable=True);job=core._job(c,op['job_id'])
-        if payload.get('job_id')!=job['id'] or payload.get('generation')!=job['generation'] or job['status']!='running':
-            raise BusinessError('stale_proposal','这轮已经失效。')
+        c.execute('BEGIN IMMEDIATE');_check_native_caller(core,c,payload);op=_operation(core,c,identifier);job=core._job(c,op['job_id'])
+        check_turn(core,c,job,payload,active=False,generation=payload.get('generation'))
+        if payload.get('job_id')!=job['id']:raise BusinessError('stale_proposal','这轮已经失效。')
         fingerprint=digest(payload.get('proposal'))
         prior=c.execute('SELECT candidate_fingerprint FROM conversation_operations WHERE job_id=?',(job['id'],)).fetchone()
         if prior and prior['candidate_fingerprint']==fingerprint:c.commit();return {'received':True,'job_id':job['id'],'reused':True}
+        check_turn(core,c,job,payload)
+        if payload.get('generation')!=job['generation'] or job['status']!='running':
+            raise BusinessError('stale_proposal','这轮已经失效。')
         if get_candidate(c,job['id']):raise BusinessError('candidate_conflict','同一作业已经返回另一份候选。')
+        op=_operation(core,c,identifier,writable=True)
         candidate=validate_proposal(payload.get('proposal'),set(json.loads(job['input'])['allowed_commands']))
         candidate,proof=validate(core,c,op,candidate)
         candidate.update(_candidate_validated=True,context_validation=proof)

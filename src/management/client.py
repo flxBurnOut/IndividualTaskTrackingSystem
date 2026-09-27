@@ -8,7 +8,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .runtime import default_data_dir, discovery, start_service
+from .runtime import DataSpaceMismatch, UpdatePending, default_data_dir, discovery, read_startup_failure, require_data_dir, start_service
+from .runtime_contract import client_headers, matches_contract, mismatch_details, service_mismatch_message
 
 
 class ClientError(Exception):
@@ -18,7 +19,10 @@ class ClientError(Exception):
 
 
 class Client:
-    def __init__(self, data_dir=None, autostart=True):
+    def __init__(self, data_dir=None, autostart=True, *, entrance='gui'):
+        if entrance not in {'gui', 'mcp', 'installer'}:
+            raise ValueError('Unknown client entrance')
+        self.entrance = entrance
         self.data_dir = Path(data_dir or default_data_dir()).resolve()
         self.autostart = autostart
         self.epoch, self.revision = None, None
@@ -33,19 +37,38 @@ class Client:
 
     def _discover_and_connect(self):
         started = False
+        attempted_at = None
         deadline = time.monotonic() + (15 if self.autostart else 1)
         while True:
-            self.runtime = discovery(self.data_dir)
+            try:
+                runtime = discovery(self.data_dir)
+                if runtime is not None:
+                    self._require_data_dir(runtime.get('data_dir') if isinstance(runtime, dict) else None)
+                self.runtime = runtime
+            except DataSpaceMismatch as error:
+                self.runtime = None
+                raise ClientError('data_space_mismatch', str(error)) from error
             if self.runtime:
                 try:
                     response = self._request('query', 'state', {}, timeout=2)
                     return self._remember(response)
-                except ClientError:
-                    pass
+                except ClientError as error:
+                    if error.code in {'data_space_mismatch', 'service_version_mismatch', 'client_version_mismatch', 'service_updating'}:
+                        raise
+            if attempted_at is not None:
+                failure = read_startup_failure(self.data_dir, not_before=attempted_at)
+                if failure:
+                    raise ClientError(failure['code'], failure['message'])
             if not self.autostart or time.monotonic() >= deadline:
-                raise ClientError('service_unavailable', '业务服务没有响应。请检查所选数据目录与软件运行环境。')
+                raise ClientError('service_unavailable', '业务服务没有响应。请检查所选数据目录、磁盘可用空间、目录读写权限与安装文件。')
             if not started:
-                start_service(self.data_dir)
+                attempted_at = time.time()
+                try:
+                    start_service(self.data_dir)
+                except UpdatePending as error:
+                    raise ClientError(error.code, error.message) from error
+                except OSError as error:
+                    raise ClientError('service_start_failed', '后台启动程序未能运行。请检查安装文件、磁盘可用空间和所选目录权限后重试。') from error
                 started = True
             time.sleep(.1)
 
@@ -64,19 +87,36 @@ class Client:
                     raise
                 return self._connect()
 
+    def _require_data_dir(self, value):
+        try:
+            require_data_dir(value, self.data_dir)
+        except DataSpaceMismatch as error:
+            self.runtime = None
+            raise ClientError('data_space_mismatch', str(error)) from error
+
     def _request(self, category, name, data, timeout=35):
         runtime = self.runtime
         if not runtime:
             raise ClientError('service_unavailable', '尚未连接业务服务。')
+        self._require_data_dir(runtime.get('data_dir'))
         body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
         url = 'http://127.0.0.1:%d/v1/%s/%s' % (runtime['port'], category, name)
-        request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token']}, method='POST')
+        request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token'], **client_headers(getattr(self, 'entrance', 'gui'))}, method='POST')
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
             if len(raw) > 2 * 1024 * 1024:
                 raise ClientError('response_limit', '查询返回过多内容，请减少每页数量。')
-            return json.loads(raw)
+            result = json.loads(raw)
+            if category == 'query' and name == 'state':
+                self._require_data_dir(result.get('data_dir') if isinstance(result, dict) else None)
+                contract = result.get('service_contract') if isinstance(result, dict) else None
+                if not matches_contract(contract):
+                    self.runtime = None
+                    raise ClientError('service_version_mismatch', service_mismatch_message(contract), mismatch_details(contract))
+                if result.get('maintenance'):
+                    raise ClientError('service_updating', '后台正在准备更新，暂不接收新操作；请完成更新后重新打开软件。')
+            return result
         except urllib.error.HTTPError as error:
             try:
                 detail = json.loads(error.read(65536))['error']
@@ -89,6 +129,8 @@ class Client:
             raise ClientError('protocol_error', '业务服务返回内容无法解析。') from error
 
     def _remember(self, response):
+        if 'data_dir' in response:
+            self._require_data_dir(response['data_dir'])
         epoch, revision = response.get('epoch'), response.get('revision')
         if epoch and revision is not None:
             if self.epoch != epoch:
@@ -125,3 +167,11 @@ class Client:
 
     def close(self):
         pass  # Service lifetime belongs to the data space, not this entrance.
+
+    def prepare_update(self):
+        """Ask this exact service to drain only if idle; never retry a write.
+
+        Retain the connection when a drain needs another user-requested check.
+        An ordinary state preflight would intentionally reject maintenance.
+        """
+        return self._request('maintenance', 'shutdown-if-idle', {}, timeout=30)
