@@ -11,6 +11,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
+from .mcp_routing import DiscussionRouting, RoutedMCPServer, is_context_query
 
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
@@ -22,6 +23,8 @@ INSTRUCTIONS = (
     "事实更新不自动重排计划。不要访问数据库、工作簿或生成写库脚本。普通操作由你推理，"
     "不会再次启动后台 AI。优先 prepare_context 并用统一分页工具读取完整约束；遇到冲突重新读取并处理，"
     "不可更换版本号盲重试。只有成功回执表示写入成功。"
+    "如果当前会话关联软件事项，每轮先 begin_discussion，最后 submit_candidate；"
+    "身份由 Codex 调用上下文提供，不能指定其他会话。受管事项只返回候选，由用户在软件确认。"
 )
 
 QueryName = Literal[
@@ -83,10 +86,13 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     if client is None:
         from .client import Client
         client = Client(data_dir)
-    server = MCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
+    server = RoutedMCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
+    routing = DiscussionRouting(server, client)
 
     def query(name: str, **params: Any) -> dict[str, Any]:
         try:
+            if routing.is_managed():
+                return routing.request('context' if is_context_query(name) else 'query', name=name, params=params)
             value=client.query(name, **params)
             from .context_service import size,MAX_PAGE_BYTES,QUERY_NAMES
             if name not in QUERY_NAMES and name not in {'material_image','state','settings'} and size(value)>MAX_PAGE_BYTES:
@@ -109,6 +115,7 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             raise
 
     def command(name: str, payload: dict, request_id: str, epoch: str, expected_revision: int) -> dict[str, Any]:
+        routing.guard_write()
         if not request_id.strip() or len(request_id) > 128 or not epoch or expected_revision < 0:
             raise ToolError("写入必须使用唯一 request_id、最新上下文 epoch 和 revision。")
         try:
@@ -126,6 +133,8 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         jobs and saved drafts are in the shared service, not this conversation.
         Read plan_context separately before planning. No hidden background AI.
         """
+        if routing.is_managed():
+            return routing.request('query', name='begin_context', params={'business_date': business_date})
         state=query('state')
         envelope=query('prepare_context',goal='读取当前个人事务',scope={'kind':'general',**({'date':business_date} if business_date else {})})
         return {**state,'context':envelope,'instructions':INSTRUCTIONS,
@@ -269,10 +278,28 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         user's specific intent. A proposal must be reviewed before apply_proposal.
         Unavailable commands return a typed error, not a fabricated success.
         """
+        routing.guard_write()
         capabilities = query("capabilities")
         if name not in capabilities.get("commands", []):
             raise ToolError(json.dumps({"code": "unknown_command", "message": "Command is not registered."}))
         return command(name, payload, request_id, epoch, expected_revision)
+
+    @server.tool(annotations=WRITE, structured_output=True)
+    def begin_discussion(text: str, request_id: str) -> dict[str, Any]:
+        """Begin this exact user turn in the software matter bound to this Codex
+        call. Identity comes from transport metadata, never a tool argument.
+        Reuses a pending software request or starts a request in the same matter;
+        never starts another model. Reuse request_id only for identical retries.
+        Returns fresh context, job_id, generation and allowed candidate commands."""
+        return routing.request('begin', text=text, request_id=request_id)
+
+    @server.tool(annotations=WRITE, structured_output=True)
+    def submit_candidate(job_id: str, generation: int, proposal: dict[str, Any]) -> dict[str, Any]:
+        """Return a candidate for the current bound matter using begin_discussion's
+        job handle. proposal contains summary, unknowns, sources and actions.
+        Each action has command, reason and payload_json. Saves for review only;
+        actual changes require the user's confirmation in the management app."""
+        return routing.request('submit', job_id=job_id, generation=generation, proposal=proposal)
 
     from .context_mcp import register_tools
     register_tools(server,query)

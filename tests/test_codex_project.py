@@ -22,6 +22,44 @@ class RPC:
         raise AssertionError(method)
 
 
+class SetupRPC(RPC):
+    def __init__(self, pages, selected, *, instruction_path=None):
+        super().__init__(pages, selected)
+        self.workspace = Path(selected['roots'][0]['path'])
+        self.instruction_path = (self.workspace / '.codex/management-instructions.md'
+                                 if instruction_path is None else instruction_path)
+        self.closed = False
+        self.entered = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def close(self):
+        self.closed = True
+
+    def request(self, method, params):
+        if method != 'config/read':
+            return super().request(method, params)
+        self.calls.append((method, params))
+        return {'config': {'model_instructions_file': str(self.instruction_path)},
+                'layers': [
+                    {'name': {'type': 'project', 'dotCodexFolder': str(self.workspace / '.codex')},
+                     'disabledReason': None,
+                     'config': {'model_instructions_file': str(self.workspace / '.codex/management-instructions.md')}},
+                    {'name': {'type': 'user', 'file': str(self.workspace.parent / 'config.toml')},
+                     'version': 'synthetic-v1',
+                     'config': {'projects': {str(self.workspace): {'trust_level': 'trusted'}}}},
+                ]}
+
+
+def prepare_instructions(workspace):
+    path = workspace / '.codex/management-instructions.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('Synthetic managed project instructions.\n', encoding='utf-8')
+    return path
+
+
 def test_paginate_before_desktop_handoff(tmp_path):
     target=project(tmp_path)
     rpc=RPC([{'data': [], 'nextCursor': 'page2'}, {'data':[target]}],target)
@@ -179,14 +217,13 @@ def test_failed_activation_is_not_ready(tmp_path):
 
 
 def test_failed_setup_marks_existing_binding_unready(tmp_path,monkeypatch):
-    from management import codex_workspace
+    from management import codex_workspace, desktop_seed
     workspace=tmp_path/'Codex事务助手';workspace.mkdir()
     cp._save_binding(workspace,{'status':'ready','workspace':str(workspace),'project_id':'old'})
     monkeypatch.setattr(codex_workspace,'prepare_workspace',lambda d:{'workspace':str(workspace)})
-    monkeypatch.setattr(cp.ai,'find_codex',lambda *a:'codex.exe')
     class Failed:
-        def __init__(self,*args):raise cp.ai.AIError('AI_START_FAILED','not available')
-    monkeypatch.setattr(cp.ai,'_AppServer',Failed)
+        def __init__(self,*args,**kwargs):raise cp.ai.AIError('AI_START_FAILED','not available')
+    monkeypatch.setattr(desktop_seed,'PlainAppServer',Failed)
     with pytest.raises(BusinessError):cp.ensure_project(tmp_path,{'enabled':True})
     assert cp.project_binding(workspace) is None
     assert not cp._LOCK.locked()
@@ -194,27 +231,45 @@ def test_failed_setup_marks_existing_binding_unready(tmp_path,monkeypatch):
 
 @pytest.mark.parametrize('existing',[False,True])
 def test_ensure_project_reports_whether_desktop_open_was_requested(tmp_path,monkeypatch,existing):
-    from management import codex_workspace
+    from management import codex_workspace, desktop_seed
     workspace=tmp_path/'Codex事务助手';workspace.mkdir()
+    prepare_instructions(workspace)
     target=project(workspace)
     pages=[{'data':[target]}] if existing else [{'data':[]},{'data':[target]}]
-    class SetupRPC(RPC):
-        closed=False
-        def request(self,method,params):
-            if method=='initialize':return {}
-            return super().request(method,params)
-        def send(self,message):assert message['method']=='initialized'
-        def close(self):self.closed=True
     rpc=SetupRPC(pages,target)
     monkeypatch.setattr(codex_workspace,'prepare_workspace',lambda d:{'workspace':str(workspace)})
-    monkeypatch.setattr(cp.ai,'find_codex',lambda *a:'codex.exe')
-    monkeypatch.setattr(cp.ai,'_AppServer',lambda *a:rpc)
-    monkeypatch.setattr(cp,'_activate_project_config',lambda *a:None)
+    monkeypatch.setattr(desktop_seed,'PlainAppServer',lambda *a,**kwargs:rpc)
     monkeypatch.setattr(cp,'_probe_mcp',lambda *a:None)
     opened=[];monkeypatch.setattr(cp,'open_desktop_workspace',opened.append)
     result=cp.ensure_project(tmp_path,{'enabled':True})
     assert result['desktop_open_requested'] is (not existing)
     assert result['created'] is (not existing)
+    assert result['instructions_verified'] is True
     assert opened==([] if existing else [workspace])
     assert cp.project_binding(workspace)['desktop_open_requested'] is (not existing)
-    assert rpc.closed and not cp._LOCK.locked()
+    assert rpc.entered and rpc.closed and not cp._LOCK.locked()
+
+
+def test_active_project_layer_with_overridden_effective_instructions_is_rejected(tmp_path,monkeypatch):
+    from management import codex_workspace, desktop_seed
+    workspace=tmp_path/'Codex事务助手';workspace.mkdir()
+    expected=prepare_instructions(workspace)
+    other=tmp_path/'other-instructions.md';other.write_text('Synthetic override.',encoding='utf-8')
+    cp._save_binding(workspace,{'status':'ready','workspace':str(workspace),'project_id':'old'})
+    rpc=SetupRPC([{'data':[project(workspace)]}],project(workspace),instruction_path=other)
+    monkeypatch.setattr(codex_workspace,'prepare_workspace',lambda d:{'workspace':str(workspace)})
+    monkeypatch.setattr(desktop_seed,'PlainAppServer',lambda *a,**kwargs:rpc)
+    monkeypatch.setattr(cp,'_probe_mcp',lambda *a:pytest.fail('Instruction validation must precede the MCP probe'))
+    monkeypatch.setattr(cp,'open_desktop_workspace',lambda *a:pytest.fail('Invalid rules must not open a composer'))
+    with pytest.raises(BusinessError,match='新协助规则') as error:
+        cp.ensure_project(tmp_path,{'enabled':True})
+    assert error.value.code=='codex_project_incomplete'
+    assert expected.is_file() and cp.project_binding(workspace) is None
+    assert [method for method,_ in rpc.calls]==['config/read','config/read']
+    assert rpc.entered and rpc.closed and not cp._LOCK.locked()
+
+
+def test_effective_instruction_path_without_local_file_is_rejected(tmp_path):
+    rpc=SetupRPC([],project(tmp_path))
+    with pytest.raises(BusinessError,match='新协助规则'):
+        cp._verify_project_instructions(rpc,tmp_path)

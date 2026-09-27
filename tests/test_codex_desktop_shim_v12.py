@@ -159,13 +159,13 @@ def initialize(value,desktop):
     value.accept(desktop,{'method':'initialized'})
 
 
-def test_runtime_waits_for_real_desktop_initialized(relay):
+def test_runtime_publishes_on_successful_desktop_initialize_response(relay):
     value,engine,sent,published,desktop,manager=relay
     value.endpoint='ws://127.0.0.1:1234'
     value.accept(desktop,{'id':1,'method':'initialize','params':{}})
     assert not published
     value.receive_engine({'id':engine.sent[-1]['id'],'result':{'userAgent':'synthetic'}})
-    assert not published
+    assert published==[value.endpoint]
     value.accept(desktop,{'method':'initialized'})
     assert published==[value.endpoint]
     value.publish_if_ready()

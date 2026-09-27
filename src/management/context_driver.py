@@ -82,6 +82,8 @@ def requeue(core,c,job,*,provider=None,error=None,restart=False):
 def recover(core,c):
     for row in c.execute("""SELECT j.* FROM jobs j JOIN context_operations o ON o.job_id=j.id
         WHERE j.status='running' AND j.epoch=?""",(core.store.meta(c,'epoch'),)).fetchall():
+        if json.loads(row['input']).get('desktop_transport') == 'native_ipc_v1':
+            continue
         requeue(core,c,dict(row),restart=True)
 
 
@@ -105,6 +107,8 @@ def operation_handle(core,identifier,action,payload):
     These handles cannot create a second job or turn a read into a business write."""
     from .context_service import _operation,QUERY_NAMES,envelope,validate
     with core.store.connect() as c:
+        from .session_coordinator import _check_native_caller
+        _check_native_caller(core, c, payload)
         op=_operation(core,c,identifier)
         if op['epoch']!=payload.get('epoch') or not op['job_id']:raise BusinessError('context_scope','作业上下文无效。')
         job=core._job(c,op['job_id'])
@@ -124,7 +128,7 @@ def operation_handle(core,identifier,action,payload):
     from .session_coordinator import get_candidate
     from .context_service import digest
     with core.store.lock,core.store.connect() as c:
-        c.execute('BEGIN IMMEDIATE');op=_operation(core,c,identifier,writable=True);job=core._job(c,op['job_id'])
+        c.execute('BEGIN IMMEDIATE');_check_native_caller(core,c,payload);op=_operation(core,c,identifier,writable=True);job=core._job(c,op['job_id'])
         if payload.get('job_id')!=job['id'] or payload.get('generation')!=job['generation'] or job['status']!='running':
             raise BusinessError('stale_proposal','这轮已经失效。')
         fingerprint=digest(payload.get('proposal'))

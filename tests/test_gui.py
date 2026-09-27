@@ -61,6 +61,21 @@ def create(client, title, kind="task", data=None, parent_id=None):
     client.state()
     return client.command("create", {"type": kind, "title": title, "data": data or {}, "parent_id": parent_id})["result"]["entity"]
 
+
+def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, window, monkeypatch):
+    window.codex_connection.configure({'ai': {'enabled': True, 'execution_mode': 'desktop_shared'}})
+    for state in ('checking', 'desktop_closed', 'connecting', 'ready', 'disconnected', 'unsupported', 'error'):
+        window.codex_connection._set_state(state)
+        app.processEvents()
+        assert window.codex_connection_panel.isVisible()
+        assert window.codex_connection_retry.isVisible()
+        assert window.codex_connection_note.text()
+        assert '退出 Codex' not in window.codex_connection_note.text()
+    calls = []
+    monkeypatch.setattr(window.bridge, 'command', lambda name, *args, **kwargs: calls.append(name))
+    window.codex_connection_retry.click()
+    assert calls == ['connect_codex']
+
 def test_empty_three_navigation_and_form_create(app, window):
     assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
     assert not window.today_page.has_plan

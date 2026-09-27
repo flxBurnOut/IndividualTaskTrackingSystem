@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import uuid
 import psutil
 from .ai import find_codex
@@ -17,8 +18,8 @@ from .schemas import BusinessError
 CONFIG_NAME = 'desktop-launch.json'
 
 
-def _error(text):
-    return BusinessError('codex_desktop_setup', text)
+def _error(text, code='codex_desktop_setup'):
+    return BusinessError(code, text)
 
 
 def _desktop_paths():
@@ -73,10 +74,45 @@ def _plain(path):
             raise _error('连接目录不能使用符号链接或目录联接。')
 
 
-def prepare(data_dir, executable=''):
+def _owned_config(path, root):
+    _plain(path)
+    if not path.exists():
+        return None
+    try:
+        if path.stat().st_size > 16384:
+            raise ValueError()
+        previous = json.loads(path.read_text('utf-8'))
+        if (not isinstance(previous, dict) or previous.get('managed_by') != 'personal-management'
+                or previous.get('schema_version') != 1
+                or Path(previous['data_dir']).resolve() != root):
+            raise ValueError()
+        return previous
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise _error('桌面启动配置无法确认归属，已保留原文件。请在设置中检查连接。') from exc
+
+
+def _write_config(path, config):
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), 'utf-8')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _prepare(data_dir, executable=''):
     root = Path(data_dir).resolve()
     bridge = root / 'codex-desktop-bridge'
     _plain(bridge)
+    path = bridge / CONFIG_NAME
+    previous = _owned_config(path, root)
+    if executable is None:
+        # Legacy callers have no fresh settings snapshot. Keep the saved user
+        # selection; older metadata only knew the last discovered executable.
+        executable = previous.get('executable') if previous else ''
+        if executable is None:
+            old_real = previous.get('real_cli', '')
+            executable = old_real if Path(old_real).is_file() else ''
     real = find_codex(executable)
     shim = _shim_path()
     if not real or Path(real).resolve() == shim:
@@ -84,56 +120,68 @@ def prepare(data_dir, executable=''):
     desktop = _desktop_paths()
     if not desktop:
         raise _error('未找到已安装的 Codex 桌面应用。请先安装并登录 Codex。')
+    for target in (Path(real).resolve(), shim, desktop[0]):
+        _plain(target)
+        if not target.is_absolute() or not target.is_file():
+            raise _error('Codex 程序位置已失效，请在设置中检查程序位置。')
     bridge.mkdir(exist_ok=True)
     config = {'schema_version': 1, 'managed_by': 'personal-management', 'data_dir': str(root),
-              'real_cli': str(Path(real).resolve()), 'shim': str(shim), 'desktop': str(desktop[0])}
-    path = bridge / CONFIG_NAME
+              'real_cli': str(Path(real).resolve()), 'shim': str(shim), 'desktop': str(desktop[0]),
+              'executable': executable}
+    if previous != config:
+        _write_config(path, config)
+    return config
+
+
+def _launch_lock(data_dir):
+    from .runtime import OwnerLock
+    path = Path(data_dir).resolve() / 'codex-desktop-bridge' / 'launch.lock'
     _plain(path)
-    if path.exists():
-        if path.stat().st_size > 16384:
-            raise _error('桌面启动配置异常，已保留原文件。')
-        try:
-            previous = json.loads(path.read_text('utf-8'))
-        except (OSError, ValueError) as exc:
-            raise _error('桌面启动配置无法读取，已保留原文件。') from exc
-        if previous.get('managed_by') != 'personal-management':
-            raise _error('该位置已有其他启动配置，未覆盖。')
-    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    return OwnerLock(path)
+
+
+def prepare(data_dir, executable=''):
+    lock = _launch_lock(data_dir)
+    if not lock.acquire():
+        raise _error('正在准备 Codex 连接，请稍后重试。', 'codex_desktop_busy')
     try:
-        temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), 'utf-8')
-        os.replace(temporary, path)
+        _prepare(data_dir, executable)
     finally:
-        temporary.unlink(missing_ok=True)
+        lock.release()
     return {'prepared': True, 'requires_desktop_restart': True}
 
 
-def launch(data_dir):
+def _launch(data_dir, executable='', cancel=None):
     bridge = Path(data_dir).resolve() / 'codex-desktop-bridge'
     from .ai_shared import connection_status
-    path = bridge / CONFIG_NAME
-    _plain(path)
-    try:
-        if path.stat().st_size > 16384:
-            raise ValueError()
-        config = json.loads(path.read_text('utf-8'))
-        if config.get('managed_by') != 'personal-management' or config.get('schema_version') != 1 or Path(config['data_dir']).resolve() != bridge.parent:
-            raise ValueError()
-        desktop, shim, real = (Path(config[k]) for k in ('desktop', 'shim', 'real_cli'))
-        if any(not p.is_absolute() or not p.is_file() for p in (desktop, shim, real)) or shim.resolve() == real.resolve():
-            raise ValueError()
-        for executable in (desktop, shim, real):
-            _plain(executable)
-        if shim.resolve() != _shim_path():
-            raise ValueError()
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise _error('请先在 Codex 协助设置中保存一次，准备当前版本的桌面连接。') from exc
+    config = _prepare(data_dir, executable)
+    desktop, shim, real = (Path(config[k]) for k in ('desktop', 'shim', 'real_cli'))
+    pending = bridge / 'launch-pending.json'
+    _plain(pending)
     if connection_status(bridge, expected_bridge_executable=shim, expected_executable=real).get('ready'):
+        pending.unlink(missing_ok=True)
         return {'launched': False, 'ready': True}
+    # Persist the brief startup window so another GUI or the scheduler cannot
+    # dispatch a second desktop before Windows exposes the first process.
+    if pending.exists():
+        try:
+            if pending.stat().st_size > 16384:
+                raise ValueError()
+            attempt = json.loads(pending.read_text('utf-8'))
+            age = time.time() - float(attempt['started_at'])
+            same = attempt.get('config') == config
+        except (OSError, ValueError, TypeError, KeyError):
+            raise _error('Codex 启动记录无法读取，请在设置中重新检查连接。') from None
+        if same and 0 <= age < 30:
+            return {'launched': False, 'ready': False}
+        pending.unlink(missing_ok=True)
+        if same:
+            raise _error('Codex 已启动但未建立连接。请检查 Codex 窗口，然后在软件中点“重新检查连接”。', 'codex_desktop_start_timeout')
     for process in psutil.process_iter(['exe']):
         try:
             running = Path(process.info['exe'] or '')
             if running == desktop or (running.name.lower() in {'codex.exe', 'chatgpt.exe'} and running.parent.name.lower() == 'app' and running.parent.parent.name.startswith('OpenAI.Codex_')):
-                raise _error('请先保存并退出 Codex 桌面，再点“启动 Codex 连接模式”。这会让桌面和管理软件共用连接；不会自动关闭你正在进行的任务。')
+                raise _error('请保存并退出 Codex，保持管理软件打开；退出后会自动连接。', 'codex_desktop_restart_required')
         except (psutil.Error, OSError):
             continue
     environment = dict(os.environ)
@@ -143,13 +191,45 @@ def launch(data_dir):
     # Explicitly use the normal desktop stdio path through our local shim.
     environment.pop('CODEX_APP_SERVER_WS_URL', None)
     environment.pop('CODEX_APP_SERVER_USE_LOCAL_DAEMON', None)
-    subprocess.Popen([str(desktop)], cwd=desktop.parent, env=environment,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True)
+    if cancel is not None and cancel.is_set():
+        raise _error('本次连接已取消。', 'codex_desktop_cancelled')
+    _write_config(pending, {'started_at': time.time(), 'config': config})
+    try:
+        subprocess.Popen([str(desktop)], cwd=desktop.parent, env=environment,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True)
+    except OSError as exc:
+        pending.unlink(missing_ok=True)
+        raise _error('无法打开 Codex，请检查安装后重新检查连接。') from exc
     return {'launched': True, 'ready': False}
 
 
-def ensure_connection(data_dir, cancel, stop=None, timeout=20):
+def launch(data_dir, executable=None, cancel=None):
+    if cancel is not None and cancel.is_set():
+        raise _error('本次连接已取消。', 'codex_desktop_cancelled')
+    lock = _launch_lock(data_dir)
+    if not lock.acquire():
+        return {'launched': False, 'ready': False}
+    try:
+        return _launch(data_dir, executable, cancel)
+    finally:
+        lock.release()
+
+
+def connect_step(data_dir, executable='', cancel=None):
+    """One bounded, model-free step for the GUI's automatic connection flow."""
+    try:
+        result = launch(data_dir, executable, cancel)
+    except BusinessError as error:
+        if error.code != 'codex_desktop_restart_required':
+            raise
+        return {'state': 'waiting_for_exit', 'ready': False, 'message': error.message}
+    if result.get('ready'):
+        return {'state': 'ready', 'ready': True, 'message': 'Codex 已连接，可以直接发送。'}
+    return {'state': 'starting', 'ready': False, 'message': '正在打开并连接 Codex…'}
+
+
+def ensure_connection(data_dir, cancel, stop=None, timeout=30, executable=''):
     """A configured send may start a closed desktop, never terminate an open one."""
     import time
     from .ai_shared import connection_status
@@ -158,13 +238,14 @@ def ensure_connection(data_dir, cancel, stop=None, timeout=20):
         return cancel.is_set() or (stop is not None and stop.is_set())
     if cancelled():
         raise _error('本次请求已取消。')
-    if launch(data_dir).get('ready'):
+    if launch(data_dir, executable, cancel).get('ready'):
         return
+    expected_real = Path(find_codex(executable)).resolve()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if cancelled():
             raise _error('本次请求已取消。')
-        if connection_status(bridge, expected_bridge_executable=_shim_path()).get('ready'):
+        if connection_status(bridge, expected_bridge_executable=_shim_path(), expected_executable=expected_real).get('ready'):
             return
         cancel.wait(.2)
     raise _error('Codex 桌面已启动但尚未建立同步连接。请检查 Codex 的启动提示，再重新发送；消息没有交给独立后台连接。')

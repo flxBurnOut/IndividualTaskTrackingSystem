@@ -18,7 +18,7 @@ from .storage import Store, encode, new_id, now
 
 
 COMMANDS = ["attach_conversation", "correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
-            "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "install_module", "disable_module",
+            "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "connect_codex", "install_module", "disable_module",
             "create_job", "cancel_job", "resume_context_operation", "apply_proposal", "promote_checklist", "run_workflow", "undo",
             "import_asset", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
 
@@ -46,8 +46,18 @@ class Core:
         self.root = self.store.root
         self.cancel_events = {}
         self._resources = None
+        self._desktop_gateway = None
+        self._desktop_gateway_lock = threading.Lock()
         from .extensions import ExtensionRegistry
         self.extensions = ExtensionRegistry()
+
+    @property
+    def desktop_gateway(self):
+        with self._desktop_gateway_lock:
+            if self._desktop_gateway is None:
+                from .desktop_gateway import DesktopGateway
+                self._desktop_gateway = DesktopGateway(self)
+            return self._desktop_gateway
 
     @property
     def resources(self):
@@ -107,10 +117,7 @@ class Core:
             result = browse(self,p)
             with self.store.connect() as c:return {**result,**self.store.state(c)}
         if name == 'codex_connection':
-            from .ai_shared import connection_status
-            import sys
-            expected = Path(sys.executable).with_name('PersonalManagementCodex.exe') if getattr(sys, 'frozen', False) else None
-            return {**connection_status(self.root/'codex-desktop-bridge', expected_bridge_executable=expected), **self.query('state')}
+            return {**self.desktop_gateway.status(force=bool(p.get('force'))), **self.query('state')}
         if name == 'codex_models':
             from .model_catalog import list_models
             with self.store.connect() as c:
@@ -387,6 +394,15 @@ class Core:
             return {"request_id": request_id, "result": result, "epoch": epoch, "revision": revision, "replayed": False}
 
     def _prepare(self, name, p):
+        if name == 'connect_codex':
+            if set(p) - {'_operation_id'}:
+                raise BusinessError('validation', '连接不接受额外业务参数。')
+            config = self.query('settings')['settings']['ai']
+            if not config.get('enabled'):
+                raise BusinessError('ai_not_configured', '请先启用 Codex 协助并保存设置。')
+            from .codex_project import ensure_project, require_ready_project
+            project = require_ready_project(ensure_project(self.root, config), self.root/'Codex事务助手')
+            return {'project': project, 'connection': self.desktop_gateway.connect()}
         if name=='attach_conversation':
             from .session_coordinator import prepare_attachment
             return prepare_attachment(self,p)
@@ -408,15 +424,16 @@ class Core:
                 raise BusinessError('validation', '请选择有效的 Codex 使用方式。')
             config = copy.deepcopy(config)
             if config['enabled']:
-                from .codex_project import ensure_project
-                project = ensure_project(self.root, config)
-                if not isinstance(project, dict) or project.get('status') != 'ready' or not project.get('mcp_verified'):
-                    raise BusinessError('codex_project_incomplete', '对话项目连接尚未完成；协助设置未保存。请重新保存以修复连接。')
+                from .codex_workspace import prepare_workspace, WorkspaceError
+                from .codex_project import project_binding
+                try:
+                    prepared_workspace = prepare_workspace(self.root)
+                except WorkspaceError as error:
+                    raise BusinessError('codex_project_incomplete', str(error)) from error
+                project = project_binding(prepared_workspace['workspace']) or {
+                    **prepared_workspace, 'status': 'prepared', 'name': 'Codex事务助手'}
             else:
                 project = {'status': 'disabled', 'name': 'Codex事务助手'}
-            if config['enabled'] and config.get('execution_mode') == 'desktop_shared':
-                from .codex_desktop import prepare
-                prepare(self.root, config['executable'])
             return {'ai': config, 'codex_project': project}
         if name == 'add_source':
             from .sources import prepare
@@ -491,6 +508,11 @@ class Core:
         return None
 
     def _dispatch(self, c, name, p, rid, prepared=None):
+        if name == 'connect_codex':
+            settings = self.store.meta(c, 'settings')
+            settings['codex_project'] = copy.deepcopy(prepared['project'])
+            self.store.set_meta(c, 'settings', settings)
+            return prepared['connection']
         if name=='attach_conversation':
             from .session_coordinator import attach
             return attach(self,c,p,rid,prepared)
@@ -498,7 +520,7 @@ class Core:
         if name == 'configure_codex':
             result = self._dispatch(c, 'settings', {'settings': {'ai': prepared['ai']}}, rid)
             project = prepared['codex_project']
-            if project['status'] == 'ready':
+            if project['status'] in {'ready', 'prepared'}:
                 result['settings']['codex_project'] = copy.deepcopy(project)
                 self.store.set_meta(c, 'settings', result['settings'])
             # Disabling internal assistance leaves the independent dialogue project connected.

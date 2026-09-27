@@ -504,6 +504,11 @@ class SettingsDialog(QDialog):
     def __init__(self, bridge, capabilities, data_dir, parent=None, on_changed=None):
         super().__init__(parent)
         self.bridge, self.capabilities, self.data_dir, self.on_changed = bridge, capabilities, Path(data_dir), on_changed
+        self.codex_connection = getattr(parent, 'codex_connection', None)
+        self._owns_codex_connection = self.codex_connection is None
+        if self._owns_codex_connection:
+            from .gui_codex_connection import CodexConnectionController
+            self.codex_connection = CodexConnectionController(data_dir, self, bridge=bridge)
         self.current_settings = {}
         self.display_dirty = False
         self._display_loading = False
@@ -638,7 +643,7 @@ class SettingsDialog(QDialog):
 
         provider = QWidget()
         provider_layout = QVBoxLayout(provider)
-        intro = QLabel("先在本机 Codex 完成登录。首次启用并保存时，软件会创建固定的‘Codex事务助手’项目并连接当前数据空间；以后可直接在该项目里新建对话，处理邮件、群消息与临时事项。")
+        intro = QLabel("先在本机 Codex 完成登录。保存设置后，点击“连接 Codex”或在讨论中发送即可准备‘Codex事务助手’项目与业务接口。也可以先打开 Codex，软件会自动识别连接状态。")
         intro.setWordWrap(True)
         provider_layout.addWidget(intro)
         form = QFormLayout()
@@ -679,12 +684,12 @@ class SettingsDialog(QDialog):
         form.addRow('', self.model_note)
         form.addRow("单次等待上限", self.timeout)
         provider_layout.addLayout(form)
-        save = self.ai_save = QPushButton("保存并连接 Codex 项目")
+        save = self.ai_save = QPushButton("保存设置")
         save.setEnabled(False)
         save.setObjectName("Primary")
         save.clicked.connect(self.save_ai)
         provider_layout.addWidget(save)
-        self.codex_project_note = QLabel('尚未验证对话项目连接。启用并保存后自动创建项目、设置接口；无需手动复制配置。')
+        self.codex_project_note = QLabel('首次连接或发送时会准备对话项目与业务接口；当前连接状态见下方。')
         self.codex_project_note.setTextFormat(Qt.TextFormat.PlainText)
         self.codex_project_note.setWordWrap(True)
         self.codex_project_note.setObjectName('Hint')
@@ -698,15 +703,6 @@ class SettingsDialog(QDialog):
         connection_help.setWordWrap(True)
         connection_help.setObjectName('Hint')
         provider_layout.addWidget(connection_help)
-        self.codex_bridge_note = QLabel('桌面同步模式首次需要退出 Codex，再从下方启动；以后在管理软件发送一次，即可在 Codex 中看到全过程。此连接适配需要与当前 Codex 版本共同验证。')
-        self.codex_bridge_note.setWordWrap(True)
-        self.codex_bridge_note.setObjectName('Hint')
-        provider_layout.addWidget(self.codex_bridge_note)
-        self.codex_bridge_start = QPushButton('启动 Codex 连接模式')
-        self.codex_bridge_start.clicked.connect(self.launch_codex_desktop)
-        provider_layout.addWidget(self.codex_bridge_start)
-        self.ai_mode.currentIndexChanged.connect(self.show_codex_mode)
-        self.show_codex_mode()
         advanced_connection = QPushButton('高级：查看接口配置')
         advanced_connection.setCheckable(True)
         provider_layout.addWidget(advanced_connection)
@@ -789,13 +785,34 @@ class SettingsDialog(QDialog):
         data_layout.addStretch()
         add_page(data, '数据与高级')
 
+        # Connection progress and the next action must remain visible even when
+        # large fonts make the provider settings taller than the scroll page.
+        # Keep this separate from save errors in the other settings tabs.
+        self.codex_bridge_note = QLabel('Codex 连接：启用并保存设置后可查看状态或连接。')
+        self.codex_bridge_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.codex_bridge_note.setWordWrap(True)
+        self.codex_bridge_note.setObjectName('Notice')
+        self.codex_bridge_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        outer.addWidget(self.codex_bridge_note)
         self.message = QLabel()
         self.message.setWordWrap(True)
         outer.addWidget(self.message)
+        actions = QHBoxLayout()
+        self.codex_bridge_start = QPushButton('连接 Codex')
+        self.codex_bridge_start.clicked.connect(self.launch_codex_desktop)
+        actions.addWidget(self.codex_bridge_start)
+        actions.addStretch()
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         close.rejected.connect(self.reject)
-        outer.addWidget(close)
+        actions.addWidget(close)
+        outer.addLayout(actions)
+        self.ai_mode.currentIndexChanged.connect(self.show_codex_mode)
+        tabs.currentChanged.connect(self.show_codex_mode)
+        self.show_codex_mode()
+        if self.codex_connection is not None:
+            self.codex_connection.changed.connect(self.show_connection_state)
+            self.show_connection_state(self.codex_connection.snapshot())
         for editor_form in (reminder_form,appearance_form,form):
             editor_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
             editor_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -887,6 +904,8 @@ class SettingsDialog(QDialog):
             if not self.display_dirty:
                 self.set_display_preferences(result)
             config = self.current_settings.get("ai", {})
+            if self.codex_connection is not None:
+                self.codex_connection.configure(self.current_settings)
             self.show_codex_project(self.current_settings.get("codex_project"), enabled=config.get("enabled", False))
             self.ai_enabled.setChecked(config.get("enabled", False))
             self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(config.get("execution_mode", "background"))))
@@ -1012,6 +1031,8 @@ class SettingsDialog(QDialog):
         self.model.blockSignals(False)
 
     def _model_dialog_finished(self, *_):
+        if self._owns_codex_connection:
+            self.codex_connection.request_stop()
         self._models_closed = True
         self._models_generation += 1
         self._model_debounce.stop()
@@ -1083,34 +1104,44 @@ class SettingsDialog(QDialog):
         self.bridge.query('codex_models', loaded, failed, executable=path)
 
     def show_codex_mode(self):
-        desktop = self.ai_mode.currentData() == 'desktop_shared'
+        desktop = (self.tabs.currentIndex() == self._provider_tab
+                   and self.ai_mode.currentData() == 'desktop_shared')
         self.codex_bridge_note.setVisible(desktop)
         self.codex_bridge_start.setVisible(desktop)
 
     def launch_codex_desktop(self):
         config = self.current_settings.get('ai', {})
-        if config.get('execution_mode') != 'desktop_shared':
-            self.message.setText('请先保存“在 Codex 桌面同步显示”的设置，再启动连接模式。')
+        if config.get('execution_mode') != 'desktop_shared' or not config.get('enabled'):
+            self.codex_bridge_note.setText('请先启用 Codex 协助并保存设置，再点击“连接 Codex”。')
             return
-        try:
-            from .codex_desktop import launch
-            result = launch(self.bridge.data_dir)
-        except Exception as exc:
-            self.error({'message': getattr(exc, 'message', str(exc))})
+        if self.codex_connection is not None:
+            self.codex_connection.request_connect()
+        else:
+            self.codex_bridge_note.setText('请从管理软件主窗口连接 Codex。')
+
+    def show_connection_state(self, value):
+        if self._models_closed:
             return
-        self.codex_bridge_note.setText('已连接，可直接发送。' if result.get('ready') else '已启动 Codex，正在等待桌面建立连接…')
-        self.refresh_codex_connection(8)
+        from .gui_codex_connection import MESSAGES
+        state = value.get('state') or ('ready' if value.get('ready') else 'checking')
+        message = value.get('message') or MESSAGES.get(state, MESSAGES['error'])
+        self.codex_bridge_note.setText('Codex 连接：' + message)
+        self.codex_bridge_start.setText('检查连接' if value.get('ready') else '连接 Codex')
+        self.codex_bridge_start.setEnabled(not value.get('connect_pending') and state != 'disabled')
 
     def refresh_codex_connection(self, attempts=0):
         if self._models_closed:
             return
+        if self.codex_connection is not None:
+            self.show_connection_state(self.codex_connection.snapshot())
+            return
         def loaded(value):
             if self._models_closed:
                 return
-            self.codex_bridge_note.setText(value.get('message', '连接状态待确认。'))
+            self.show_connection_state(value)
             if not value.get('ready') and attempts:
                 QTimer.singleShot(1500, lambda: self.refresh_codex_connection(attempts-1))
-        self.bridge.query('codex_connection', loaded, lambda error: self.error(error) if not self._models_closed else None)
+        self.bridge.query('codex_connection', loaded, lambda error: self.show_connection_state({'state': 'error', 'message': error.get('message', '连接状态读取失败。')}))
 
     def open_codex_project(self):
         project = self.current_settings.get('codex_project') or {}
@@ -1124,11 +1155,11 @@ class SettingsDialog(QDialog):
         self.codex_open_project.setEnabled(bool(project and project.get('status') == 'ready'))
         if project and project.get('status') == 'ready':
             path = project.get('workspace') or project.get('project_path') or ''
-            self.codex_project_note.setText('上次已连接：' + project.get('name', 'Codex事务助手') + '\n' + path + '\n软件或数据位置改变后，再次保存可检查并修复连接。' + ('' if enabled else '\n软件后台协助已关闭；此对话项目仍可独立使用。'))
+            self.codex_project_note.setText('已保存的项目：' + project.get('name', 'Codex事务助手') + '\n' + path + '\n连接时会检查项目与业务接口；当前 Codex 状态见下方。' + ('' if enabled else '\nCodex 协助已关闭；此对话项目仍可独立使用。'))
         elif enabled:
-            self.codex_project_note.setText('尚未完成对话项目连接。请保存一次，自动创建项目并检查 MCP 接口。')
+            self.codex_project_note.setText('首次连接或发送时会准备固定项目与业务接口；无需反复保存设置。')
         else:
-            self.codex_project_note.setText('软件后台协助已关闭。首次启用并保存时会自动创建固定对话项目与 MCP 连接，并打开空白对话，不会自动发送消息。')
+            self.codex_project_note.setText('Codex 协助已关闭。启用并保存设置后，可点击“连接 Codex”或在讨论中发送，准备固定项目与业务接口。')
 
     def _ai_fields_enabled(self, enabled):
         for widget in (self.ai_enabled, self.executable, self.model, self.timeout, self.ai_mode):
@@ -1148,7 +1179,7 @@ class SettingsDialog(QDialog):
         self._model_debounce.stop()
         self._ai_fields_enabled(False)
         self.message.setObjectName('Hint')
-        self.message.setText('正在创建或检查 Codex 项目与业务接口…' if config['enabled'] else '正在保存协助设置…')
+        self.message.setText('正在保存 Codex 协助设置…')
         def saved(result):
             if self._models_closed:
                 return
@@ -1156,26 +1187,25 @@ class SettingsDialog(QDialog):
             self._ai_fields_enabled(True)
             value = result.get('result', result)
             project = value.get('codex_project')
-            if config['enabled'] and (not isinstance(project, dict) or project.get('status') != 'ready' or not project.get('mcp_verified')):
-                failed({'message': '未收到对话项目和 MCP 接口的完成回执，请重新保存以检查连接。'})
-                return
             self.current_settings['ai'] = dict(config)
-            if project and project.get('status') == 'ready':
+            if isinstance(project, dict) and project.get('status') != 'disabled':
                 self.current_settings['codex_project'] = project
             self.show_codex_project(self.current_settings.get('codex_project'), enabled=config['enabled'])
             self.saved(result)
             self.message.setObjectName('Hint')
-            self.message.setText(('设置已保存；事务助手已连接。' + ('已请求 Codex 打开项目的空白对话。' if project.get('desktop_open_requested') else '以后可直接打开事务助手，无需重复刷新配置。')) if config['enabled'] else '软件后台协助已关闭；已创建的对话项目和接口保留。')
-            if config.get('execution_mode') == 'desktop_shared' and config['enabled']:
-                self.message.setText('设置已保存。首次启用请保存并退出 Codex，再点“启动 Codex 连接模式”。')
-                self.refresh_codex_connection()
+            self.message.setText('设置已保存。连接状态见下方；可直接连接或发送。' if config['enabled'] else 'Codex 协助已关闭；已创建的对话项目和接口保留。')
+            if self.codex_connection is not None:
+                self.codex_connection.configure(self.current_settings)
+                self.show_connection_state(self.codex_connection.snapshot())
+            elif config.get('execution_mode') == 'desktop_shared' and config['enabled']:
+                self.show_connection_state({'state': 'unknown'})
         def failed(error):
             if self._models_closed:
                 return
             self._ai_configuring = False
             self._ai_fields_enabled(True)
             if config['enabled']:
-                self.codex_project_note.setText('本次对话项目连接未完成，设置尚未确认保存。当前填写内容已保留，可修复后再次保存。')
+                self.codex_project_note.setText('本次设置尚未确认保存。当前填写内容已保留，请检查提示后重试。')
             self.error(error)
         self.bridge.command("configure_codex", {"ai": config}, saved, failed)
 

@@ -157,6 +157,15 @@ def _activate_project_config(rpc, workspace):
         raise _error('Codex 尚未加载项目连接配置，请在 Codex 确认项目权限后重试。')
 
 
+def _verify_project_instructions(rpc, workspace):
+    result = rpc.request('config/read', {'cwd': str(workspace), 'includeLayers': True})
+    configured = (result.get('config') or {}).get('model_instructions_file')
+    expected = workspace / '.codex/management-instructions.md'
+    if (not isinstance(configured, str) or not Path(configured).is_absolute()
+            or _key(configured) != _key(expected) or not expected.is_file()):
+        raise _error('当前 Codex 尚未加载本项目的新协助规则；请检查该项目的自定义设置。')
+
+
 async def _probe_mcp_async(workspace, data_dir):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -166,7 +175,8 @@ async def _probe_mcp_async(workspace, data_dir):
         async with ClientSession(read, write) as session:
             await session.initialize()
             available = await session.list_tools()
-            required = {'begin_context', 'query_business', 'execute_command', 'save_plan', 'record_feedback'}
+            required = {'begin_context', 'query_business', 'execute_command', 'save_plan', 'record_feedback',
+                        'begin_discussion', 'submit_candidate'}
             if not required.issubset({t.name for t in available.tools}):
                 raise _error('业务接口缺少必要的读写能力。')
             reply = await session.call_tool('begin_context', {})
@@ -218,6 +228,23 @@ def project_binding(workspace):
         return None
 
 
+def require_ready_project(value, workspace):
+    """A setup acknowledgement must identify this verified business project."""
+    try:
+        if (not isinstance(value, dict) or value.get('status') != 'ready'
+                or value.get('mcp_verified') is not True
+                or value.get('instructions_verified') is not True
+                or not isinstance(value.get('project_id'), str)
+                or not 0 < len(value['project_id']) <= 200
+                or not isinstance(value.get('workspace'), str)
+                or not Path(value['workspace']).is_absolute()
+                or _key(value['workspace']) != _key(workspace)):
+            raise ValueError()
+    except (OSError, ValueError, TypeError):
+        raise _error('当前项目和业务接口尚未完成核对，未报告连接成功。') from None
+    return value
+
+
 def ensure_project(data_dir, ai_config):
     """Prepare, register, activate and verify one project for this data space."""
     from .codex_workspace import prepare_workspace, WorkspaceError
@@ -225,21 +252,20 @@ def ensure_project(data_dir, ai_config):
         raise _error('另一次配置正在进行，请稍后重试。')
     rpc, workspace = None, None
     try:
-        executable = ai.find_codex(ai_config.get('executable'))
-        if not executable:
-            raise _error('未找到本机 Codex 程序。')
         prepared = prepare_workspace(data_dir)
         workspace = Path(prepared['workspace']).resolve()
-        rpc = ai._AppServer(executable, workspace, threading.Event(), 75)
-        rpc.request('initialize', {'clientInfo': {'name': 'personal_management_setup', 'version': __version__}, 'capabilities': {'experimentalApi': True}})
-        rpc.send({'method': 'initialized', 'params': {}})
+        from .desktop_seed import PlainAppServer
+        rpc = PlainAppServer(workspace, timeout=25)
+        rpc.__enter__()
         _activate_project_config(rpc, workspace)
+        _verify_project_instructions(rpc, workspace)
         _probe_mcp(workspace, Path(data_dir).resolve())
         project, created, opened = _desktop_project(rpc, workspace)
         rpc.close()
         rpc = None
         result = {**prepared, 'status': 'ready', 'name': project['name'], 'project_path': str(workspace),
-                  'project_id': project['id'], 'created': created, 'mcp_verified': True, 'desktop_open_requested': opened}
+                  'project_id': project['id'], 'created': created, 'mcp_verified': True,
+                  'instructions_verified': True, 'desktop_open_requested': opened}
         _save_binding(workspace, result)
         return result
     except (ai.AIError, BusinessError, OSError, ValueError, KeyError, TypeError) as exc:

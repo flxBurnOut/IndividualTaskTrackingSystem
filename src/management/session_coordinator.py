@@ -11,6 +11,8 @@ from .storage import encode, now, new_id
 
 
 def initialize(c):
+    from .desktop_dispatch import initialize as initialize_dispatch
+    initialize_dispatch(c)
     c.execute("""CREATE TABLE IF NOT EXISTS conversation_operations(
         job_id TEXT PRIMARY KEY REFERENCES jobs(id),conversation_id TEXT NOT NULL,
         epoch TEXT NOT NULL,phase TEXT NOT NULL,provider_thread_id TEXT,provider_turn_id TEXT,
@@ -18,6 +20,10 @@ def initialize(c):
     c.execute("""CREATE TABLE IF NOT EXISTS conversation_native_requests(
         conversation_id TEXT NOT NULL,epoch TEXT NOT NULL,request_id TEXT NOT NULL,job_id TEXT NOT NULL,
         PRIMARY KEY(conversation_id,epoch,request_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS conversation_native_turns(
+        epoch TEXT NOT NULL,provider_thread_id TEXT NOT NULL,provider_turn_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id),
+        PRIMARY KEY(epoch,provider_thread_id,provider_turn_id))""")
     if 'candidate_fingerprint' not in {r[1] for r in c.execute('PRAGMA table_info(conversation_operations)')}:
         c.execute('ALTER TABLE conversation_operations ADD COLUMN candidate_fingerprint TEXT')
     c.execute('CREATE INDEX IF NOT EXISTS conversation_operation_scope ON conversation_operations(conversation_id,updated_at)')
@@ -101,9 +107,60 @@ def complete_candidate(core,c,job,candidate):
 def recover_candidates(core,c):
     for row in c.execute("""SELECT j.* FROM jobs j JOIN conversation_operations o ON o.job_id=j.id
         JOIN conversations v ON v.active_job_id=j.id
-        WHERE j.status='running' AND o.candidate IS NOT NULL AND j.epoch=?""",
+        WHERE j.status='running' AND o.candidate IS NOT NULL AND j.epoch=?
+        AND coalesce(json_extract(j.input,'$.desktop_transport'),'')!='native_ipc_v1'""",
         (core.store.meta(c,'epoch'),)).fetchall():
         complete_candidate(core,c,dict(row),get_candidate(c,row['id']))
+
+
+def _require_native_turn(payload):
+    if not payload.get('_native_provider_thread_id') or not payload.get('_native_provider_turn_id'):
+        raise BusinessError('discussion_turn_identity_required',
+            '这轮缺少 Codex 提供的真实回合身份。原任务已保留，未创建重复作业或结束仍在处理的回合。')
+
+
+def _native_turn_job(core, c, payload, conversation):
+    """One trusted actual turn cannot become a second job under a new request ID.
+
+    Manual turns have no software dispatch journal, so their durable operation
+    identity is equally authoritative. This runs inside BEGIN IMMEDIATE.
+    """
+    if not payload.get('_native_provider_thread_id'):
+        return None  # Explicit legacy shim/local discussion entry.
+    _require_native_turn(payload)
+    key = (payload['epoch'], payload['_native_provider_thread_id'], payload['_native_provider_turn_id'])
+    matches = c.execute("""SELECT job_id FROM conversation_native_turns
+        WHERE epoch=? AND provider_thread_id=? AND provider_turn_id=?
+        UNION SELECT job_id FROM conversation_operations
+        WHERE epoch=? AND provider_thread_id=? AND provider_turn_id=?
+        UNION SELECT job_id FROM desktop_dispatches
+        WHERE epoch=? AND provider_thread_id=? AND provider_turn_id=?
+        AND method='thread-follower-start-turn'""", key + key + key).fetchall()
+    if len(matches) > 1:
+        raise BusinessError('conversation_binding_conflict', '此真实回合已有冲突的作业记录，未创建或猜测归属。')
+    if not matches:
+        return None
+    original = core._job(c, matches[0]['job_id'])
+    if json.loads(original['input']).get('conversation_id') != conversation['id']:
+        raise BusinessError('conversation_binding_conflict', '此真实回合属于其他事项，未改写归属。')
+    if original['status'] not in {'queued', 'running'} or conversation['active_job_id'] != original['id']:
+        raise BusinessError('discussion_turn_finished', '这次桌面调用对应的作业已经结束，未另建重复作业。')
+    return original
+
+
+def _check_native_caller(core, c, payload):
+    caller = payload.get('_native_provider_thread_id')
+    if caller is None:
+        return
+    row = c.execute("""SELECT conversation_id FROM conversation_bindings WHERE
+        provider_thread_id=? AND epoch=? AND state='active'""", (caller, payload.get('epoch'))).fetchone()
+    if not row or row['conversation_id'] != payload.get('conversation_id'):
+        raise BusinessError('conversation_binding_stale', '调用会话的关联已改变，未写入旧事项。')
+    if not row['conversation_id'].startswith('operation:'):
+        current = c.execute('SELECT provider_thread_id FROM conversations WHERE id=?',
+                            (row['conversation_id'],)).fetchone()
+        if not current or current['provider_thread_id'] != caller:
+            raise BusinessError('conversation_binding_stale', '调用会话的关联已改变，未写入旧事项。')
 
 
 def handle(core, action, payload):
@@ -117,6 +174,7 @@ def handle(core, action, payload):
         name=payload.get('name');params=payload.get('params') or {}
         if name not in (QUERY_NAMES-{'prepare_context'})|{'material_image'}:raise BusinessError('context_query','此讨论没有开放该接口。')
         with core.store.connect() as c:
+            _check_native_caller(core, c, payload)
             row=c.execute('''SELECT o.epoch,json_extract(j.input,'$.conversation_id') conversation_id
                 FROM context_operations o JOIN jobs j ON j.id=o.job_id WHERE o.id=?''',(params.get('operation_id'),)).fetchone()
             if not row or row['epoch']!=payload.get('epoch') or row['conversation_id']!=conversation_id:
@@ -125,6 +183,8 @@ def handle(core, action, payload):
     # Material extraction runs before the transaction, like ordinary send_message.
     prepared=None
     if action=='begin':
+        if payload.get('_native_provider_thread_id'):
+            _require_native_turn(payload)
         request_id=payload.get('request_id')
         if not isinstance(request_id,str) or not 1<=len(request_id)<=128:
             raise BusinessError('validation','每轮需要稳定的请求编号，重试时复用原编号。')
@@ -136,15 +196,22 @@ def handle(core, action, payload):
             if not row:raise BusinessError('not_found','业务会话不存在。')
             request={'scope':json.loads(row['scope']),'text':text}
             active=core._job(c,row['active_job_id']) if row['active_job_id'] else None
+            native = c.execute("""SELECT 1 FROM conversation_operations o JOIN jobs j ON j.id=o.job_id
+                WHERE o.conversation_id=? AND o.epoch=? AND json_extract(j.input,'$.desktop_transport')='native_ipc_v1'
+                LIMIT 1""", (conversation_id, payload.get('epoch'))).fetchone()
+            if native:
+                _require_native_turn(payload)
         if not active:prepared=core._prepare('send_message',request)
     with core.store.lock, core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         try:
+            _check_native_caller(core, c, payload)
             if payload.get('epoch') != core.store.meta(c,'epoch'):
                 raise BusinessError('epoch_mismatch','数据空间已恢复或切换，请刷新连接。')
             conversation=c.execute('SELECT * FROM conversations WHERE id=?',(conversation_id,)).fetchone()
             if not conversation:raise BusinessError('not_found','业务会话不存在。')
             if action=='begin':
+                original = _native_turn_job(core, c, payload, conversation)
                 prior=c.execute('SELECT job_id FROM conversation_native_requests WHERE conversation_id=? AND epoch=? AND request_id=?',
                                 (conversation_id,payload['epoch'],payload['request_id'])).fetchone()
                 active=core._job(c,prior['job_id']) if prior else core._job(c,conversation['active_job_id']) if conversation['active_job_id'] else None
@@ -152,11 +219,19 @@ def handle(core, action, payload):
                     raise BusinessError('discussion_turn_finished','这个请求已经结束，未重复创建；新的用户消息请使用新请求编号。')
 
                 if active and active['status'] in {'queued','running'}:
+                    if original and original['id'] != active['id']:
+                        raise BusinessError('conversation_binding_conflict', '请求编号与真实回合属于不同作业，未切换归属。')
+                    value=json.loads(active['input'])
+                    if value.get('desktop_transport') == 'native_ipc_v1':
+                        _require_native_turn(payload)
+                        bound = c.execute('SELECT provider_turn_id FROM conversation_operations WHERE job_id=?',
+                                          (active['id'],)).fetchone()
+                        if bound and bound['provider_turn_id'] not in (None, payload['_native_provider_turn_id']):
+                            raise BusinessError('conversation_busy', '此事项仍绑定另一真实回合，未用新的调用替换它。')
                     owner=c.execute('SELECT request_id FROM conversation_native_requests WHERE job_id=? LIMIT 1',(active['id'],)).fetchone()
                     if owner and owner['request_id']!=payload['request_id']:
                         raise BusinessError('conversation_busy','这一轮已经开始；相同调用重试请复用原请求编号。')
 
-                    value=json.loads(active['input'])
                     if value['prompt'].strip()!=payload['text'].strip():
                         raise BusinessError('conversation_busy','这个事项正在处理另一条消息，请等待返回。')
                     job=active
@@ -166,6 +241,8 @@ def handle(core, action, payload):
                     result=conversations.send(core,c,request,'desktop:'+new_id(),prepared)
                     job=core._job(c,result['job']['id'])
                     value=json.loads(job['input']);value['execution_owner']='desktop'
+                    if payload.get('_native_provider_thread_id'):
+                        value['desktop_transport'] = 'native_ipc_v1'
                     revision=core.store.meta(c,'revision')+1
                     core.store.set_meta(c,'revision',revision)
                     c.execute("UPDATE jobs SET status='running',input=?,snapshot_revision=? WHERE id=?",
@@ -177,6 +254,17 @@ def handle(core, action, payload):
                         'provider_contract':'desktop_mcp_v3'},str(core.root/'Codex事务助手'))
                 c.execute('INSERT OR IGNORE INTO conversation_native_requests VALUES (?,?,?,?)',
                           (conversation_id,payload['epoch'],payload['request_id'],job['id']))
+                if payload.get('_native_provider_turn_id'):
+                    # Immutable identity survives operation progress/compaction
+                    # replacing its mutable provider_turn_id with a later turn.
+                    c.execute('''INSERT OR IGNORE INTO conversation_native_turns
+                        (epoch,provider_thread_id,provider_turn_id,conversation_id,job_id) VALUES (?,?,?,?,?)''',
+                        (job['epoch'], payload['_native_provider_thread_id'], payload['_native_provider_turn_id'],
+                         conversation_id, job['id']))
+                    observe(c, job, conversation_id, {'phase': 'waiting_model',
+                        'provider_thread_id': payload['_native_provider_thread_id'],
+                        'provider_turn_id': payload['_native_provider_turn_id'],
+                        'provider_contract': 'desktop_mcp_v3'}, str(core.root/'Codex事务助手'))
                 c.commit()
                 value=json.loads(job['input'])
                 return {'job_id':job['id'],'epoch':job['epoch'],'generation':job['generation'],
@@ -190,6 +278,13 @@ def handle(core, action, payload):
                     raise BusinessError('conversation_binding_conflict','回传不属于当前事项。')
                 from .ai import validate_proposal
                 value=json.loads(job['input'])
+                if value.get('desktop_transport') == 'native_ipc_v1' or payload.get('_native_provider_thread_id'):
+                    _require_native_turn(payload)
+                    bound = c.execute('SELECT provider_thread_id,provider_turn_id FROM conversation_operations WHERE job_id=?',
+                                      (job['id'],)).fetchone()
+                    if (not bound or bound['provider_thread_id'] != payload['_native_provider_thread_id']
+                            or bound['provider_turn_id'] != payload['_native_provider_turn_id']):
+                        raise BusinessError('conversation_binding_conflict', '候选的真实回合与原作业不一致，未接收或改写归属。')
                 candidate=validate_proposal(payload.get('proposal'),set(value['allowed_commands']))
                 fingerprint=hashlib.sha256(encode(payload.get('proposal')).encode()).hexdigest()
                 old=c.execute('SELECT candidate_fingerprint FROM conversation_operations WHERE job_id=?',(job['id'],)).fetchone()
@@ -213,14 +308,126 @@ def handle(core, action, payload):
                 candidate['provider']={'kind':'codex_app_server','thread_id':conversation['provider_thread_id'],
                     'contract':'desktop_mcp_v3','project_path':str(core.root/'Codex事务助手'),'recovery':'resumed'}
                 c.execute('UPDATE conversation_operations SET candidate=?,candidate_fingerprint=?,updated_at=? WHERE job_id=?',(encode(candidate),fingerprint,now(),job['id']))
-                if value.get('execution_owner')=='desktop':
+                if value.get('execution_owner')=='desktop' and value.get('desktop_transport') != 'native_ipc_v1':
                     complete_candidate(core,c,job,candidate)
+                # Native candidate ACK does not finish its provider turn. Keep
+                # running/active until desktop_native_turns verifies exact end.
                 c.commit()
                 return {'received':True,'job_id':job['id'],'applied':False,
                         'message':'候选已持久保存，等待用户在软件中核对确认；尚未修改业务数据。'}
             raise BusinessError('not_found','未注册的会话接口。')
         except Exception:
             c.rollback();raise
+
+
+def native_binding(core, provider_thread_id):
+    """Resolve the MCP caller supplied by Codex, never a model's scope guess."""
+    import uuid
+    try:
+        if not isinstance(provider_thread_id, str) or str(uuid.UUID(provider_thread_id)) != provider_thread_id:
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise BusinessError('conversation_caller_invalid', '缺少有效的 Codex 调用会话身份。') from None
+    with core.store.connect() as c:
+        epoch = core.store.meta(c, 'epoch')
+        row = c.execute("""SELECT conversation_id FROM conversation_bindings
+            WHERE provider_thread_id=? AND epoch=? AND state='active'""",
+            (provider_thread_id, epoch)).fetchone()
+        if not row:
+            if c.execute('SELECT 1 FROM conversation_bindings WHERE provider_thread_id=? LIMIT 1',
+                         (provider_thread_id,)).fetchone():
+                raise BusinessError('conversation_binding_stale', '此 Codex 会话的旧关联已失效，请在软件中核对原事项；未开放普通写入。')
+            return {'managed': False, 'epoch': epoch}
+        ident = row['conversation_id']
+        if ident.startswith('operation:'):
+            current = c.execute('SELECT id FROM context_operations WHERE id=? AND epoch=?',
+                                (ident[10:], epoch)).fetchone()
+        else:
+            current = c.execute('SELECT id FROM conversations WHERE id=? AND provider_thread_id=?',
+                                (ident, provider_thread_id)).fetchone()
+        if not current:
+            raise BusinessError('conversation_binding_conflict', '当前会话关联需要核对，未改用其他事项。')
+        return {'managed': True, 'epoch': epoch, 'conversation_id': ident,
+                'provider_thread_id': provider_thread_id}
+
+
+def handle_native(core, action, payload):
+    """Project MCP routing. Caller identity is transport metadata, not tool input."""
+    binding = native_binding(core, payload.get('provider_thread_id'))
+    if action == 'binding':
+        return binding
+    if not binding['managed']:
+        raise BusinessError('conversation_not_bound', '此 Codex 会话尚未关联软件事项，未猜测或新建关联。')
+    params = {key: value for key, value in payload.items()
+              if key not in {'provider_thread_id', 'provider_turn_id', 'conversation_id', 'epoch'}
+              and not key.startswith('_native_')}
+    params.update(conversation_id=binding['conversation_id'], epoch=binding['epoch'],
+                  _native_provider_thread_id=binding['provider_thread_id'])
+    if payload.get('provider_turn_id') is not None:
+        import uuid
+        turn = payload['provider_turn_id']
+        try:
+            if not isinstance(turn, str) or str(uuid.UUID(turn)) != turn:
+                raise ValueError()
+        except (ValueError, AttributeError):
+            raise BusinessError('conversation_caller_invalid', 'Codex 调用轮次无效。') from None
+        params['_native_provider_turn_id'] = turn
+    if action in {'begin', 'submit'}:
+        _require_native_turn(params)
+    if action in {'begin', 'submit', 'context'}:
+        return handle(core, action, params)
+    if action != 'query':
+        raise BusinessError('not_found', '未注册的受管讨论接口。')
+    name, query = params.get('name'), params.get('params') or {}
+    if not isinstance(query, dict):
+        raise BusinessError('validation', '受管查询参数无效。')
+    instruction = ('这是软件绑定的受管事项。每轮先 begin_discussion 读取当前事实，'
+                   '再通过 submit_candidate 返回候选，实际修改须在软件确认。')
+    if name == 'state':
+        return {**core.query('state'), **binding, 'instructions': instruction}
+    if name == 'capabilities':
+        from .ai_commands import CANDIDATE_COMMANDS
+        return {**binding, 'allowed_commands': sorted(CANDIDATE_COMMANDS),
+                'direct_business_writes': False, 'instructions': instruction}
+    with core.store.connect() as c:
+        ident = binding['conversation_id']
+        if ident.startswith('operation:'):
+            row = c.execute('SELECT job_id FROM context_operations WHERE id=? AND epoch=?',
+                            (ident[10:], binding['epoch'])).fetchone()
+            job_id = row['job_id'] if row else None
+        else:
+            row = c.execute('SELECT active_job_id FROM conversations WHERE id=?', (ident,)).fetchone()
+            job_id = row['active_job_id'] if row else None
+        job = core._job(c, job_id) if job_id else None
+        value = json.loads(job['input']) if job else {}
+        operation = value.get('context_operation_id')
+        if job and (job['epoch'] != binding['epoch'] or job['status'] not in {'queued', 'running'}):
+            operation = None
+    if name in {'begin_context', 'prepare_context'}:
+        if not operation:
+            return {**binding, 'next_tool': 'begin_discussion', 'instructions': instruction}
+        from .context_service import _operation, envelope
+        with core.store.connect() as c:
+            context = envelope(core, c, _operation(core, c, operation))
+        return {**binding, 'job_id': job['id'], 'generation': job['generation'],
+                'context': context, 'instructions': instruction}
+    if not operation:
+        raise BusinessError('discussion_not_started', '请先 begin_discussion 开始本事项的当前回合。')
+    allowed = {'get', 'list', 'source_content', 'sources', 'daily_review', 'weekly_review',
+               'plan_context', 'daily_tasks', 'recovery_summary', 'object_workspace',
+               'workspace_tasks', 'timetables', 'timetable_week', 'receipt'}
+    if name not in allowed:
+        raise BusinessError('context_query', '此受管事项没有开放该查询。')
+    if name == 'get':
+        return handle(core, 'context', {**params, 'name': 'read_context_item',
+            'params': {'operation_id': operation, 'id': query.get('id')}})
+    if name == 'receipt':
+        return handle(core, 'context', {**params, 'name': 'read_context_item',
+            'params': {'operation_id': operation, 'id': 'receipt:' + str(query.get('request_id', ''))}})
+    return {**binding, 'operation_id': operation, 'reader': 'query_context',
+            'collection': {'sources': 'materials', 'list': 'records', 'daily_tasks': 'tasks',
+                           'workspace_tasks': 'tasks'}.get(name, 'records'),
+            'instruction': '按本事项统一分页读取；计划、课表和复盘见 @plan_request、@schedule、@daily_review。'}
 
 
 def check_native_turns(core, rpc_factory=None):
@@ -235,6 +442,12 @@ def check_native_turns(core, rpc_factory=None):
         jobs=[dict(r) for r in c.execute("""SELECT j.* FROM jobs j JOIN conversations v ON v.active_job_id=j.id
             WHERE j.status='running' AND json_extract(j.input,'$.execution_owner')='desktop' LIMIT 4""")]
         settings=core.store.meta(c,'settings');epoch=core.store.meta(c,'epoch')
+    if not jobs:return
+    native_jobs = [job for job in jobs if json.loads(job['input']).get('desktop_transport') == 'native_ipc_v1']
+    if native_jobs:
+        from .desktop_native_turns import check_native_turns as check_ordinary_desktop
+        check_ordinary_desktop(core, native_jobs)
+        jobs = [job for job in jobs if job not in native_jobs]
     if not jobs:return
     rpc=None
     try:
@@ -275,13 +488,10 @@ def check_native_turns(core, rpc_factory=None):
 
 
 def _provider(core):
-    import threading
-    from .ai import _AppServer,find_codex
-    with core.store.connect() as c:settings=core.store.meta(c,'settings')
-    rpc=_AppServer(find_codex(settings.get('ai',{}).get('executable')),core.root/'Codex事务助手',threading.Event(),12)
+    from .desktop_seed import PlainAppServer
+    rpc=PlainAppServer(core.root/'Codex事务助手',timeout=12)
     try:
-        rpc.request('initialize',{'clientInfo':{'name':'personal_management_repair','version':'1'},'capabilities':{'experimentalApi':True}})
-        rpc.send({'method':'initialized','params':{}})
+        rpc.__enter__()
         return rpc
     except Exception:
         rpc.close();raise

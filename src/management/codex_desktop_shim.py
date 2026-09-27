@@ -425,6 +425,64 @@ def _connect(endpoint, token, process, parent, stop):
     raise ShimError('Timed out waiting for the authenticated Codex engine')
 
 
+def _desktop_lines(stream, stop):
+    """Read desktop pipe frames without holding Python's stdin buffer lock.
+
+    The desktop may keep its write handle open after the engine disconnects.
+    Peek before raw reads so cancellation never depends on desktop stdin EOF.
+    In-memory streams used by protocol tests keep their normal line reader.
+    """
+    descriptor = None
+    if os.name == 'nt':
+        try:
+            descriptor = stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            pass
+    if descriptor is not None:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(descriptor)
+        kernel = _kernel()
+        kernel.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel.GetFileType.restype = wintypes.DWORD
+        if kernel.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
+            descriptor = None
+    if descriptor is None:
+        while not stop.is_set():
+            raw = stream.readline(MAX_FRAME + 2)
+            yield raw
+            if not raw:
+                return
+        return
+
+    kernel.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+        wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel.PeekNamedPipe.restype = wintypes.BOOL
+    pending = bytearray()
+    while not stop.is_set():
+        newline = pending.find(b'\n')
+        if newline >= 0 or len(pending) >= MAX_FRAME + 2:
+            end = min(newline + 1, MAX_FRAME + 2) if newline >= 0 else len(pending)
+            raw = bytes(pending[:end])
+            del pending[:end]
+            yield raw
+            continue
+        available = wintypes.DWORD()
+        if not kernel.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+            if ctypes.get_last_error() in {109, 232}:  # Broken pipe / no data.
+                yield bytes(pending)
+                return
+            raise _win_error('Cannot read desktop input pipe')
+        if not available.value:
+            stop.wait(.05)
+            continue
+        # This is the sole stdin reader; read only bytes already in the pipe.
+        chunk = os.read(descriptor, min(available.value, 65536, MAX_FRAME + 2 - len(pending)))
+        if not chunk:
+            yield bytes(pending)
+            return
+        pending.extend(chunk)
+
+
 class _Relay:
     """Multiplex clients over one engine subscription without claiming tool identity."""
     ALLOWED_MANAGEMENT = {'thread/start', 'thread/resume', 'thread/read', 'thread/unsubscribe', 'thread/turns/list', 'thread/compact/start', 'thread/name/set',
@@ -692,6 +750,11 @@ class _Relay:
             if method == 'initialize' and actor['name'] == 'desktop' and isinstance(result, dict):
                 with self.lock:
                     self.initialize_result = result
+                    # Current desktop clients finish initialization on the
+                    # successful response; only their short-lived startup
+                    # probe also sends the optional initialized notification.
+                    # Publish the authenticated main connection in both cases.
+                    self.desktop_initialized = True
                 self.publish_if_ready()
             self.enqueue(actor, {**message, 'id': ident})
             return
@@ -786,8 +849,9 @@ class _Relay:
 
     def read_desktop(self, actor):
         try:
-            while not self.stop.is_set():
-                raw = self.stdin.readline(MAX_FRAME + 2)
+            for raw in _desktop_lines(self.stdin, self.stop):
+                if self.stop.is_set():
+                    return
                 if not raw:
                     self.shutdown()
                     return
@@ -822,7 +886,8 @@ class _Relay:
             self.front = server
             self.endpoint = f'ws://127.0.0.1:{server.socket.getsockname()[1]}'
             threading.Thread(target=server.serve_forever, daemon=True, name='codex-management-listener').start()
-            threading.Thread(target=self.read_desktop, args=(desktop,), daemon=True, name='codex-desktop-input').start()
+            input_thread = threading.Thread(target=self.read_desktop, args=(desktop,), daemon=True, name='codex-desktop-input')
+            input_thread.start()
             threading.Thread(target=self.watch, daemon=True, name='codex-desktop-watch').start()
             try:
                 while not self.stop.is_set():
@@ -841,6 +906,7 @@ class _Relay:
                 for actor in actors:
                     self.drop_actor(actor)
                 server.shutdown()
+                input_thread.join(timeout=2)
         if self.error:
             raise ShimError(self.error)
 

@@ -84,14 +84,18 @@ def test_cancelled_send_does_not_launch(prepared, monkeypatch):
     with pytest.raises(BusinessError):codex_desktop.ensure_connection(prepared[0], event)
 
 
-def test_configure_shared_mode_prepares_once_and_preserves_mode(tmp_path, monkeypatch):
+def test_save_shared_mode_prepares_local_workspace_without_legacy_launcher(tmp_path, monkeypatch):
     from management import codex_project
     core=Core(tmp_path/'core');calls=[]
-    monkeypatch.setattr(codex_project,'ensure_project',lambda *a:copy.deepcopy(PROJECT))
+    monkeypatch.setattr(codex_project,'ensure_project',lambda *a:pytest.fail('Saving settings must not connect a desktop project'))
     monkeypatch.setattr(codex_desktop,'prepare',lambda *a:calls.append(a))
     result=command(core,'configure_codex',{'ai':{**CONFIG,'execution_mode':'desktop_shared'}})
     assert result['result']['settings']['ai']['execution_mode']=='desktop_shared'
-    assert calls == [(core.root, CONFIG['executable'])]
+    assert calls == []
+    assert result['result']['settings']['ai']['executable'] == CONFIG['executable']
+    assert result['result']['codex_project']['status'] == 'prepared'
+    assert (core.root/'Codex事务助手/.codex/config.toml').is_file()
+    assert not (core.root/'codex-desktop-bridge/desktop-launch.json').exists()
 
 
 def test_invalid_execution_mode_cannot_connect(tmp_path, monkeypatch):

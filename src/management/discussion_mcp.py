@@ -31,17 +31,20 @@ def configuration(workspace, conversation_id, epoch):
 
 
 def create_server(data_dir, conversation_id, epoch, *, client=None):
-    from mcp.server.mcpserver import MCPServer
+    from .mcp_routing import RoutedMCPServer, DiscussionRouting
     from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ToolAnnotations
     from .client import Client
     client=client or Client(data_dir)
-    server=MCPServer('personal-management-discussion',instructions=(
+    server=RoutedMCPServer('personal-management-discussion',instructions=(
         '每轮先 begin_discussion 读取本事项的最新事实；提交候选后用自然中文回答。'
         '候选需用户在软件确认才会生效。不得通过脚本或其他工具改库。'),log_level='WARNING')
+    routing = DiscussionRouting(server, client)
 
     def request(action,**params):
-        try:return client._request('discussion',action,{'conversation_id':conversation_id,'epoch':epoch,**params},timeout=100 if params.get('name') in {'next_context_step','read_material'} else 35)
+        try:
+            routing.guard_fixed_binding(conversation_id, epoch)
+            return client._request('discussion',action,{'conversation_id':conversation_id,'epoch':epoch,**params},timeout=100 if params.get('name') in {'next_context_step','read_material'} else 35)
         except Exception as exc:
             if hasattr(exc,'code'):raise ToolError(json.dumps({'code':exc.code,'message':str(exc),'details':getattr(exc,'details',{})},ensure_ascii=False)) from exc
             raise
@@ -59,6 +62,7 @@ def create_server(data_dir, conversation_id, epoch, *, client=None):
     def query_business(name:str, params:dict[str,Any]|None=None) -> dict[str,Any]:
         """Read current evidence, including paged course records and source content.
         A query is never a request to start another AI or apply any change."""
+        routing.guard_fixed_binding(conversation_id, epoch)
         allowed={'state','get','list','source_content','sources','daily_review','weekly_review','plan_context',
                  'daily_tasks','recovery_summary','object_workspace','workspace_tasks','timetables','timetable_week','receipt'}
         if name not in allowed:raise ToolError('此会话不开放这个查询。')

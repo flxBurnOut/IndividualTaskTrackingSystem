@@ -79,6 +79,12 @@ class AssistanceDialog(QDialog):
     def __init__(self,bridge,parent=None,prompt='',on_saved=None,context_entities=None,intent=None,business_date=None,scope=None,on_open_settings=None,source_ids=None,auto_send=False,on_open_codex_thread=None):
         super().__init__(parent)
         self.bridge,self.on_saved,self.on_open_settings=bridge,on_saved,on_open_settings;self.epoch=bridge.epoch;self.on_open_codex_thread=on_open_codex_thread
+        self.codex_connection=getattr(parent,'codex_connection',None)
+        self._owns_codex_connection=self.codex_connection is None
+        if self._owns_codex_connection:
+            from .gui_codex_connection import CodexConnectionController
+            self.codex_connection=CodexConnectionController(parent=self,bridge=bridge)
+        self._pending_connection_send=None
         context_entities=context_entities or [];self.context_entities=context_entities
         if scope is None:
             if context_entities:
@@ -91,6 +97,7 @@ class AssistanceDialog(QDialog):
         self.scope=dict(scope);self.owner_id=scope.get('entity_id');self.conversation=None;self.messages={};self.next_before=None;self.active_job_id=None;self.job_id=None;self.full_job={};self.pending=False;self.mutating=False;self.applying=False;self.generation=0;self.settings_ready=False;self.conversation_ready=False;self.ai_enabled=False;self.auto_send=auto_send;self.auto_sent=False;self.closed=False;self.loading_older=False;self.showing_older=False;self.last_render=None;self.proposal_loading=None;self.dialogs=[]
         self.execution_mode='background';self.auto_focus_job=None;self.focused_thread_ids=set();self.navigation_error='';self.cards={};self.card_order=[];self.outgoing=None;self.active_progress={};self.latest_progress={};self.progress_seen_at=time.monotonic();self.poll_again=False;self.poll_before=None;self.receipt_pending=False;self.operation_serial=0;self.epoch_invalid=False
         self.attachment_dirty=source_ids is not None;self.selected_ids=list(dict.fromkeys(source_ids or []));self.source_meta={};self.attachment_version=0;self.initial_scroll=True;self.render_serial=0
+        self._auto_send_text=prompt
         self.setWindowTitle('与 Codex 讨论');self.resize(840,780);self.setMinimumSize(590,520)
         layout=QVBoxLayout(self);layout.setContentsMargins(24,20,24,18);layout.setSpacing(12)
         header=QHBoxLayout();header.addWidget(label('与 Codex 讨论','DialogHeading'),1);self.open_codex=button('在 Codex 查看',self.open_codex_thread);self.open_codex.hide();header.addWidget(self.open_codex)
@@ -100,16 +107,67 @@ class AssistanceDialog(QDialog):
         self.history=QScrollArea();self.history.setWidgetResizable(True);self.history.setFrameShape(QFrame.Shape.NoFrame);self.history_body=QWidget();self.history_layout=QVBoxLayout(self.history_body);self.history_layout.setContentsMargins(4,4,10,8);self.history_layout.setSpacing(18);self.history.setWidget(self.history_body);layout.addWidget(self.history,1)
         self.latest_button=button('回到最新回复',self.return_latest);self.older_button=button('查看更早的讨论',lambda:self.poll(before=self.next_before));self.empty_history=QWidget();empty_layout=QVBoxLayout(self.empty_history);empty_layout.addWidget(label('从一件具体的事开始','PageTitle'));empty_layout.addWidget(label('补充你的想法、实际情况或课程资料。Codex 会保留这次讨论的上下文。','Quiet'));self.history_layout.addWidget(self.latest_button);self.history_layout.addWidget(self.older_button);self.history_layout.addWidget(self.empty_history);self.history_layout.addStretch();self.latest_button.hide();self.older_button.hide()
         self.status=label('正在读取这次讨论…','Quiet');layout.addWidget(self.status)
+        self.desktop_connection_note=label('','Quiet');self.desktop_connection_note.hide();layout.addWidget(self.desktop_connection_note)
+        self.desktop_connection_retry=button('连接 Codex',self.retry_desktop_connection);self.desktop_connection_retry.hide();layout.addWidget(self.desktop_connection_retry,alignment=Qt.AlignmentFlag.AlignLeft)
         self.connect_button=button('连接 Codex',self.open_settings);self.connect_button.setObjectName('Primary');self.connect_button.hide();layout.addWidget(self.connect_button,alignment=Qt.AlignmentFlag.AlignLeft)
         self.repair_button=button('恢复原会话关联',self.repair_conversation);self.repair_button.hide();layout.addWidget(self.repair_button,alignment=Qt.AlignmentFlag.AlignLeft)
         self.resume_button=button('从已保存进度继续',self.resume_operation);self.resume_button.hide();layout.addWidget(self.resume_button,alignment=Qt.AlignmentFlag.AlignLeft)
         composer=QFrame();composer.setObjectName('ChatComposer');composer_layout=QVBoxLayout(composer);composer_layout.setContentsMargins(12,10,12,10)
         self.chips=QWidget();self.chip_layout=QHBoxLayout(self.chips);self.chip_layout.setContentsMargins(0,0,0,0);self.chip_scroll=QScrollArea();self.chip_scroll.setWidgetResizable(True);self.chip_scroll.setFrameShape(QFrame.Shape.NoFrame);self.chip_scroll.setWidget(self.chips);self.chip_scroll.setFixedHeight(51);composer_layout.addWidget(self.chip_scroll)
         self.prompt=Composer(self.start_job);self.prompt.setFrameShape(QFrame.Shape.NoFrame);self.prompt.setStyleSheet('QTextEdit {border:0;background:transparent;}');self.prompt.setFixedHeight(80);self.prompt.setPlaceholderText('说说你想安排什么，或补充新的实际情况…');self.prompt.setPlainText(prompt);composer_layout.addWidget(self.prompt)
+        self.prompt.textChanged.connect(self.cancel_pending_connection_send)
         row=QHBoxLayout();self.attach=button('＋ 附件',self.choose_sources);row.addWidget(self.attach);row.addWidget(label('Enter 发送 · Shift + Enter 换行','Quiet'),1);self.send=button('发送',self.send_or_stop);self.send.setObjectName('Primary');self.send.setMinimumWidth(86);row.addWidget(self.send);composer_layout.addLayout(row);layout.addWidget(composer)
         self.all_changes=button('查看完整变更清单',self.show_all_changes);self.all_changes.hide();layout.addWidget(self.all_changes,alignment=Qt.AlignmentFlag.AlignLeft)
         self.apply=QPushButton('核对后保存这些变更');self.apply.setObjectName('Primary');self.apply.clicked.connect(self.apply_result);self.apply.hide()
+        self.connection_send_timer=QTimer(self);self.connection_send_timer.setSingleShot(True);self.connection_send_timer.setInterval(30000);self.connection_send_timer.timeout.connect(self.cancel_pending_connection_send)
         self.timer=QTimer(self);self.timer.setInterval(1500);self.timer.timeout.connect(self.tick);self.timer.start();self.finished.connect(self.finished_dialog);self.refresh_chips();self.load_settings();self.poll();self.load_source_titles()
+        if self.codex_connection is not None:
+            self.codex_connection.changed.connect(self.desktop_connection_changed)
+            self.desktop_connection_changed(self.codex_connection.snapshot())
+
+    def desktop_connection_changed(self,value):
+        if self.closed:return
+        visible=self.execution_mode=='desktop_shared' and value.get('required',False)
+        self.desktop_connection_note.setVisible(visible)
+        self.desktop_connection_note.setText('Codex 连接：'+value.get('message',''))
+        self.desktop_connection_retry.setVisible(visible)
+        self.desktop_connection_retry.setText('检查连接' if value.get('ready') else '连接 Codex')
+        self.desktop_connection_retry.setEnabled(not value.get('connect_pending'))
+        pending=self._pending_connection_send
+        if pending and value.get('ready'):
+            matches=self._connection_draft_matches(pending)
+            self._pending_connection_send=None;self.connection_send_timer.stop()
+            if matches and self.current_epoch() and not self.active_job_id and not self.mutating and not self.applying:
+                self.start_job(connect_if_needed=False)
+                return
+        elif pending and value.get('state') in {'disabled','desktop_closed','disconnected','unsupported','error'}:
+            self._pending_connection_send=None;self.connection_send_timer.stop()
+        self.update_controls()
+
+    def retry_desktop_connection(self):
+        if self.codex_connection is not None:self.codex_connection.request_connect()
+
+    def desktop_connection_blocked(self):
+        return self.execution_mode=='desktop_shared' and self.codex_connection is not None and self.codex_connection.required and not self.codex_connection.ready
+
+    def _connection_draft_matches(self,pending):
+        return (not self.closed and pending['text']==self.prompt.toPlainText()
+                and pending['attachment_version']==self.attachment_version
+                and pending['source_ids']==tuple(self.selected_ids) and pending['epoch']==self.epoch)
+
+    def cancel_pending_connection_send(self,*_):
+        if self._pending_connection_send is None:return
+        self._pending_connection_send=None;self.connection_send_timer.stop()
+        if not self.closed:
+            self.update_controls();self.status.setText('已取消本次等待发送，草稿保留；需要发送时再次点击。')
+
+    def connect_and_send(self):
+        if self._pending_connection_send is not None:return
+        self._pending_connection_send={'text':self.prompt.toPlainText(),'attachment_version':self.attachment_version,
+            'source_ids':tuple(self.selected_ids),'epoch':self.epoch}
+        self.connection_send_timer.start()
+        self.update_controls()
+        self.codex_connection.request_connect()
 
 
     def show_all_changes(self):
@@ -144,6 +202,9 @@ class AssistanceDialog(QDialog):
         self.dialogs.append(dialog);dialog.open();load()
 
     def resume_operation(self):
+        if self.closed or not self.current_epoch() or self.mutating or self.active_job_id:return
+        if self.desktop_connection_blocked():
+            self.update_controls();return
         identifier=(self.latest_progress or {}).get('job_id')
         if not identifier:return
         self.resume_button.setEnabled(False)
@@ -188,7 +249,8 @@ class AssistanceDialog(QDialog):
         self.bridge.query('conversation_targets',loaded,failed,conversation_id=conversation['id'])
 
     def finished_dialog(self, *_):
-        self.closed=True;self.timer.stop()
+        self.closed=True;self.timer.stop();self._pending_connection_send=None;self.connection_send_timer.stop()
+        if self._owns_codex_connection:self.codex_connection.request_stop()
 
     def load_source_titles(self):
         for identifier in self.selected_ids[:20]:
@@ -203,7 +265,10 @@ class AssistanceDialog(QDialog):
         if self.closed:return
         def loaded(result):
             if self.closed or not self.current_epoch(result):return
-            self.settings_ready=True;ai=result.get('settings',{}).get('ai',{});self.ai_enabled=bool(ai.get('enabled'));self.execution_mode=ai.get('execution_mode','background');self.update_controls();self.maybe_open_live_thread();self.maybe_auto_send()
+            self.settings_ready=True;ai=result.get('settings',{}).get('ai',{});self.ai_enabled=bool(ai.get('enabled'));self.execution_mode=ai.get('execution_mode','background')
+            if self.codex_connection is not None:
+                self.codex_connection.configure(result.get('settings',{}));self.desktop_connection_changed(self.codex_connection.snapshot())
+            self.update_controls();self.maybe_open_live_thread();self.maybe_auto_send()
         def failed(error):
             if self.closed or not self.current_epoch():return
             self.settings_ready=True;self.error(error);self.update_controls()
@@ -217,9 +282,13 @@ class AssistanceDialog(QDialog):
 
     def maybe_auto_send(self):
         if self.auto_send and not self.auto_sent and self.settings_ready and self.conversation_ready and self.ai_enabled and not self.active_job_id:
-            self.auto_sent=True;self.start_job()
+            self.auto_sent=True
+            if (not self.desktop_connection_blocked() and self.prompt.toPlainText()==self._auto_send_text
+                    and self.attachment_version==0):self.start_job(connect_if_needed=False)
 
     def refresh_chips(self):
+        if self._pending_connection_send and not self._connection_draft_matches(self._pending_connection_send):
+            self.cancel_pending_connection_send()
         while self.chip_layout.count():
             item=self.chip_layout.takeAt(0)
             if item.widget():item.widget().deleteLater()
@@ -246,6 +315,7 @@ class AssistanceDialog(QDialog):
     def current_epoch(self,result=None):
         epoch=(result or {}).get('epoch')
         if (epoch is not None and self.epoch is not None and epoch!=self.epoch) or (self.epoch is not None and self.bridge.epoch is not None and self.bridge.epoch!=self.epoch):
+            self._pending_connection_send=None;self.connection_send_timer.stop()
             self.epoch_invalid=True;self.mutating=False;self.applying=False;self.timer.stop()
             self.send.setEnabled(False);self.apply.setEnabled(False);self.status.setText('数据空间已切换，请关闭并重新打开讨论。未发送文字仍保留在输入框。')
             return False
@@ -304,7 +374,8 @@ class AssistanceDialog(QDialog):
         total=candidate.get('actions_total',len(candidate.get('actions',[])))
         self.all_changes.setVisible(bool(candidate.get('action_reader') and (total>len(candidate.get('actions',[])) or any(a.get('large_candidate') for a in candidate.get('actions',[])))))
         self.all_changes.setText(f'查看完整的 {total} 项变更')
-        self.send.setText('停止' if self.active_job_id else '发送');self.send.setEnabled(ready and not self.mutating and not self.applying and (bool(self.active_job_id) or self.ai_enabled))
+        waiting=self._pending_connection_send is not None
+        self.send.setText('停止' if self.active_job_id else '取消等待发送' if waiting else '连接并发送' if self.desktop_connection_blocked() else '发送');self.send.setEnabled(ready and not self.mutating and not self.applying and (bool(self.active_job_id) or self.ai_enabled))
         self.attach.setEnabled(not self.mutating);self.prompt.setReadOnly(self.mutating)
         can_open=not self.mutating and (not self.active_job_id or self.execution_mode=='desktop_shared')
         self.open_codex.setVisible(bool(self.thread_id()));self.open_codex.setEnabled(can_open);self.open_codex.setToolTip('在 Codex 查看消息与处理进度' if can_open and self.execution_mode=='desktop_shared' else '处理结束后可在 Codex 查看' if not can_open else '在 Codex 查看这次讨论')
@@ -315,18 +386,28 @@ class AssistanceDialog(QDialog):
         elif self.active_job_id:self.status.setText(self.progress_text()+'。关闭窗口后仍会继续。')
         elif self.outgoing and self.outgoing.get('delivery')=='uncertain':self.status.setText('发送结果待确认，正在查询回执；不会自动重发。输入框保留原文。')
         elif self.outgoing and self.outgoing.get('delivery')=='failed':self.status.setText(self.outgoing.get('error') or '发送失败，原文保留在输入框。')
+        elif waiting:self.status.setText('正在连接；成功后只发送本次草稿一次。修改草稿或点击“取消等待发送”可取消。')
+        elif self.desktop_connection_blocked():self.status.setText('Codex 尚未连接，草稿已保留。点击“连接并发送”即可继续。')
         elif ready and not self.applying and not self.mutating:self.status.setText('讨论会自动保存；涉及实际记录的修改，需要核对后确认。')
         if self.navigation_error:self.status.setText(self.status.text()+' '+self.navigation_error)
 
     def send_or_stop(self):
         if self.active_job_id:self.cancel_job()
+        elif self._pending_connection_send is not None:self.cancel_pending_connection_send()
         else:self.start_job()
 
-    def start_job(self):
+    def start_job(self,*,connect_if_needed=True):
         if self.closed or not self.current_epoch() or self.mutating or self.applying or self.active_job_id or not self.settings_ready or not self.conversation_ready:return
         if not self.ai_enabled:self.update_controls();return
+        if self._pending_connection_send is not None:return
         text=self.prompt.toPlainText().strip()
         if not text:self.error({'message':'先写下需要讨论的内容。'});return
+        if self.outgoing and self.outgoing.get('delivery')=='uncertain':
+            self.update_controls();return
+        if self.desktop_connection_blocked():
+            if connect_if_needed:self.connect_and_send()
+            else:self.update_controls()
+            return
         payload={'scope':self.scope,'text':text}
         if self.intent=='daily_plan' and text==self.initial_planning_prompt:payload['request_plan']=True
         if self.intent=='course_notes':payload['skill_id']='course-notes'
@@ -602,4 +683,6 @@ class AssistanceDialog(QDialog):
         super().showEvent(event);self.closed=False;self.timer.start()
 
     def closeEvent(self,event):
-        self.closed=True;self.timer.stop();super().closeEvent(event)
+        self.closed=True;self.timer.stop();self._pending_connection_send=None;self.connection_send_timer.stop()
+        if self._owns_codex_connection:self.codex_connection.request_stop()
+        super().closeEvent(event)

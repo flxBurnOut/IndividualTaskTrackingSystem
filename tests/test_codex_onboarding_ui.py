@@ -1,4 +1,4 @@
-"""First-use Codex setup crosses one validated business command, using synthetic data."""
+"""Saving is local; explicit connection validates the project and live desktop."""
 import copy
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +16,8 @@ from management.schemas import BusinessError
 
 
 CONFIG = {'enabled': True, 'executable': 'synthetic-codex.exe', 'model': 'synthetic-model', 'timeout_seconds': 180}
-PROJECT = {'status': 'ready', 'name': 'Codex事务助手', 'workspace': 'C:/synthetic/Codex事务助手', 'project_path': 'C:/synthetic/Codex事务助手', 'project_id': 'synthetic-project', 'mcp_verified': True, 'created': True}
+SHARED_CONFIG = {**CONFIG, 'execution_mode': 'desktop_shared'}
+PROJECT = {'status': 'ready', 'name': 'Codex事务助手', 'workspace': 'C:/synthetic/Codex事务助手', 'project_path': 'C:/synthetic/Codex事务助手', 'project_id': 'synthetic-project', 'mcp_verified': True, 'instructions_verified': True, 'created': True}
 
 
 def command(core, name, payload, *, request_id=None, state=None):
@@ -34,42 +35,77 @@ def setup(monkeypatch):
     calls = []
     def ensure(data_dir, config):
         calls.append((data_dir, copy.deepcopy(config)))
-        return copy.deepcopy(PROJECT)
+        return {**copy.deepcopy(PROJECT), 'workspace': str(data_dir/'Codex事务助手'),
+                'project_path': str(data_dir/'Codex事务助手')}
     monkeypatch.setattr(codex_project, 'ensure_project', ensure)
     return calls
 
 
-def test_first_save_connects_project_before_persisting_settings(core, setup):
+class Gateway:
+    def __init__(self):
+        self.connections = 0
+    def connect(self):
+        self.connections += 1
+        return {'state': 'ready', 'ready': True, 'project_ready': True, 'mcp_ready': None}
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def gateway(core):
+    core._desktop_gateway = Gateway()
+    return core._desktop_gateway
+
+
+def test_first_save_only_prepares_local_project_and_persists_settings(core, setup, gateway):
     result = command(core, 'configure_codex', {'ai': CONFIG})
-    assert setup == [(core.root, CONFIG)]
-    assert result['result']['codex_project'] == PROJECT
+    assert setup == [] and gateway.connections == 0
+    project = result['result']['codex_project']
+    assert project['status'] == 'prepared' and not project.get('mcp_verified')
+    assert (core.root/'Codex事务助手/.codex/config.toml').is_file()
     settings = Core(core.root).query('settings')['settings']
-    assert settings['ai'] == CONFIG and settings['codex_project'] == PROJECT
+    assert settings['ai'] == CONFIG and settings['codex_project'] == project
     assert core.query('list')['total'] == 0
     assert 'configure_codex' in core.query('capabilities')['commands']
 
 
-def test_setup_releases_business_lock_while_connecting(core, monkeypatch):
+def test_explicit_connect_checks_project_before_normal_desktop_connection(core, setup, gateway):
+    command(core, 'configure_codex', {'ai': SHARED_CONFIG})
+    result = command(core, 'connect_codex', {})
+    assert setup == [(core.root, SHARED_CONFIG)] and gateway.connections == 1
+    assert result['result']['ready'] is True
+    project = core.query('settings')['settings']['codex_project']
+    assert project['project_id'] == PROJECT['project_id'] and project['mcp_verified'] is True
+    assert project['workspace'] == str(core.root/'Codex事务助手')
+    assert core.query('list')['total'] == 0
+
+
+def test_explicit_connection_releases_business_lock_and_preserves_revision_guard(core, monkeypatch, gateway):
+    command(core, 'configure_codex', {'ai': SHARED_CONFIG})
     def ensure(*args):
         with ThreadPoolExecutor(1) as executor:
             future = executor.submit(command, core, 'create', {'type': 'task', 'title': 'Concurrent synthetic update'})
             future.result(timeout=3)
-        return copy.deepcopy(PROJECT)
+        return {**copy.deepcopy(PROJECT), 'workspace': str(core.root/'Codex事务助手'),
+                'project_path': str(core.root/'Codex事务助手')}
     monkeypatch.setattr(codex_project, 'ensure_project', ensure)
     with pytest.raises(BusinessError) as exc:
-        command(core, 'configure_codex', {'ai': CONFIG})
+        command(core, 'connect_codex', {})
     assert exc.value.code == 'revision_conflict'
-    assert not core.query('settings')['settings']['ai']['enabled']
+    assert core.query('settings')['settings']['ai'] == SHARED_CONFIG
     assert core.query('list')['total'] == 1
 
 
-def test_disable_preserves_independent_dialogue_connection(core, setup):
-    command(core, 'configure_codex', {'ai': CONFIG})
+def test_disable_preserves_independent_dialogue_connection(core, setup, gateway):
+    command(core, 'configure_codex', {'ai': SHARED_CONFIG})
+    command(core, 'connect_codex', {})
+    project = copy.deepcopy(core.query('settings')['settings']['codex_project'])
     result = command(core, 'configure_codex', {'ai': {**CONFIG, 'enabled': False}})
     assert len(setup) == 1
     assert result['result']['codex_project']['status'] == 'disabled'
     settings = core.query('settings')['settings']
-    assert not settings['ai']['enabled'] and settings['codex_project'] == PROJECT
+    assert not settings['ai']['enabled'] and settings['codex_project'] == project
+    assert gateway.connections == 1
 
 
 def test_disabled_first_save_never_creates_project(core, setup):
@@ -101,36 +137,64 @@ def test_configuration_requires_complete_known_payload(core, setup, payload):
 
 
 @pytest.mark.parametrize('error', [BusinessError('codex_unavailable', 'Synthetic unavailable'), AIError('AI_START_FAILED', 'Synthetic start failure')])
-def test_setup_failure_preserves_previous_configuration_and_has_no_receipt(core, monkeypatch, error):
+def test_explicit_connection_failure_preserves_saved_configuration_and_has_no_receipt(core, monkeypatch, gateway, error):
+    command(core, 'configure_codex', {'ai': SHARED_CONFIG})
     before = core.query('settings')
     def ensure(*args):
         raise error
     monkeypatch.setattr(codex_project, 'ensure_project', ensure)
     request_id = str(uuid.uuid4())
     with pytest.raises(type(error)):
-        command(core, 'configure_codex', {'ai': CONFIG}, request_id=request_id)
+        command(core, 'connect_codex', {}, request_id=request_id)
     assert core.query('settings') == before
     assert not core.query('receipt', request_id=request_id)['found']
+    assert gateway.connections == 0
 
 
 @pytest.mark.parametrize('project', [None, {}, {'status': 'ready'}, {'status': 'pending', 'mcp_verified': True}])
-def test_partial_setup_is_not_reported_as_success(core, monkeypatch, project):
+def test_partial_explicit_setup_is_not_reported_as_success(core, monkeypatch, gateway, project):
+    command(core, 'configure_codex', {'ai': SHARED_CONFIG})
+    before = core.query('settings')
+    request_id = str(uuid.uuid4())
     monkeypatch.setattr(codex_project, 'ensure_project', lambda *args: project)
     with pytest.raises(BusinessError) as exc:
-        command(core, 'configure_codex', {'ai': CONFIG})
+        command(core, 'connect_codex', {}, request_id=request_id)
     assert exc.value.code == 'codex_project_incomplete'
-    assert core.query('state')['revision'] == 0
+    assert core.query('settings') == before and gateway.connections == 0
+    assert not core.query('receipt', request_id=request_id)['found']
 
 
-def test_repeated_request_replays_receipt_without_reconnecting(core, setup):
+def test_repeated_save_replays_receipt_without_preparing_again_or_connecting(core, setup, monkeypatch):
+    from management import codex_workspace
+    original = codex_workspace.prepare_workspace
+    prepared = []
+    def prepare(data_dir):
+        prepared.append(data_dir)
+        return original(data_dir)
+    monkeypatch.setattr(codex_workspace, 'prepare_workspace', prepare)
     state = core.query('state')
     rid = str(uuid.uuid4())
     first = command(core, 'configure_codex', {'ai': CONFIG}, request_id=rid, state=state)
     second = command(core, 'configure_codex', {'ai': CONFIG}, request_id=rid, state=state)
     assert second['replayed'] and second['result'] == first['result']
-    assert len(setup) == 1
+    assert not setup and prepared == [core.root]
     command(core, 'configure_codex', {'ai': CONFIG})
-    assert len(setup) == 2
+    assert not setup and prepared == [core.root, core.root]
+
+
+def test_local_preparation_failure_preserves_custom_files_and_previous_settings(core, monkeypatch, setup):
+    from management import codex_workspace
+    command(core, 'configure_codex', {'ai': CONFIG})
+    custom = core.root/'Codex事务助手/AGENTS.md'
+    custom.write_text('Synthetic user-authored instructions', encoding='utf-8')
+    before = core.query('settings')
+    request_id = str(uuid.uuid4())
+    with pytest.raises(BusinessError) as error:
+        command(core, 'configure_codex', {'ai': {**CONFIG, 'executable': 'new-explicit.exe'}}, request_id=request_id)
+    assert error.value.code == 'codex_project_incomplete'
+    assert custom.read_text('utf-8') == 'Synthetic user-authored instructions'
+    assert core.query('settings') == before and not setup
+    assert not core.query('receipt', request_id=request_id)['found']
 
 
 def test_legacy_settings_remains_compatible_without_spawning(core, setup):
@@ -168,9 +232,9 @@ def dialog(app, tmp_path):
     app.processEvents()
 
 
-def test_gui_saves_configuration_via_first_use_command_and_displays_receipt(dialog):
+def test_gui_saves_configuration_without_claiming_a_desktop_connection(dialog):
     view, bridge = dialog
-    assert '尚未完成' in view.codex_project_note.text()
+    assert '首次连接或发送' in view.codex_project_note.text()
     view.save_ai()
     call = bridge.commands[-1]
     assert call['name'] == 'configure_codex' and call['payload'] == {'ai': CONFIG}
@@ -179,9 +243,9 @@ def test_gui_saves_configuration_via_first_use_command_and_displays_receipt(dial
     assert len(bridge.commands) == 1
     call['callback']({'result': {'settings': {'ai': CONFIG}, 'codex_project': PROJECT}})
     assert view.ai_save.isEnabled() and view.executable.isEnabled()
-    assert '上次已连接' in view.codex_project_note.text()
+    assert '已保存的项目' in view.codex_project_note.text()
     assert PROJECT['workspace'] in view.codex_project_note.text()
-    assert '已连接' in view.message.text()
+    assert '设置已保存' in view.message.text() and '已连接' not in view.message.text()
 
 
 def test_gui_setup_failure_preserves_entered_values_and_last_saved_configuration(dialog):
@@ -191,15 +255,16 @@ def test_gui_setup_failure_preserves_entered_values_and_last_saved_configuration
     bridge.commands[-1]['error']({'message': 'Synthetic repair required'})
     assert view.executable.text() == 'new-synthetic.exe'
     assert view.current_settings['ai'] == CONFIG
-    assert view.ai_save.isEnabled() and '未完成' in view.codex_project_note.text()
+    assert view.ai_save.isEnabled() and '尚未确认保存' in view.codex_project_note.text()
     assert view.message.text() == 'Synthetic repair required'
 
 
-def test_gui_missing_completion_receipt_does_not_claim_success(dialog):
+def test_gui_settings_receipt_needs_no_connection_receipt_and_does_not_claim_connected(dialog):
     view, bridge = dialog
     view.save_ai()
     bridge.commands[-1]['callback']({'result': {'settings': {'ai': CONFIG}}})
-    assert '完成回执' in view.message.text() and '未完成' in view.codex_project_note.text()
+    assert '设置已保存' in view.message.text() and '已连接' not in view.message.text()
+    assert '首次连接或发送' in view.codex_project_note.text()
 
 
 def test_gui_disabling_keeps_project_record_visible(dialog):

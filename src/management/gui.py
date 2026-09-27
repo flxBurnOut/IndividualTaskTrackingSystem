@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 from .gui_async import ServiceBridge
 from .gui_gc import install_gui_gc
+from .gui_codex_connection import CodexConnectionController
 from .gui_forms import EntityForm
 from .gui_workflows import AssistanceDialog, PlanDialog, SettingsDialog
 from .gui_today import TodayPage
@@ -94,7 +95,7 @@ class SearchDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, data_dir, client_factory=None):
+    def __init__(self, data_dir, client_factory=None, desktop_step=None):
         install_gui_gc()
         super().__init__()
         from .branding import configure_application
@@ -122,7 +123,10 @@ class MainWindow(QMainWindow):
         self._saved_appearance = normalize_appearance()
         self._sidebar_pending = False
         self._sidebar_desired = False
+        self.codex_connection = CodexConnectionController(data_dir, self, bridge=self.bridge,
+            step=desktop_step, automatic=client_factory is None)
         self._build()
+        self.codex_connection.changed.connect(self.show_codex_connection)
         bind_theme(self, self.refresh_global_metrics)
         self.poll = QTimer(self)
         self.poll.setInterval(5000)
@@ -184,6 +188,17 @@ class MainWindow(QMainWindow):
         self.notice = plain_label("", "Notice")
         self.notice.hide()
         main_layout.addWidget(self.notice)
+        self.codex_connection_panel = QWidget()
+        connection_row = QHBoxLayout(self.codex_connection_panel)
+        connection_row.setContentsMargins(0, 0, 0, 0)
+        connection_row.addWidget(plain_label('Codex 连接', 'SectionTitle'))
+        self.codex_connection_note = plain_label('正在检查连接…', 'Hint')
+        self.codex_connection_note.setWordWrap(True)
+        self.codex_connection_retry = make_button('连接 Codex', self.codex_connection.request_connect)
+        connection_row.addWidget(self.codex_connection_note, 1)
+        connection_row.addWidget(self.codex_connection_retry)
+        self.codex_connection_panel.hide()
+        main_layout.addWidget(self.codex_connection_panel)
         self.pages = QStackedWidget()
         self.today_page = TodayPage(self.bridge, self, on_plan=self.plan_with_codex, on_manual=self.manual_plan, on_review=self.open_review, on_task=self.open_task, on_changed=self.saved, on_timetable=self.open_timetable, on_habits=lambda:self.open_settings(page='日常习惯'))
         install_calendar(self.today_page.date)
@@ -228,6 +243,15 @@ class MainWindow(QMainWindow):
         self.notice.setText(error.get("message", str(error)))
         self.notice.show()
 
+    def show_codex_connection(self, value):
+        if self.closed:
+            return
+        self.codex_connection_panel.setVisible(value['required'])
+        self.codex_connection_note.setText(value['message'])
+        self.codex_connection_retry.setVisible(True)
+        self.codex_connection_retry.setText('检查连接' if value.get('ready') else '连接 Codex')
+        self.codex_connection_retry.setEnabled(not value.get('connect_pending'))
+
     def load_capabilities(self):
         def loaded(result):
             self.capabilities = result
@@ -248,6 +272,7 @@ class MainWindow(QMainWindow):
         if epoch == self._display_epoch and revision is not None and self._display_revision is not None and revision < self._display_revision:
             return
         self._display_epoch, self._display_revision = epoch, revision
+        self.codex_connection.configure(settings)
         self._business_timezone = settings.get("timezone")
         self._saved_appearance = normalize_appearance(settings.get('appearance'))
         apply_appearance(QApplication.instance(), self._saved_appearance)
@@ -489,6 +514,7 @@ class MainWindow(QMainWindow):
             self.review_pending = False
         self.closed = True
         self.poll.stop()
+        self.codex_connection.request_stop()
         if self.bridge.callbacks:
             self.close_requested = True
             self.notice.setText("等待本次读取或保存结束后自动关闭。")
@@ -498,6 +524,13 @@ class MainWindow(QMainWindow):
         if not self.bridge.close(timeout_ms=0):
             self.close_requested = True
             self.notice.setText("正在等待后台连接退出，然后自动关闭。")
+            self.notice.show()
+            QTimer.singleShot(100, self.close)
+            event.ignore()
+            return
+        if not self.codex_connection.close(timeout_ms=0):
+            self.close_requested = True
+            self.notice.setText("正在结束连接检查，然后自动关闭。")
             self.notice.show()
             QTimer.singleShot(100, self.close)
             event.ignore()

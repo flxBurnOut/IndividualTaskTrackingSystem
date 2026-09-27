@@ -20,6 +20,8 @@ MAX_FILE_BYTES = 512 * 1024
 _DOCUMENT_PREFIX = "<!-- personal-management managed document sha256="
 _CONFIG_PREFIX = "# >>> personal-management managed MCP sha256="
 _CONFIG_END = "# <<< personal-management managed MCP"
+_INSTRUCTIONS_PREFIX = "# >>> personal-management managed instructions sha256="
+_INSTRUCTIONS_END = "# <<< personal-management managed instructions"
 _LEGACY_CONFIG_MARKER = "# Managed local business connection; regenerate after selecting a new installed release."
 _OLD_CONNECTION = "项目级 `.codex/config.toml` 已提供MCP配置，直接连接明确安装的发布版本，使用本工作区上一级的数据空间。软件升级或迁移后，通过项目根tools/prepare_codex_workspace.py更新连接配置；不要自行挑选发布目录中看起来版本最高的程序。未连接时先报告接口状态并检查配置，不绕过接口改库。不要读取或输出runtime.json中的令牌。"
 _NEW_CONNECTION = "项目级 `.codex/config.toml` 由个人事务管理的 Codex 设置自动准备，连接同一数据空间的业务服务。软件升级或迁移后，在个人事务管理中重新保存 Codex 设置即可修复连接，再新建或重新打开普通任务以加载配置。未连接时先报告接口状态并检查配置，不绕过接口改库。不要读取或输出runtime.json中的令牌。"
@@ -136,7 +138,9 @@ def _managed_document(text: str) -> bool:
 
 def _agents_text(previous: str, template: str) -> str:
     legacy = template.replace(_NEW_CONNECTION, _OLD_CONNECTION)
-    if previous and not _managed_document(previous) and _normalized(previous) not in {template, legacy}:
+    known_previous = {'5d29dfb95d44e3c48f962e99e0c0503328533a36223bea32cbd58f3a8338548d',
+                      '4de008f87872d963e6c4d22cfd4fbcfb81537bafe33a90e37643013081a4711e'}
+    if previous and not _managed_document(previous) and _normalized(previous) not in {template, legacy} and _digest(previous) not in known_previous:
         raise WorkspaceError("Codex事务助手的 AGENTS.md 含有用户修改，已保留。请先合并个人说明，再重新保存 Codex 设置。")
     return _document(template)
 
@@ -209,6 +213,43 @@ def _configuration(previous: str, connection: str) -> str:
     return text
 
 
+def _instructions_configuration(previous: str, instructions_path: Path) -> str:
+    """Own one root key independently of the table-scoped MCP configuration.
+
+    TOML comments do not end a table. The block must therefore precede all
+    existing sections, even when the managed MCP block appears after a user's
+    custom table. Other project text remains byte-for-byte within this string.
+    """
+    parsed = _parse_config(previous)
+    remainder = previous
+    if _INSTRUCTIONS_PREFIX in previous or _INSTRUCTIONS_END in previous:
+        starts = list(re.finditer(r"(?m)^" + re.escape(_INSTRUCTIONS_PREFIX) + r"([0-9a-f]{64})\r?\n", previous))
+        ends = list(re.finditer(r"(?m)^" + re.escape(_INSTRUCTIONS_END) + r"(?:\r?\n|$)", previous))
+        if len(starts) != 1 or len(ends) != 1 or starts[0].end() > ends[0].start():
+            raise WorkspaceError("Codex事务助手的受管理指令配置标记不完整，已保留原配置。")
+        start, end = starts[0], ends[0]
+        owned_body = previous[start.end():end.start()]
+        if _digest(owned_body) != start.group(1):
+            raise WorkspaceError("Codex事务助手的受管理指令配置已被修改，已保留原配置。")
+        owned = _parse_config(owned_body)
+        if (set(owned) != {"model_instructions_file"}
+                or not isinstance(owned["model_instructions_file"], str)
+                or parsed.get("model_instructions_file") != owned["model_instructions_file"]):
+            raise WorkspaceError("Codex事务助手的受管理指令配置不在项目顶层，已保留原配置。")
+        remainder = previous[:start.start()] + previous[end.end():]
+    remaining = _parse_config(remainder)
+    if "model_instructions_file" in remaining:
+        raise WorkspaceError("项目已有用户配置的 model_instructions_file，已保留其配置和文件。请先处理指令配置冲突，再重新保存 Codex 设置。")
+    body = "model_instructions_file = " + _json(str(instructions_path.resolve())) + "\n"
+    block = _INSTRUCTIONS_PREFIX + _digest(body) + "\n" + body + _INSTRUCTIONS_END + "\n"
+    text = block + remainder
+    result = _parse_config(text)
+    if (result.get("model_instructions_file") != str(instructions_path.resolve())
+            or {key: value for key, value in result.items() if key != "model_instructions_file"} != remaining):
+        raise WorkspaceError("无法在保持其他项目配置的前提下准备指令文件，已保留原配置。")
+    return text
+
+
 def _atomic_write(path: Path, content: bytes, expected: bytes | None) -> None:
     """Replace one complete file, refusing edits observed since preflight."""
     descriptor, temporary = tempfile.mkstemp(prefix=".pm-workspace-", suffix=".tmp", dir=path.parent)
@@ -241,6 +282,8 @@ def prepare_workspace(data_dir) -> dict:
             raise WorkspaceError(f"对话工作区目录被同名文件占用：{directory}")
     paths = {
         "agents_path": workspace / "AGENTS.md",
+        # Prepare the referenced document before publishing its config key.
+        "instructions_path": config_dir / "management-instructions.md",
         "config_path": config_dir / "config.toml",
         "readme_path": workspace / "开始使用.md",
     }
@@ -250,9 +293,17 @@ def prepare_workspace(data_dir) -> dict:
     template = _normalized(_decode(_read(template_path), template_path))
     if not template or _NEW_CONNECTION not in template:
         raise WorkspaceError("软件缺少 Codex 对话工作区模板，请恢复完整安装后重试。")
+    from .workspace_instructions import instructions
+    body = instructions()
+    if not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > MAX_FILE_BYTES - 200:
+        raise WorkspaceError("软件的 Codex 工作区指令缺失或过大，请恢复完整安装后重试。")
+    if originals["instructions_path"] is not None and not _managed_document(previous["instructions_path"]):
+        raise WorkspaceError("Codex事务助手的 management-instructions.md 含有用户修改，已保留原文件。请先处理指令文件冲突，再重新保存 Codex 设置。")
     generated = {
         "agents_path": _agents_text(previous["agents_path"], template),
-        "config_path": _configuration(previous["config_path"], mcp_config(data)),
+        "instructions_path": _document(body),
+        "config_path": _instructions_configuration(
+            _configuration(previous["config_path"], mcp_config(data)), paths["instructions_path"]),
     }
     readme = previous["readme_path"]
     readme_preserved = bool(readme and not _managed_document(readme) and _normalized(readme) not in {_README, _LEGACY_README})

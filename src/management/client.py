@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -22,10 +23,15 @@ class Client:
         self.autostart = autostart
         self.epoch, self.revision = None, None
         self.runtime = None
+        self._connection_lock = threading.RLock()
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._connect()
 
     def _connect(self):
+        with self._connection_lock:
+            return self._discover_and_connect()
+
+    def _discover_and_connect(self):
         started = False
         deadline = time.monotonic() + (15 if self.autostart else 1)
         while True:
@@ -33,8 +39,7 @@ class Client:
             if self.runtime:
                 try:
                     response = self._request('query', 'state', {}, timeout=2)
-                    self._remember(response)
-                    return
+                    return self._remember(response)
                 except ClientError:
                     pass
             if not self.autostart or time.monotonic() >= deadline:
@@ -44,12 +49,28 @@ class Client:
                 started = True
             time.sleep(.1)
 
+    def ensure_connected(self):
+        """Refresh this data space with a read-only probe before a new operation.
+
+        A persistent MCP client can outlive the service's process, port and
+        credential. Only state reads are retried here; a caller's later write
+        body is never replayed by this method.
+        """
+        with self._connection_lock:
+            try:
+                return self._remember(self._request('query', 'state', {}, timeout=2))
+            except ClientError as error:
+                if error.code not in {'connection_lost', 'unauthorized', 'service_unavailable'}:
+                    raise
+                return self._connect()
+
     def _request(self, category, name, data, timeout=35):
-        if not self.runtime:
+        runtime = self.runtime
+        if not runtime:
             raise ClientError('service_unavailable', '尚未连接业务服务。')
         body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
-        url = 'http://127.0.0.1:%d/v1/%s/%s' % (self.runtime['port'], category, name)
-        request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.runtime['token']}, method='POST')
+        url = 'http://127.0.0.1:%d/v1/%s/%s' % (runtime['port'], category, name)
+        request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token']}, method='POST')
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
@@ -80,7 +101,7 @@ class Client:
         try:
             return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
         except ClientError as error:
-            if error.code == 'connection_lost' and self.autostart:
+            if error.code in {'connection_lost', 'unauthorized', 'service_unavailable'}:
                 self._connect()
                 return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
             raise
@@ -89,11 +110,14 @@ class Client:
         return self.query('state')
 
     def command(self, name, payload, *, request_id=None, expected_revision=None, epoch=None):
-        if self.epoch is None:
-            self.state()
-        envelope = {'request_id': request_id or str(uuid.uuid4()), 'epoch': epoch if epoch is not None else self.epoch, 'expected_revision': expected_revision if expected_revision is not None else self.revision, 'payload': payload}
+        prior_epoch, prior_revision = self.epoch, self.revision
+        current = self.ensure_connected()
+        envelope = {'request_id': request_id or str(uuid.uuid4()),
+                    'epoch': epoch if epoch is not None else prior_epoch if prior_epoch is not None else current.get('epoch', self.epoch),
+                    'expected_revision': expected_revision if expected_revision is not None else prior_revision if prior_revision is not None else current.get('revision', self.revision),
+                    'payload': payload}
         try:
-            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'configure_codex', 'add_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
+            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'configure_codex', 'connect_codex', 'add_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
         except ClientError as error:
             error.details['request_id'] = envelope['request_id']
             # Never silently retry a write or discard the caller's old version.

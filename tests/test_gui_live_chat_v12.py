@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 from management.gui_assistant import AssistanceDialog
 from test_ux_workflows_v2 import ControlledBridge,ready_conversation
 
-THREAD='01a0cca0-409b-70b3-af92-f7e348ad6100'
+THREAD='00000000-0000-4000-8000-000000000101'
 
 @pytest.fixture(scope='session')
 def app():return QApplication.instance() or QApplication([])
@@ -179,6 +179,7 @@ def test_uncertain_receipt_after_persisted_message_never_adds_duplicate_user_bub
 def shared_mode(dialog,bridge,opener):
     dialog.on_open_codex_thread=opener;dialog.load_settings()
     bridge.deliver('settings',{'settings':{'ai':{'enabled':True,'execution_mode':'desktop_shared'}}})
+    bridge.deliver('codex_connection',{'ready':True,'state':'ready'})
     dialog.timer.stop()
 
 

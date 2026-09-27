@@ -29,9 +29,10 @@ def test_fresh_data_creates_guidance_and_connection_without_business_database(tm
     result = workspace.prepare_workspace(data)
     assert result["workspace"] == str(project(data))
     assert result["changed"] is True
-    assert len(result["changed_files"]) == 3
+    assert len(result["changed_files"]) == 4
     assert not (data / "database.sqlite3").exists()
-    assert set(snapshots(data)) == {"AGENTS.md", "开始使用.md", str(Path(".codex") / "config.toml")}
+    assert set(snapshots(data)) == {"AGENTS.md", "开始使用.md", str(Path(".codex") / "config.toml"),
+                                   str(Path(".codex") / "management-instructions.md")}
     config = tomllib.loads(Path(result["config_path"]).read_text("utf-8"))["mcp_servers"]["personal_management"]
     assert Path(config["command"]).is_file()
     assert config["args"] == ["-m", "management", "--mcp", "--data-dir", str(data.resolve())]
@@ -45,6 +46,12 @@ def test_fresh_data_creates_guidance_and_connection_without_business_database(tm
     assert "重新保存 Codex 设置" in instructions
     assert "tools/prepare_codex_workspace.py" not in instructions
     assert "project_registered" not in result
+    assert "instructions_loaded" not in result
+    assert tomllib.loads(Path(result["config_path"]).read_text("utf-8"))["model_instructions_file"] == result["instructions_path"]
+    from management.workspace_instructions import instructions as expected_instructions
+    instruction_file = Path(result["instructions_path"]).read_text("utf-8")
+    assert workspace._managed_document(instruction_file)
+    assert instruction_file.split("\n", 1)[1] == expected_instructions()
 
 
 def test_repeat_is_idempotent_and_does_not_rewrite_files(tmp_path):
@@ -94,7 +101,7 @@ def test_update_after_move_and_upgrade_keeps_custom_sections_exactly(tmp_path, m
     original = 'model = "chosen-model"\r\n# Keep this comment.\r\n[mcp_servers.custom]\r\ncommand = "custom-tool"\r\nargs = ["--read-only"]\r\n'
     path = write_config(data, original)
     first = workspace.prepare_workspace(data)
-    assert path.read_bytes().startswith(original.encode("utf-8"))
+    assert original.encode("utf-8") in path.read_bytes()
     old_config = tomllib.loads(path.read_text("utf-8"))
     moved = tmp_path / "moved data"
     data.rename(moved)
@@ -105,12 +112,13 @@ def test_update_after_move_and_upgrade_keeps_custom_sections_exactly(tmp_path, m
     monkeypatch.setattr(sys, "executable", str(service.with_name("PersonalManagement.exe")))
     result = workspace.prepare_workspace(moved)
     changed_config = Path(result["config_path"])
-    assert changed_config.read_bytes().startswith(original.encode("utf-8"))
+    assert original.encode("utf-8") in changed_config.read_bytes()
     parsed = tomllib.loads(changed_config.read_text("utf-8"))
     assert parsed["model"] == old_config["model"]
     assert parsed["mcp_servers"]["custom"] == old_config["mcp_servers"]["custom"]
     assert parsed["mcp_servers"]["personal_management"]["command"] == str(service)
     assert parsed["mcp_servers"]["personal_management"]["args"][-1] == str(moved)
+    assert parsed["model_instructions_file"] == str(project(moved) / ".codex/management-instructions.md")
     assert result["changed_files"] == [str(changed_config)]
 
 
@@ -133,7 +141,7 @@ def test_migrates_exact_previous_helper_guidance_and_config(tmp_path):
     (project(data) / "开始使用.md").write_text(workspace._LEGACY_README, encoding="utf-8")
     result = workspace.prepare_workspace(data)
     assert result["changed"] is True
-    assert len(result["changed_files"]) == 3
+    assert len(result["changed_files"]) == 4
     current = path.read_text("utf-8")
     assert workspace._LEGACY_CONFIG_MARKER not in current
     assert tomllib.loads(current)["mcp_servers"]["user_tool"] == {"command": "other-tool"}
@@ -263,7 +271,7 @@ def test_does_not_read_business_database_or_runtime_token(tmp_path, monkeypatch)
 
 def test_crlf_conversion_does_not_look_like_user_edit(tmp_path):
     result = workspace.prepare_workspace(tmp_path)
-    for key in ("agents_path", "config_path", "readme_path"):
+    for key in ("agents_path", "instructions_path", "config_path", "readme_path"):
         path = Path(result[key])
         path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
     assert workspace.prepare_workspace(tmp_path)["changed"] is True
@@ -276,3 +284,84 @@ def test_same_name_inline_table_conflict_is_rejected_without_losing_other_settin
         workspace.prepare_workspace(tmp_path)
     assert path.read_bytes() == original
     assert not (project(tmp_path) / "AGENTS.md").exists()
+
+
+@pytest.mark.parametrize('placement', ['before_tables', 'after_tables', 'between_tables'])
+def test_instructions_root_key_precedes_tables_independently_of_mcp_block(tmp_path, placement):
+    managed = workspace._configuration('', workspace.mcp_config(tmp_path))
+    custom = '[custom]\nkeep = "untouched"\nmodel_instructions_file = "nested-user-setting"\n'
+    other = '[features]\nmy_feature = true\n'
+    original = {'before_tables': managed + custom + other,
+                'after_tables': custom + other + managed,
+                'between_tables': custom + managed + other}[placement]
+    path = write_config(tmp_path, original)
+    result = workspace.prepare_workspace(tmp_path)
+    text = path.read_text('utf-8')
+    parsed = tomllib.loads(text)
+    assert text.startswith(workspace._INSTRUCTIONS_PREFIX)
+    assert original in text
+    assert parsed['model_instructions_file'] == result['instructions_path']
+    assert Path(parsed['model_instructions_file']).is_absolute()
+    assert parsed['custom'] == {'keep': 'untouched', 'model_instructions_file': 'nested-user-setting'}
+    assert parsed['features'] == {'my_feature': True}
+    assert 'model_instructions_file' not in parsed['mcp_servers']['personal_management']
+
+
+@pytest.mark.parametrize('same_path', [False, True])
+def test_unowned_project_model_instructions_setting_and_file_are_preserved(tmp_path, same_path):
+    custom_file = project(tmp_path) / '.codex/management-instructions.md' if same_path else tmp_path / 'personal-instructions.md'
+    custom_file.parent.mkdir(parents=True, exist_ok=True)
+    custom_file.write_bytes(b'User-owned instructions.\r\n')
+    original = 'model_instructions_file = ' + json.dumps(str(custom_file), ensure_ascii=False) + '\n[custom]\nkeep=true\n'
+    path = write_config(tmp_path, original)
+    before = snapshots(tmp_path)
+    with pytest.raises(workspace.WorkspaceError, match='model_instructions_file|management-instructions.md'):
+        workspace.prepare_workspace(tmp_path)
+    assert snapshots(tmp_path) == before
+    assert path.read_text('utf-8') == original
+    assert custom_file.read_bytes() == b'User-owned instructions.\r\n'
+
+
+@pytest.mark.parametrize('damage', ['body', 'unmarked', 'empty', 'config_hash', 'config_marker', 'duplicate_marker', 'nonroot_block'])
+def test_instruction_conflicts_preflight_all_files_before_any_write(tmp_path, damage):
+    result = workspace.prepare_workspace(tmp_path)
+    agents = Path(result['agents_path'])
+    agents.write_text(workspace._document('Old intact managed guidance.\n'), encoding='utf-8')
+    instructions = Path(result['instructions_path'])
+    config = Path(result['config_path'])
+    if damage == 'body':
+        instructions.write_text(instructions.read_text('utf-8') + '\nPersonal addition.\n', encoding='utf-8')
+    elif damage == 'unmarked':
+        instructions.write_text('Personal instructions.\n', encoding='utf-8')
+    elif damage == 'empty':
+        instructions.write_bytes(b'')
+    elif damage == 'config_hash':
+        config.write_text(config.read_text('utf-8').replace('management-instructions.md', 'personal-instructions.md'), encoding='utf-8')
+    elif damage == 'config_marker':
+        config.write_text(config.read_text('utf-8').replace(workspace._INSTRUCTIONS_END, '# marker removed'), encoding='utf-8')
+    elif damage == 'duplicate_marker':
+        with config.open('a', encoding='utf-8') as stream:
+            stream.write('\n' + workspace._INSTRUCTIONS_END + '\n')
+    else:
+        config.write_text('[custom]\nkeep=true\n' + config.read_text('utf-8'), encoding='utf-8')
+    before = snapshots(tmp_path)
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.prepare_workspace(tmp_path)
+    assert snapshots(tmp_path) == before
+
+
+def test_intact_previous_managed_model_instructions_upgrade_without_changing_user_sections(tmp_path):
+    from management.workspace_instructions import instructions as expected_instructions
+    result = workspace.prepare_workspace(tmp_path)
+    path = Path(result['instructions_path'])
+    path.write_text(workspace._document('Previous managed model instructions.\n'), encoding='utf-8')
+    config = Path(result['config_path'])
+    custom = '\n[custom]\nkeep = "same"\n'
+    with config.open('a', encoding='utf-8') as stream:
+        stream.write(custom)
+    config_before = config.read_bytes()
+    upgraded = workspace.prepare_workspace(tmp_path)
+    assert upgraded['changed_files'] == [str(path)]
+    assert path.read_text('utf-8').split('\n', 1)[1] == expected_instructions()
+    assert config.read_bytes() == config_before
+    assert workspace.prepare_workspace(tmp_path)['changed_files'] == []

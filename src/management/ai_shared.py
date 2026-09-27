@@ -23,7 +23,7 @@ from .resources import ResourceError, _plain_path
 
 
 MAX_RUNTIME_BYTES = 16 * 1024
-NOT_READY = '尚未连接 Codex 桌面。请在设置中启用“桌面实时连接”，重新启动 Codex 后重试。'
+NOT_READY = '尚未连接 Codex 桌面。请在管理软件中查看连接状态或重新检查连接。'
 
 
 def _positive_time(value):

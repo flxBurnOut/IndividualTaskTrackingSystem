@@ -65,8 +65,17 @@ def start(c, job):
     stamp = now()
     c.execute('''INSERT INTO conversation_progress(
         job_id,conversation_id,epoch,generation,phase,started_at,updated_at)
-        VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id) DO NOTHING''',
+        VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+        conversation_id=excluded.conversation_id,epoch=excluded.epoch,generation=excluded.generation,
+        phase=excluded.phase,provider_thread_id=NULL,provider_turn_id=NULL,
+        provider_project_path=NULL,provider_contract=NULL,recovery=NULL,preview_text='',
+        started_at=excluded.started_at,updated_at=excluded.updated_at,finished_at=NULL
+        WHERE conversation_progress.epoch<>excluded.epoch
+            OR conversation_progress.generation<excluded.generation''',
         (row['id'], conversation_id, row['epoch'], row['generation'], 'connecting', stamp, stamp))
+    # An explicit resume advances the canonical generation. Its first claim gets
+    # fresh progress, while a same-generation reconnect keeps its snapshot. The
+    # _current check above fences stale workers before either insert or reset.
     return True
 
 

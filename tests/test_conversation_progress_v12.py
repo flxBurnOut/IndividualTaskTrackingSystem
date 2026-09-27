@@ -274,6 +274,124 @@ def test_schema_initialization_and_start_are_idempotent(core):
     assert row(core, job) == before
 
 
+def test_cancel_immediate_resume_reclaims_progress_for_the_same_job(core, monkeypatch):
+    job, old_publish = claimed(core)
+    value = json.loads(job['input'])
+    old_publish({'phase': 'receiving', 'provider_thread_id': 'same-thread',
+                 'provider_turn_id': 'old-turn', 'provider_contract': 'desktop_mcp_v3',
+                 'recovery': 'new', 'preview_text': 'Old attempt preview'})
+    core.query('checkpoint_context', operation_id=value['context_operation_id'],
+               summary='Synthetic safe boundary', **{'yield': True})
+    command(core, 'cancel_job', {'id': job['id']})
+    cancelled = row(core, job)
+    assert cancelled['generation'] == job['generation'] and cancelled['finished_at']
+    resumed = command(core, 'resume_context_operation', {'id': job['id']})
+    assert resumed == {'job_id': job['id'], 'resumed': True, 'same_operation': True}
+    stale = row(core, job)
+    with pytest.raises(progress.ProgressRejected):
+        old_publish({'phase': 'reasoning', 'preview_text': 'Late old worker'})
+    with core.store.connect() as c, pytest.raises(progress.ProgressRejected):
+        progress.start(c, job)
+    assert row(core, job) == stale
+
+    stamp = '2030-01-01T00:00:00.000+00:00'
+    monkeypatch.setattr(progress, 'now', lambda: stamp)
+    with core.store.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        current = core._job(c, job['id'])
+        assert current['status'] == 'queued' and current['generation'] == job['generation'] + 2
+        c.execute("UPDATE jobs SET status='running' WHERE id=?", (job['id'],))
+        current = core._job(c, job['id'])
+        conversations.mark_running(c, current)
+        assert progress.start(c, current)
+        c.commit()
+    fresh = row(core, job)
+    assert fresh['generation'] == current['generation'] and fresh['epoch'] == current['epoch']
+    assert fresh['conversation_id'] == value['conversation_id']
+    assert fresh['phase'] == 'connecting' and fresh['finished_at'] is None
+    assert fresh['started_at'] == fresh['updated_at'] == stamp
+    assert fresh['preview_text'] == ''
+    assert all(fresh[key] is None for key in ('provider_thread_id', 'provider_turn_id',
+               'provider_project_path', 'provider_contract', 'recovery'))
+    with core.store.connect() as c, pytest.raises(progress.ProgressRejected):
+        progress.start(c, job)
+    with pytest.raises(progress.ProgressRejected):
+        old_publish({'phase': 'validating', 'preview_text': 'Late previous generation'})
+    assert row(core, job) == fresh
+
+    publish = progress.Publisher(core, current, threading.Event(), threading.Event())
+    assert publish({'phase': 'waiting_model', 'provider_thread_id': 'same-thread',
+                    'provider_turn_id': 'new-turn', 'provider_contract': 'desktop_mcp_v3',
+                    'recovery': 'resumed', 'preview_text': 'New attempt preview'})
+    assert row(core, job)['preview_text'] == 'New attempt preview'
+    with core.store.connect() as c:
+        persisted = core._job(c, job['id'])
+        operation = c.execute('SELECT * FROM conversation_operations WHERE job_id=?', (job['id'],)).fetchone()
+        conversation = c.execute('SELECT * FROM conversations WHERE id=?', (value['conversation_id'],)).fetchone()
+        assert persisted['status'] == 'running'
+        assert json.loads(persisted['input'])['context_operation_id'] == value['context_operation_id']
+        assert operation['epoch'] == current['epoch'] and operation['provider_turn_id'] == 'new-turn'
+        assert operation['provider_thread_id'] == conversation['provider_thread_id'] == 'same-thread'
+        assert conversation['active_job_id'] == job['id']
+        assert c.execute('SELECT count(*) FROM jobs').fetchone()[0] == 1
+
+
+def test_same_generation_recovery_preserves_progress_when_reclaimed(core):
+    from management.context_driver import recover
+    job, publish = claimed(core)
+    publish({'phase': 'receiving', 'provider_thread_id': 'same-thread',
+             'provider_turn_id': 'same-turn', 'preview_text': 'Preserved on service reopen'})
+    with core.store.connect() as c:
+        recover(core, c)
+        assert core._job(c, job['id'])['status'] == 'queued'
+    reopened = Core(core.root)
+    before = row(reopened, job)
+    with reopened.store.connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        c.execute("UPDATE jobs SET status='running' WHERE id=?", (job['id'],))
+        current = reopened._job(c, job['id'])
+        conversations.mark_running(c, current)
+        assert progress.start(c, current)
+        c.commit()
+    assert current['generation'] == job['generation']
+    assert row(reopened, job) == before
+    assert before['provider_thread_id'] == 'same-thread' and before['provider_turn_id'] == 'same-turn'
+    assert before['preview_text'] == 'Preserved on service reopen'
+    publish = progress.Publisher(reopened, current, threading.Event(), threading.Event())
+    assert publish({'phase': 'reasoning'})
+
+
+@pytest.mark.parametrize('reason', ['epoch', 'status', 'active_job'])
+def test_start_rejects_noncurrent_owner_before_resetting_progress(core, reason):
+    job, _ = claimed(core)
+    with core.store.connect() as c:
+        c.execute('UPDATE conversation_progress SET generation=0,finished_at=? WHERE job_id=?', (now(), job['id']))
+        if reason == 'epoch':
+            core.store.set_meta(c, 'epoch', 'different-data-epoch')
+        elif reason == 'status':
+            c.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (job['id'],))
+        else:
+            c.execute('UPDATE conversations SET active_job_id=NULL')
+    before = row(core, job)
+    with core.store.connect() as c, pytest.raises(progress.ProgressRejected):
+        progress.start(c, job)
+    assert row(core, job) == before
+
+
+@pytest.mark.parametrize('newer_generation', [False, True])
+def test_start_does_not_reopen_finished_same_generation_or_downgrade_newer_progress(core, newer_generation):
+    job, publish = claimed(core)
+    with core.store.connect() as c:
+        c.execute('UPDATE conversation_progress SET generation=?,finished_at=? WHERE job_id=?',
+                  (job['generation'] + int(newer_generation), now(), job['id']))
+    before = row(core, job)
+    with core.store.connect() as c:
+        assert progress.start(c, job)
+    assert row(core, job) == before
+    with pytest.raises(progress.ProgressRejected):
+        publish({'phase': 'reasoning'})
+
+
 def test_worker_progress_is_queryable_before_generation_returns(core, monkeypatch):
     from management import ai
     from management.scheduler import Background

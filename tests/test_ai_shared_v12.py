@@ -117,7 +117,7 @@ def test_missing_runtime_is_clear_without_starting_an_engine(tmp_path):
     with pytest.raises(ai.AIError) as error:
         shared.read_runtime(None)
     assert error.value.code == 'AI_SHARED_NOT_READY'
-    assert '桌面实时连接' in error.value.message
+    assert '管理软件' in error.value.message and '重新检查连接' in error.value.message
 
 
 class Socket:

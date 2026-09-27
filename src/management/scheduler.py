@@ -21,12 +21,15 @@ class Background:
             c.execute("BEGIN IMMEDIATE")
             from .session_coordinator import recover_candidates
             recover_candidates(self.core,c)
+            from .native_desktop import recover as recover_desktop
+            recover_desktop(self.core,c)
             from .context_driver import recover as recover_context
             recover_context(self.core,c)
             from .context_driver import upgrade_queued
             upgrade_queued(self.core,c)
             c.execute("UPDATE io_operations SET status='needs_reconciliation' WHERE status='preparing'")
-            c.execute("UPDATE jobs SET status='failed',generation=generation+1,error=?,updated_at=? WHERE status='running'", (encode({'code': 'interrupted', 'message': '服务在执行中断开。未自动重试，请核对已保存的产物后重新发起。'}), now()))
+            c.execute("""UPDATE jobs SET status='failed',generation=generation+1,error=?,updated_at=? WHERE status='running'
+                AND coalesce(json_extract(input,'$.desktop_transport'),'')!='native_ipc_v1'""", (encode({'code': 'interrupted', 'message': '服务在执行中断开。未自动重试，请核对已保存的产物后重新发起。'}), now()))
             conversations.reconcile(self.core, c)
             c.commit()
         for function in (self.worker, self.scheduler):
@@ -57,6 +60,7 @@ class Background:
                 idle_batch(self.core)
                 self.stop.wait(.3)
                 continue
+            native_execution = False
             try:
                 if cancel.is_set() or self.stop.is_set():
                     continue
@@ -70,10 +74,11 @@ class Background:
                     settings['_codex_bridge_dir'] = str(self.core.root/'codex-desktop-bridge')
                     progress = conversation_progress.Publisher(self.core, job, cancel, self.stop)
                     if settings.get('ai', {}).get('execution_mode') == 'desktop_shared':
-                        from .codex_desktop import ensure_connection
-                        progress({'phase': 'connecting'})
-                        ensure_connection(self.core.root, cancel, self.stop)
-                    result = generate(value, settings, cancel, progress)
+                        native_execution = True
+                        from .native_desktop import generate as generate_desktop
+                        result = generate_desktop(self.core, job, value, settings, cancel, self.stop, progress)
+                    else:
+                        result = generate(value, settings, cancel, progress)
                     if result.get('context_continuation'):
                         with self.core.store.lock,self.core.store.connect() as c:
                             c.execute('BEGIN IMMEDIATE')
@@ -122,6 +127,11 @@ class Background:
                     conversation_progress.finish(c, job['id'])
                     c.commit()
             except Exception as error:
+                from .native_desktop import ServiceDetached
+                if isinstance(error, ServiceDetached) or (native_execution and self.stop.is_set()):
+                    # The desktop owns its turn. Retain the same running job for
+                    # startup reconciliation; closing a service is not cancellation.
+                    continue
                 with self.core.store.lock, self.core.store.connect() as c:
                     c.execute('BEGIN IMMEDIATE')
                     failure = {'code': getattr(error, 'code', 'executor_error'), 'message': getattr(error, 'message', str(error))[:1000]}

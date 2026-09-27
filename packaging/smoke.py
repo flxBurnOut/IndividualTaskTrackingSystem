@@ -12,7 +12,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-0.14.1') / 'PersonalManagementService.exe'
+EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-1.0.0') / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
 
 async def main():
@@ -32,7 +32,7 @@ async def main():
         assert shim.is_file(), 'Missing desktop connection adapter'
         connection = client.query('codex_connection')
         assert connection['ready'] is False and 'token' not in connection
-        report['desktop_connection_adapter'] = {'packaged': True, 'not_ready_without_desktop': True, 'no_secrets_in_status': True}
+        report['desktop_connection_adapter'] = {'legacy_adapter_packaged': True, 'disabled_until_enabled': True, 'no_secrets_in_status': True, 'default_transport': 'native_ipc_v1'}
         report['fresh_empty'] = client.state()['counts'] == {}
         report['diagnostic'] = json.loads(result.stdout)
         runtime = json.loads((data/'runtime.json').read_text('utf-8'))

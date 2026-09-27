@@ -4,6 +4,8 @@
 
 ## 每次新对话和每轮业务处理
 
+先按 `begin_context` 返回的真实归属区分处理方式。若返回 `managed=true` 或指向 `begin_discussion`，这就是软件绑定的事项：每轮先用当前用户原话调用 `begin_discussion`，按返回的 job_id、generation 和统一上下文工具读取事实，再调用 `submit_candidate` 保存候选，等待用户在软件核对。同一会话在 Codex 直接继续，也沿用这一规则。不要调用普通写入工具、execute_command 或脚本绕过候选确认；服务会按 Codex 实际调用会话身份校验，模型不能自行改写归属。若返回旧关联失效，保留原讨论并报告，不另建同名任务或改用普通写入。未绑定的普通对话才采用下面的直接业务流程。
+
 1. 优先调用 `personal_management` 的 `begin_context` 读取最新状态、epoch、revision、能力及未完成作业。按需查询 `dashboard`、`today`、课程/项目、具体任务和现有来源。读取分页时遵循next_offset，不把第一页当全部。
 2. 对话历史只是辅助；当前数据库记录与用户最新明确更正优先。界面和其他对话可能刚改过数据，写入前使用当前对象版本。先核同一事项是否存在，尽量更新或关联，避免重复任务。
 3. 全部业务写入使用MCP业务工具或execute_command，提供request_id、epoch、expected_revision；对象更新带版本。不得直接打开/写SQLite、改旧工作簿或编造临时写库脚本。成功回执后重新读取相关视图再报告结果；断线先查同一request_id回执，不盲重发。

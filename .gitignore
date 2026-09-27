@@ -15,6 +15,7 @@
 !/docs/开发与扩展.md
 !/docs/Codex接口与后台推理.md
 !/docs/固定会话与原文件目录.md
+!/docs/发布说明_1.0.0.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -24,6 +25,10 @@
 !/packaging/render_icon.py
 !/packaging/version_info.py
 !/packaging/smoke.py
+!/packaging/codex_entry.py
+!/packaging/installer.iss
+!/packaging/build_installer.py
+!/packaging/license_notices.py
 
 # Private data, credentials, local settings and generated files anywhere.
 .venv/

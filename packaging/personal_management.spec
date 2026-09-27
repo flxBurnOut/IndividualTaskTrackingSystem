@@ -13,6 +13,11 @@ a = Analysis([str(root / 'packaging' / 'entry.py')], pathex=[str(root / 'src')],
 # to that incorrect third-party ICU. Let Windows resolve its own system ICU.
 _icu_conflicts = {'icuuc.dll', 'icudt78.dll'}
 a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in _icu_conflicts]
+# This QtWidgets app uses the native Windows input method. PyInstaller's
+# generic QtGui hook also collects the optional GPL-only virtual keyboard.
+# Do not redistribute that unused plugin or its library in this application.
+_unused_virtual_keyboard = {'qtvirtualkeyboardplugin.dll', 'qt6virtualkeyboard.dll'}
+a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in _unused_virtual_keyboard]
 shim_analysis = Analysis([str(root / 'packaging' / 'codex_entry.py')], pathex=[str(root / 'src')], binaries=[], datas=[], hiddenimports=['management.codex_desktop_shim','websockets.sync.client','websockets.sync.server','psutil','win32job','win32security','win32api','win32con'], hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=['pytest','tkinter'], noarchive=False)
 p = PYZ(a.pure)
 shim_pyz = PYZ(shim_analysis.pure)
