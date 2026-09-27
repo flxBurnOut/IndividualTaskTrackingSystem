@@ -1,6 +1,8 @@
 """Read-only dated task candidates and an explicit, versioned plan append."""
 from __future__ import annotations
 import copy
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from .core import date_value
 from .reviews import _latest_plan
 from .schemas import BusinessError
@@ -65,7 +67,9 @@ def add_to_plan(core, c, p, rid):
                'source_text': current['data'].get('source_text', '') if current else '用户明确将任务加入这一天的计划。'}
     if current:
         payload.update(title=current['title'], supersedes_id=current['id'])
-    entity = core.create_plan(c, payload, rid, _retained=old_blocks)
+    protected = _protected_blocks(core, c, day, old_blocks)
+    historical = [protected.get(block['target_id']) for block in old_blocks]
+    entity = core.create_plan(c, payload, rid, _retained=old_blocks, _historical_retained=historical)
     return {'entity': entity, 'reused': False}
 
 
@@ -81,10 +85,21 @@ def completed_on_or_before(core, c, target, day):
         ORDER BY json_extract(data,'$.business_date') DESC,created_at DESC,rowid DESC LIMIT 1""",(target['id'],day)).fetchone()
     return bool(row and row[0]=='done')
 
+def _protected_blocks(core, c, day, blocks):
+    """Share the same historical boundary for revisions and plan appends."""
+    local = datetime.now(ZoneInfo(core.store.meta(c, 'settings')['timezone']))
+    protected = {}
+    for block in blocks:
+        target = block['target_id']
+        reported = c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.business_date')=? LIMIT 1", (target, day)).fetchone()
+        past = day < local.date().isoformat() or day == local.date().isoformat() and block.get('end', '99:99') <= local.strftime('%H:%M')
+        if reported or past:
+            protected[target] = block
+    return protected
+
+
 def revise_plan(core,c,p,rid):
     """Explicit manual editing of the latest plan, preserving reported history."""
-    import datetime as dt
-    from zoneinfo import ZoneInfo
     day=date_value(p.get('date')).isoformat()
     current=_latest_plan(core,c,day)
     if not current or (p.get('plan_id'),p.get('plan_version'))!=(current['id'],current['version']):
@@ -93,12 +108,7 @@ def revise_plan(core,c,p,rid):
     if not isinstance(blocks,list) or len(blocks)>100:
         raise BusinessError('validation','单日计划需要不超过 100 个事项。')
     old_by_id={b['target_id']:b for b in current['data'].get('blocks',[])}
-    local=dt.datetime.now(ZoneInfo(core.store.meta(c,'settings')['timezone']))
-    protected={}
-    for target,block in old_by_id.items():
-        reported=c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_extract(data,'$.target_id')=? AND json_extract(data,'$.business_date')=? LIMIT 1",(target,day)).fetchone()
-        past=day<local.date().isoformat() or day==local.date().isoformat() and block.get('end','99:99')<=local.strftime('%H:%M')
-        if reported or past:protected[target]=block
+    protected = _protected_blocks(core, c, day, old_by_id.values())
     # GUI-only names never become part of a saved block. Target versions and
     # completion gates from the source block are retained when unchanged.
     for block in blocks:

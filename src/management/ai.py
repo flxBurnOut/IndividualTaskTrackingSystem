@@ -775,7 +775,7 @@ def generate(input: dict, settings: dict, cancel: threading.Event, progress=None
             schema=copy.deepcopy(PROPOSAL_SCHEMA)
             schema['properties']['unknowns']['maxItems']=1
             schema['properties']['actions']['maxItems']=1
-            schema['properties']['actions']['items']['properties']['command']['enum']=['create_plan']
+            schema['properties']['actions']['items']['properties']['command']['enum']=sorted(set(allowed)&{'create_plan','revise_plan'})
             if input.get('context',{}).get('planning',{}).get('tasks'):
                 schema['properties']['actions']['minItems']=1
         report('sending')

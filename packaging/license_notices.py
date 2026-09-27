@@ -155,10 +155,14 @@ def _qt_notices(folder, binaries, versions):
         def fetch(record):
             url = f'https://raw.githubusercontent.com/qt/{repo}/{revision}/' + record['path']
             content = _fetch(url, git_blob=record['sha'])
-            relative = _put(folder, 'Qt-' + QT_VERSION + '/' + repo + '/' + record['path'], content)
-            return {'file': relative, 'source': url, 'sha256': hashlib.sha256(content).hexdigest()}
+            return 'Qt-' + QT_VERSION + '/' + repo + '/' + record['path'], url, content
         with ThreadPoolExecutor(max_workers=6) as pool:
-            records.extend(pool.map(fetch, selected))
+            # Concurrent directory creation can make Windows resolve a missing
+            # path with a transient \\?\ prefix. Keep downloads parallel, but
+            # serialize package writes and their unchanged containment check.
+            for relative, url, content in pool.map(fetch, selected):
+                dest = _put(folder, relative, content)
+                records.append({'file': dest, 'source': url, 'sha256': hashlib.sha256(content).hexdigest()})
     if 'qt6pdf.dll' in names:
         # QtPdf builds PDFium from qtwebengine's pinned Chromium submodule.
         # A parent-tree recursive listing does not descend into this gitlink.

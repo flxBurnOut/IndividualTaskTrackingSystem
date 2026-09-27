@@ -16,6 +16,7 @@
 !/docs/Codex接口与后台推理.md
 !/docs/固定会话与原文件目录.md
 !/docs/发布说明_1.0.0.md
+!/docs/发布说明_1.0.1.md
 
 # Required build inputs and reusable package verification.
 /packaging/*

@@ -287,7 +287,12 @@ def send(core, c, p, rid, prepared=None):
         value['skill_id'] = selected_skill
     if scope['kind'] == 'timetable':
         value['allowed_commands'] = ['apply_timetable']
-    if planning_day:value['allowed_commands']=['create_plan']
+    if planning_day:
+        from .reviews import _latest_plan
+        current_plan = _latest_plan(core, c, planning_day)
+        value['plan_baseline'] = {'plan_id': current_plan['id'] if current_plan else None,
+                                  'plan_version': current_plan['version'] if current_plan else None}
+        value['allowed_commands'] = ['revise_plan' if current_plan else 'create_plan']
     value['source_versions'] = source_versions
     value['local_images'] = prepared.get('local_images', [])
     value['source_ids'] = sources

@@ -12,8 +12,160 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-1.0.0') / 'PersonalManagementService.exe'
+EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-1.0.1') / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
+
+
+async def verify_frozen_mcp_plan_revision(client, params):
+    """Exercise packaged MCP dispatch against this smoke run's isolated service.
+
+    All five business writes cross the frozen stdio entry and generic command
+    tool. The source Client only inspects the same synthetic service. No model
+    request, Codex session or production data root is involved.
+    """
+    day, page_limit = '2038-05-01', 16 * 1024
+    encoded_size = lambda value: len(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                               separators=(',', ':')).encode('utf-8'))
+    raw = client.query('capabilities')
+    raw_bytes = encoded_size(raw)
+    assert raw_bytes > page_limit and 'revise_plan' in raw['commands'], 'Fixture must exercise the oversized registry'
+    assert not client.query('settings')['settings']['ai']['enabled'], 'Smoke must not enable models'
+    jobs_before = client.query('jobs')['total']
+    plans_before = client.query('list', type='plan')['total']
+    evidence = {'transport': 'frozen_stdio_mcp', 'date': day, 'raw_capabilities_bytes': raw_bytes}
+
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            async def call(tool, args, error_code=None):
+                response = await session.call_tool(tool, args)
+                error_text = '\n'.join(block.text for block in response.content if hasattr(block, 'text'))
+                if error_code is not None:
+                    assert response.is_error, f'{tool} unexpectedly succeeded; expected {error_code}'
+                    # The stdio server adds a human-readable tool-error prefix.
+                    # Inspect its structured JSON detail without assuming that
+                    # the transport text starts at the opening JSON brace.
+                    start = error_text.find('{')
+                    assert start >= 0, error_text
+                    detail, _ = json.JSONDecoder().raw_decode(error_text[start:])
+                    assert detail['code'] == error_code, error_text
+                    return None
+                assert not response.is_error, f'{tool}: {error_text}'
+                assert isinstance(response.structured_content, dict), f'{tool} returned no structured result'
+                return response.structured_content
+
+            async def arguments(name, payload):
+                state = await call('query_business', {'name': 'state'})
+                return {'name': name, 'payload': payload, 'request_id': str(uuid.uuid4()),
+                        'epoch': state['epoch'], 'expected_revision': state['revision']}
+
+            async def execute(name, payload):
+                return await call('execute_command', await arguments(name, payload))
+
+            names, cursor, version, page_bytes = [], 0, None, []
+            for _ in range(100):
+                query = {'offset': cursor, 'limit': 20}
+                if version is not None:
+                    query['version'] = version
+                page = await call('query_business', {'name': 'capabilities', 'params': query})
+                page_bytes.append(encoded_size(page))
+                assert page_bytes[-1] <= page_limit and 'context' not in page
+                names.extend(page['commands'])
+                cursor, version = page['next_offset'], page['version']
+                if cursor is None:
+                    break
+            else:
+                raise AssertionError('Capability index did not finish within the smoke page bound')
+            assert names == sorted(raw['commands']) and 'revise_plan' in names
+            evidence['public_capabilities_max_bytes'] = max(page_bytes)
+            evidence['public_capabilities_complete'] = True
+
+            predecessor = (await execute('create', {'type': 'task', 'title': 'Synthetic frozen prerequisite'}))['result']['entity']
+            dependent = (await execute('create', {'type': 'task', 'title': 'Synthetic frozen dependent'}))['result']['entity']
+            await execute('link', {'source_id': dependent['id'], 'target_id': predecessor['id'], 'kind': 'depends_on'})
+            old = (await execute('create_plan', {'date': day, 'mode': 'no_precise_time',
+                'title': 'Synthetic frozen original plan', 'blocks': [
+                    {'target_id': predecessor['id'], 'minutes': 20},
+                    {'target_id': dependent['id'], 'minutes': 20}]}))['result']['entity']
+            original_blocks = old['data']['blocks']
+            payload = {'date': day, 'plan_id': old['id'], 'plan_version': old['version'],
+                       'mode': 'no_precise_time', 'blocks': original_blocks}
+
+            for invalid_blocks in (list(reversed(original_blocks)), original_blocks[1:]):
+                before_state = client.state()
+                before_review = client.query('daily_review', date=day)
+                args = await arguments('revise_plan', {**payload, 'blocks': invalid_blocks})
+                await call('execute_command', args, error_code='dependency')
+                assert client.state() == before_state
+                assert client.query('daily_review', date=day) == before_review
+                assert client.query('get', id=old['id'])['entity'] == old
+                assert not (await call('recover_receipt', {'request_id': args['request_id']}))['found']
+            evidence.update(dependency_reorder_rejected=True, prerequisite_removal_rejected=True,
+                            rejected_revision_keeps_original=True)
+
+            revised_title = 'Synthetic frozen revised dependency plan'
+            valid_args = await arguments('revise_plan', {**payload, 'title': revised_title,
+                'blocks': [{**original_blocks[0], 'minutes': 30}, original_blocks[1]]})
+            receipt = await call('execute_command', valid_args)
+            revised = receipt['result']['entity']
+            assert revised['id'] != old['id'] and revised['title'] == revised_title
+            assert revised['data']['supersedes_id'] == old['id']
+            assert [block['target_id'] for block in revised['data']['blocks']] == [predecessor['id'], dependent['id']]
+            assert revised['data']['blocks'][0]['minutes'] == 30
+            assert client.query('daily_tasks', date=day)['plan']['id'] == revised['id']
+            assert client.query('get', id=old['id'])['entity'] == old
+            state_after = client.state()
+            replay = await call('execute_command', valid_args)
+            assert replay['replayed'] and replay['result'] == receipt['result']
+            assert client.state() == state_after
+            stale_args = await arguments('revise_plan', payload)
+            await call('execute_command', stale_args, error_code='plan_conflict')
+            assert client.state() == state_after
+            assert not (await call('recover_receipt', {'request_id': stale_args['request_id']}))['found']
+            assert client.query('list', type='plan')['total'] == plans_before + 2
+            evidence.update(valid_revision_supersedes_original=True, old_plan_version_rejected=True,
+                            identical_request_replayed_without_duplicate=True)
+
+            context = await call('prepare_context', {'goal': 'Read synthetic frozen dependency direction',
+                'scope': {'kind': 'daily_plan', 'date': day}})
+            operation_id = context['operation_id']
+
+            async def details(identifier):
+                offset, item_version, fragments, reader = 0, None, [], None
+                for _ in range(20):
+                    args = {'operation_id': operation_id, 'id': identifier, 'offset': offset}
+                    if item_version is not None:
+                        args['version'] = item_version
+                    page = await call('read_context_item', args)
+                    assert encoded_size(page) <= page_limit
+                    reader = page.get('dependencies', reader)
+                    if 'item' in page:
+                        assert page['complete'] and page['next_offset'] is None
+                        return page['item'], reader
+                    fragments.append(page['json_fragment'])
+                    offset, item_version = page['next_offset'], page['version']
+                    if offset is None:
+                        assert page['complete']
+                        return json.loads(''.join(fragments)), reader
+                raise AssertionError('Dependency reader did not finish within the smoke page bound')
+
+            body, reader = await details(dependent['id'])
+            assert body['id'] == dependent['id'] and reader['reader'] == 'read_context_item'
+            graph, _ = await details(reader['id'])
+            assert graph['entity_id'] == dependent['id'] and graph['as_of_date'] == day
+            assert [item['id'] for item in graph['predecessors']] == [predecessor['id']]
+            assert not graph['predecessors'][0]['completed'] and not graph['dependents']
+            _, reverse_reader = await details(predecessor['id'])
+            reverse, _ = await details(reverse_reader['id'])
+            assert not reverse['predecessors']
+            assert [item['id'] for item in reverse['dependents']] == [dependent['id']]
+            assert client.state() == state_after
+            assert client.query('jobs')['total'] == jobs_before
+            evidence.update(dependency_reader_both_directions=True, planning_is_not_completion=True,
+                            business_revision_unchanged_by_reads=True, model_jobs_added=0, passed=True)
+    return evidence
+
 
 async def main():
     root = ROOT / '.test-output' / ('packaged-' + uuid.uuid4().hex[:10])
@@ -179,6 +331,7 @@ async def main():
             time.sleep(.1)
         assert job['status']=='completed', job
         report['frozen_document_worker'] = job['result']['metadata']['validation']
+        report['mcp_generic_plan_revision'] = await verify_frozen_mcp_plan_revision(client, params)
         report['service_survives_both_entrances'] = service.is_running()
         report['passed'] = True
     except Exception as error:

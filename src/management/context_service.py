@@ -218,7 +218,7 @@ def envelope(core,c,op):
         'readers':sorted(QUERY_NAMES-{'prepare_context'}),'page_bytes':PAGE_BYTES,
         'coverage':'Indexes only; no record body or material has been read by the model.',
         'stage':op['stage'],'checkpoint':op['checkpoint'],
-        'instructions':'先查询与目标相关的记录，按 next_cursor 继续；详情用 read_context_item。计划必须核对完整 deadlines、rules、events 和当前计划。资料用 next_context_step 自动逐批读取并 checkpoint_context；检查点不修改业务。'}
+        'instructions':'先查询与目标相关的记录，按 next_cursor 继续；详情用 read_context_item。计划必须核对完整 deadlines、rules、events 和当前计划；入选事项的 dependencies 入口提供前置、后置及实际完成状态，须完整读取。资料用 next_context_step 自动逐批读取并 checkpoint_context；检查点不修改业务。'}
     if size(result)>ENVELOPE_BYTES: raise BusinessError('context_envelope','上下文索引扩展过大，请检查已注册集合。')
     return result
 
@@ -228,6 +228,8 @@ def _summary(row):
     e['data']={k:data[k] for k in ('code','due_date','date','scheduled_date','priority','owner_id','task_kind',
         'earliest_start','start','end','recurrence','time_kind','until','enabled','rule_kind') if data.get(k) is not None}
     e['details']={'reader':'read_context_item','id':e['id'],'version':e['version']}
+    from .context_dependencies import PLAN_TYPES, reference
+    if e['type'] in PLAN_TYPES:e['dependencies']=reference(e['id'])
     return e
 
 
@@ -356,7 +358,11 @@ def _special(core,c,op,identifier):
 
 
 def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
-    if identifier.startswith('receipt:'):
+    from .context_dependencies import PREFIX, PLAN_TYPES, reference, snapshot
+    dependency_reader=None
+    if identifier.startswith(PREFIX):
+        value=snapshot(core,c,identifier[len(PREFIX):],op['scope']['date']);current=digest(value)
+    elif identifier.startswith('receipt:'):
         value=core._query(c,'receipt',{'request_id':identifier[8:]});current=digest(value)
     elif identifier.startswith('@'):
         value=_special(core,c,op,identifier);current=digest(value)
@@ -374,6 +380,7 @@ def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
         current=digest(value)
     else:
         value=core.store.get(c,identifier);current=value['version']
+        if value['type'] in PLAN_TYPES:dependency_reader=reference(identifier)
     if version is not None and version!=current: raise BusinessError('context_changed','该记录在分段读取期间已改变，请重新读取这条记录。')
     budget=_budget(op,byte_limit)
     if not offset and size({'item':value,'version':current})<budget-512:
@@ -383,6 +390,7 @@ def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
         fragment,next_offset=_fragment(text,offset,budget-1024)
         result={'id':identifier,'json_fragment':fragment,'format':'text' if isinstance(value,str) else 'json',
                 'offset':offset,'next_offset':next_offset,'version':current,'complete':next_offset is None}
+    if dependency_reader:result['dependencies']=dependency_reader
     old=c.execute('SELECT * FROM context_parts WHERE operation_id=? AND item_id=?',(op['id'],identifier)).fetchone()
     text=value if isinstance(value,str) else encode(value)
     until=result.get('next_offset') or len(text)
@@ -390,7 +398,7 @@ def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
         read_until=max(until,old['read_until'] if old and old['version']==str(current) else 0)
         c.execute('INSERT INTO context_parts VALUES (?,?,?,?,?) ON CONFLICT(operation_id,item_id) DO UPDATE SET version=excluded.version,read_until=excluded.read_until,complete=excluded.complete',
             (op['id'],identifier,str(current),read_until,int(read_until==len(text))))
-    if not identifier.startswith(('@','message:','job:','receipt:')):
+    if not identifier.startswith(('@','message:','job:','receipt:',PREFIX)):
         c.execute('INSERT INTO context_reads VALUES (?,?,?,?) ON CONFLICT(operation_id,entity_id) DO UPDATE SET detail=CASE WHEN version=excluded.version THEN max(detail,excluded.detail) ELSE excluded.detail END,version=excluded.version',(op['id'],identifier,current,2 if result['complete'] else 1))
     return _charge(c,op,result)
 
@@ -472,6 +480,9 @@ def validate(core,c,op,candidate,*,require_coverage=True):
             ' AND NOT EXISTS(SELECT 1 FROM context_reads r WHERE r.operation_id=? AND r.entity_id=e.id AND r.version=e.version AND r.detail=2) LIMIT 20',[*args,op['id']])]
         if unread_rules:raise BusinessError('context_coverage','有生效规则的完整正文尚未核对，请读取这些记录。',{'ids':unread_rules})
     if missing: raise BusinessError('context_coverage','完整约束尚未核对或集合已有新增/删除，请继续读取这些集合。',{'required':missing})
+    if is_plan and require_coverage:
+        from .context_dependencies import validate_plan_reads
+        validate_plan_reads(core,c,op,iter_actions(c,op['id']))
     # All supplied original materials must reach a terminal extraction state.
     from .materials import incomplete_sources
     analyze_all=op['scope'].get('analyze_materials',True)

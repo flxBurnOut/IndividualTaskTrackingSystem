@@ -3,6 +3,7 @@ from __future__ import annotations
 from . import __version__
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Literal, get_args
@@ -82,6 +83,101 @@ class CheckinAnswer(BaseModel):
     dimensions: FeedbackDimensions
 
 
+def _capability_error(code: str, message: str) -> ToolError:
+    return ToolError(json.dumps({"code": code, "message": message}, ensure_ascii=False))
+
+
+def _validated_capabilities(value: Any) -> dict[str, Any]:
+    """Validate the service registry, never a presentation page of that registry."""
+    if not isinstance(value, dict) or value.get("next_offset") is not None:
+        raise _capability_error("capabilities_invalid", "业务能力目录不完整，无法判断操作是否已注册。")
+    commands, extensions = value.get("commands"), value.get("code_extensions")
+    if (not isinstance(commands, list)
+            or any(not isinstance(name, str) or not name.strip() for name in commands)
+            or len(commands) != len(set(commands))
+            or not isinstance(extensions, list)
+            or any(not isinstance(entry, dict) or entry.get("kind") not in ("command", "query")
+                   or not isinstance(entry.get("name"), str) or not entry["name"].strip()
+                   for entry in extensions)):
+        raise _capability_error("capabilities_invalid", "业务能力目录缺少有效的命令或扩展索引，请重新连接后读取。")
+    return value
+
+
+def _capabilities_page(value: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """Bound public discovery independently from internal registration checks.
+
+    The default page lists command/query names. A detail section without name
+    lists identifiers; with name it returns a bounded JSON fragment. The catalog
+    digest prevents joining pages across registry/module changes.
+    """
+    from .context_service import MAX_PAGE_BYTES, _fragment, size
+    from .storage import encode
+
+    value = _validated_capabilities(value)
+    sections = {"types": "id", "code_extensions": "name", "workflows": "id", "modules": "id"}
+    section, name = params.get("section", "index"), params.get("name")
+    offset, limit = params.get("offset", 0), params.get("limit", 80)
+    if (set(params) - {"section", "name", "offset", "limit", "version"}
+            or not isinstance(section, str) or section not in {"index", *sections}
+            or type(offset) is not int or offset < 0
+            or type(limit) is not int or not 1 <= limit <= 100
+            or name is not None and (not isinstance(name, str) or not name or section == "index")):
+        raise _capability_error("capabilities_parameters", "能力目录参数无效；使用 section、name、offset、limit 和 version。")
+    version = hashlib.sha256(encode(value).encode("utf-8")).hexdigest()
+    if params.get("version") is not None and params["version"] != version:
+        raise _capability_error("capabilities_changed", "能力目录已经变化，请从首页重新读取，不能拼接不同版本。")
+    header = {key: value[key] for key in ("epoch", "revision", "api_version") if key in value}
+    header.update(section=section, version=version, offset=offset)
+    if section == "index":
+        lists = {"commands": sorted(value["commands"]),
+                 "queries": sorted(set(get_args(QueryName)) | {
+                     entry["name"] for entry in value["code_extensions"] if entry["kind"] == "query"})}
+        header.update(
+            detail_sections=list(sections),
+            instructions="命令和查询名称按 next_offset 分页，并传回 version。用 query_business(name='capabilities', "
+                         "params={section:'types'}) 等读取详情名称索引，再加 name 读取单项 JSON；"
+                         "详情需按 next_offset 拼接 json_fragment。扩展 name 为 kind:name，工作流为 module_id:id。"
+                         "具体业务操作先 prepare_context，再 describe_action。")
+    else:
+        entries = value.get(section)
+        if (not isinstance(entries, list) or any(not isinstance(entry, dict)
+                or not isinstance(entry.get(sections[section]), str) or not entry[sections[section]]
+                or section == "workflows" and not isinstance(entry.get("module_id"), str)
+                for entry in entries)):
+            raise _capability_error("capabilities_invalid", "业务能力详情目录不完整。")
+        def identifier(entry):
+            if section == "code_extensions":
+                return entry["kind"] + ":" + entry["name"]
+            if section == "workflows":
+                return entry["module_id"] + ":" + entry["id"]
+            return entry[sections[section]]
+        indexed = {identifier(entry): entry for entry in entries}
+        if len(indexed) != len(entries):
+            raise _capability_error("capabilities_invalid", "业务能力详情名称重复，无法确定条目。")
+        if name is not None:
+            if name not in indexed:
+                raise _capability_error("capability_not_found", "能力目录中没有该详情名称。")
+            header["name"] = name
+            if size(header) > MAX_PAGE_BYTES // 2:
+                raise _capability_error("capabilities_budget", "能力条目标识超过单页预算。")
+            fragment, following = _fragment(encode(indexed[name]), offset, MAX_PAGE_BYTES - size(header) - 256)
+            return {**header, "json_fragment": fragment, "next_offset": following}
+        lists = {"names": sorted(indexed)}
+    total = max(map(len, lists.values()), default=0)
+    if offset > total:
+        raise _capability_error("capabilities_parameters", "能力目录读取位置无效，请使用上一页返回的位置。")
+    end = min(offset + limit, total)
+    while True:
+        result = {**header, **{key: names[offset:end] for key, names in lists.items()},
+                  "totals": {key: len(names) for key, names in lists.items()},
+                  "next_offset": end if end < total else None}
+        if size(result) <= MAX_PAGE_BYTES:
+            return result
+        if end <= offset + 1:
+            raise _capability_error("capabilities_budget", "能力条目标识超过单页预算。")
+        end -= 1
+
+
 def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     if client is None:
         from .client import Client
@@ -89,10 +185,22 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     server = RoutedMCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
     routing = DiscussionRouting(server, client)
 
-    def query(name: str, **params: Any) -> dict[str, Any]:
+    def raw_capabilities() -> dict[str, Any]:
+        # No presentation paging or persistent context creation on this path.
+        try:
+            return _validated_capabilities(client.query("capabilities"))
+        except Exception as exc:
+            if hasattr(exc, "code"):
+                raise ToolError(json.dumps({"code": exc.code, "message": str(exc),
+                                           "details": getattr(exc, "details", {})}, ensure_ascii=False)) from exc
+            raise
+
+    def query(name: str, /, **params: Any) -> dict[str, Any]:
         try:
             if routing.is_managed():
                 return routing.request('context' if is_context_query(name) else 'query', name=name, params=params)
+            if name == "capabilities":
+                return _capabilities_page(raw_capabilities(), params)
             value=client.query(name, **params)
             from .context_service import size,MAX_PAGE_BYTES,QUERY_NAMES
             if name not in QUERY_NAMES and name not in {'material_image','state','settings'} and size(value)>MAX_PAGE_BYTES:
@@ -144,13 +252,20 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     def query_business(name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Read a supported business view. Discover types/fields with capabilities.
 
-        list is paged: follow next_offset; never claim the first page is complete.
+        capabilities returns a bounded command/query index. Follow next_offset
+        with version; use params.section (types/code_extensions/workflows/modules)
+        for detail names, then params.name for a paged JSON detail. Extension
+        names use kind:name; workflow names use module_id:id. For action payloads
+        use prepare_context then describe_action. list is also paged: follow
+        next_offset; never claim the first page is complete.
         receipt(request_id) reconciles an interrupted write without repeating it.
         settings excludes secrets. This does not execute SQL or arbitrary code.
         """
         if name not in get_args(QueryName):
-            capabilities = query("capabilities")
-            registered = {entry["name"] for entry in capabilities.get("code_extensions", [])
+            if routing.is_managed():
+                return query(name, **(params or {}))
+            capabilities = raw_capabilities()
+            registered = {entry["name"] for entry in capabilities["code_extensions"]
                           if entry.get("kind") == "query"}
             if name not in registered:
                 raise ToolError(json.dumps({"code": "unknown_query", "message": "Query is not registered."}))
@@ -279,8 +394,8 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         Unavailable commands return a typed error, not a fabricated success.
         """
         routing.guard_write()
-        capabilities = query("capabilities")
-        if name not in capabilities.get("commands", []):
+        capabilities = raw_capabilities()
+        if name not in capabilities["commands"]:
             raise ToolError(json.dumps({"code": "unknown_command", "message": "Command is not registered."}))
         return command(name, payload, request_id, epoch, expected_revision)
 

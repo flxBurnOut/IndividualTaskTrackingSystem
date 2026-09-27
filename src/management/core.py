@@ -785,7 +785,7 @@ class Core:
             return {'job': self.create_job(c, 'create_artifact_job', value, rid)}
         if name in {"create_job", "create_artifact_job"}:
             if name == 'create_job' and p.get('kind') == 'ai':
-                internal={'source_owner_scope','analyze_materials','context_operation_id','context','scope_title','ai_config','previous_operation','execution_owner','conversation_id','conversation_scope','provider_thread_id','provider_project_path','provider_contract','history','local_images','source_versions','source_ids'}
+                internal={'source_owner_scope','analyze_materials','context_operation_id','context','scope_title','ai_config','previous_operation','execution_owner','conversation_id','conversation_scope','provider_thread_id','provider_project_path','provider_contract','history','local_images','source_versions','source_ids','plan_baseline'}
                 if internal & set(p.get('input') or {}):
                     raise BusinessError('proposal_scope','会话与图片输入必须由正式讨论入口根据已保存资料建立。')
             return {"job": self.create_job(c, name, p, rid)}
@@ -1180,8 +1180,8 @@ class Core:
                 if type(block['minutes']) is not int or not 1 <= block['minutes'] <= 1440:
                     raise BusinessError('validation', '估时必须是 1 至 1440 分钟。')
                 minutes_total += block['minutes']
-            if retained:
-                continue  # Preserve adopted work and its historical completion gate.
+            if historical:
+                continue  # Preserve executed history; future retained blocks still need dependency checks.
             for dep in c.execute("SELECT e.* FROM links l JOIN entities e ON l.target_id=e.id WHERE l.source_id=? AND l.kind='depends_on'", (target['id'],)):
                 predecessor = self.store.entity(dep)
                 from .daily_flow import completed_on_or_before

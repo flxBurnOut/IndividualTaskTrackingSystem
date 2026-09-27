@@ -29,7 +29,8 @@ def register_tools(server,query,*,bound=False):
     @server.tool(annotations=READ,structured_output=True)
     def read_context_item(operation_id:str,id:str,offset:int=0,version:Any=None)->dict[str,Any]:
         """Read canonical details, including @goal, @plan_request, @schedule and
-        @daily_review. If next_offset exists, concatenate json_fragment in order,
+        @daily_review. Entity dependencies point to dependencies:<id>, containing
+        predecessors, dependents and dated completion evidence. If next_offset exists, concatenate json_fragment in order,
         passing the same version; do not infer from a partial JSON fragment."""
         return query('read_context_item',operation_id=operation_id,id=id,offset=offset,version=version)
 
@@ -103,7 +104,9 @@ This discussion uses context/1. begin_discussion returns ONLY a goal and indexes
 never all database facts. Use the bounded context tools. If selected_skill is present, read @skill before doing that workflow. A search result or first
 page is not a complete collection. Fetch all pages of deadlines/rules/events
 before planning. Get exact IDs, details, dependencies and current plan with the
-readers; time estimates never change facts or completion gates.
+readers. Follow each selected item's dependencies reader, including every page;
+predecessors must finish before dependents, and planned does not mean completed.
+Time estimates never change facts or completion gates.
 scope.analyze_materials distinguishes complete analysis from references. When it
 is false (e.g. ordinary completion feedback), do not re-analyze the whole course;
 look up only the specific material chunks needed. When true, for selected
