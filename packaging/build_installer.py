@@ -19,6 +19,8 @@ import struct
 import subprocess
 import sys
 import urllib.request
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workflow import runtime_directory, version_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER_VERSION = "7.1.0"
@@ -77,14 +79,15 @@ def pe_version(path: Path) -> str:
 
 def validate_package(package: Path, version: str) -> list[dict]:
     package = plain_path(package)
-    if package != (ROOT / "release" / f"PersonalManagement-{version}").resolve():
-        raise ValueError("Installer input must be release/PersonalManagement-<version>")
+    folder = version_directory(version, ROOT).resolve()
+    if package not in {folder, folder / 'app'}:
+        raise ValueError("Installer input must be the version's app directory or a legacy runtime")
     required = (*EXES, "_internal/management/assets/app-icon.ico", "使用说明.txt", "详细使用说明.md")
     for name in required:
         if not (package / name).is_file():
             raise ValueError(f"Missing release input: {name}")
     forbidden = {".codex", ".agents", ".git", ".venv", ".analysis", ".test-output", "auth.json", "runtime.json", "service.lock", "restore_pending.json", "restore_reconciled.json",
-                 "upgrade-backups", "upgrade-state.json", "schema-upgrade.lock", "update_pending.json", "update_pending.json.new", "startup_failure.json", "startup_failure.json.new"}
+                 "upgrade-backups", "upgrade-state.json", "schema-upgrade.lock", "update_pending.json", "update_pending.json.new", "startup_failure.json", "startup_failure.json.new", "gui.lock", "tray.lock", "tray-status.json", "tray-status.json.new"}
     entries = []
     for path in sorted(package.rglob("*")):
         plain_path(path)
@@ -175,15 +178,18 @@ def main() -> None:
     version = args.version or source_version()
     if not re.fullmatch(r"\d+\.\d+\.\d+", version) or version != source_version():
         parser.error("Version must be a three-part numeric version matching the source")
-    package = ROOT / "release" / f"PersonalManagement-{version}"
+    package = runtime_directory(version, ROOT)
     entries = validate_package(package, version)
     script = ROOT / "packaging" / "installer.iss"
-    output = ROOT / "release" / f"PersonalManagement-{version}-Setup-x64.exe"
+    output = version_directory(version, ROOT) / f"PersonalManagement-{version}-Setup-x64.exe"
     if output.exists() and not args.check:
         raise FileExistsError(f"Installer already exists; preserve or move it before rebuilding: {output}")
-    log = ROOT / ".build" / f"installer-{version}{'-check' if args.check else ''}.log"
-    log.parent.mkdir(exist_ok=True)
-    command = [str(compiler), "/Qp", "/DAppVersion=" + version, "/DPackageDir=" + str(package), "/DOutputDir=" + str(output.parent)]
+    log = ROOT / '.build' / 'reports' / 'build' / version / ('installer-check.log' if args.check else 'installer.log')
+    log.parent.mkdir(parents=True, exist_ok=True)
+    # A compile check must never give the compiler a write path to a release.
+    compiler_output = log.parent / 'compile-check' if args.check else output.parent
+    compiler_output.mkdir(parents=True, exist_ok=True)
+    command = [str(compiler), "/Qp", "/DAppVersion=" + version, "/DPackageDir=" + str(package), "/DOutputDir=" + str(compiler_output)]
     if args.check:
         command.append("/O-")
     command.append(str(script))
@@ -200,7 +206,8 @@ def main() -> None:
             raise ValueError("Installer output/version verification failed")
         report.update(installer=output.name, installer_bytes=output.stat().st_size, installer_sha256=digest(output))
         (output.with_suffix(".exe.sha256")).write_text(report["installer_sha256"] + "  " + output.name + "\n", encoding="ascii")
-    report_path = ROOT / ".build" / f"installer-{version}{'-check' if args.check else ''}.json"
+        (output.parent / 'SHA256SUMS.txt').write_text(report['installer_sha256'] + '  ' + output.name + '\n', encoding='ascii')
+    report_path = log.with_suffix('.json') if args.check else output.parent / 'manifest.json'
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "files"}, ensure_ascii=False, indent=2))
 

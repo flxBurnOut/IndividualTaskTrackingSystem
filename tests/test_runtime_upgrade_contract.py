@@ -144,6 +144,28 @@ def test_shutdown_is_authenticated_and_has_no_business_payload(live):
     assert not live.server.stopping.is_set() and not live.server.maintenance
 
 
+def test_explicit_tray_exit_preserves_data_and_does_not_auto_restart(live):
+    client = Client(live.core.root, autostart=False, entrance='tray')
+    before = live.core.query('state')
+    assert client.stop_service()['prepared']
+    assert live.core.query('state') == before
+    marker = json.loads((live.core.root / 'update_pending.json').read_text('utf-8'))
+    assert marker['reason'] == 'exit' and marker['status'] == 'ready'
+    with pytest.raises(runtime.UpdatePending) as error:
+        runtime.require_no_pending_update(live.core.root)
+    assert '由用户退出' in error.value.message
+
+
+def test_tray_status_reports_jobs_without_changing_business_state(live):
+    client = Client(live.core.root, autostart=False, entrance='tray')
+    client.command('create_artifact_job', {'kind': 'text', 'relative_path': 'synthetic.txt', 'content': 'kept'})
+    before = live.core.query('state')
+    result = client.query('runtime_status')
+    assert result['jobs'] == {'queued': 1}
+    assert result['client_entrances']['tray']['verified']
+    assert live.core.query('state') == before
+
+
 @pytest.mark.parametrize('status', ['queued', 'running'])
 def test_update_refuses_pending_jobs_without_changing_them(live, status):
     client = Client(live.core.root, autostart=False)

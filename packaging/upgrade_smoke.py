@@ -22,6 +22,7 @@ import urllib.request
 import uuid
 
 import psutil
+from workflow import runtime_directory, require_test_workspace, checked_path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -42,7 +43,7 @@ def environment():
     hidden = {'PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV', '_PYI_ARCHIVE_FILE',
               '_PYI_APPLICATION_HOME_DIR', '_PYI_PARENT_PROCESS_LEVEL', 'PERSONAL_MANAGEMENT_DATA'}
     result = {key: value for key, value in os.environ.items() if key not in hidden}
-    result.update(PYINSTALLER_RESET_ENVIRONMENT='1', PYTHONUTF8='1')
+    result.update(PYINSTALLER_RESET_ENVIRONMENT='1', PYTHONUTF8='1', PERSONAL_MANAGEMENT_NO_TRAY='1')
     return result
 
 
@@ -196,7 +197,8 @@ def tables(path, layout=None):
 def asset_files(data):
     excluded = {'database.sqlite3', 'database.sqlite3-wal', 'database.sqlite3-shm',
                 'runtime.json', 'diagnostic.log', 'service.lock', 'schema-upgrade.lock',
-                'update_pending.json', 'upgrade-state.json'}
+                'update_pending.json', 'upgrade-state.json', 'gui.lock', 'tray.lock',
+                'tray-status.json', 'tray-status.json.new'}
     return {str(path.relative_to(data)): digest(path) for path in data.rglob('*')
             if path.is_file() and str(path.relative_to(data)) not in excluded
             and path.relative_to(data).parts[0] != 'upgrade-backups'
@@ -234,11 +236,11 @@ async def run(args):
     for package in (old_package, new_package):
         assert package.is_relative_to(ROOT / 'release'), 'Only repository release packages are accepted'
         assert (package / 'PersonalManagementService.exe').is_file(), str(package)
-    work = synthetic_path(ROOT / '.build' / ('upgrade-acceptance-' + uuid.uuid4().hex[:12]))
+    work = require_test_workspace(args.work_dir) / 'upgrade'
     work.mkdir(parents=True)
     data = work / '自选资料 有空格'
     data.mkdir()
-    report_path = synthetic_path(args.report)
+    report_path = checked_path(args.report, ROOT / '.build' / 'checks')
     report = {'synthetic_only': True, 'models_started': 0, 'codex_threads_created': 0,
               'installed_product': False, 'data_dir': str(data), 'passed': False, 'checks': {}}
     owned = []
@@ -338,9 +340,10 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--old-package', type=Path, default=ROOT / 'release/PersonalManagement-1.0.2')
-    parser.add_argument('--new-package', type=Path, default=ROOT / ('release/PersonalManagement-' + __version__))
-    parser.add_argument('--report', type=Path, default=ROOT / '.build' / ('upgrade-smoke-' + __version__ + '.json'))
+    parser.add_argument('--old-package', type=Path, default=runtime_directory('1.0.2'))
+    parser.add_argument('--new-package', type=Path, default=runtime_directory(__version__))
+    parser.add_argument('--report', type=Path, required=True)
+    parser.add_argument('--work-dir', type=Path, required=True)
     asyncio.run(run(parser.parse_args()))
 
 

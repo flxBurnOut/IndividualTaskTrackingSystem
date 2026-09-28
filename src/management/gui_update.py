@@ -74,13 +74,10 @@ class UpdateDialog(QDialog):
     def prepare_update(self):
         if self.preparing:
             return
-        others = [widget for widget in QApplication.topLevelWidgets()
-                  if widget.isVisible() and widget not in (self, self.window)]
-        if others or self.window.review_pending:
-            self.status.setText('请先保存并关闭其他编辑窗口，再准备更新。尚未停止后台。')
-            return
-        if self.window.bridge.callbacks or self.window.bridge.uncertain_writes:
-            self.status.setText('仍有读取、保存或待核对的保存回执，请等处理结束后重试。')
+        from .gui_shutdown import shutdown_blocker
+        problem = shutdown_blocker(self.window, self)
+        if problem:
+            self.status.setText(problem)
             return
         self.preparing = True
         self.prepare.setEnabled(False)

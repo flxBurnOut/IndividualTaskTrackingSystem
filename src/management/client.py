@@ -20,7 +20,7 @@ class ClientError(Exception):
 
 class Client:
     def __init__(self, data_dir=None, autostart=True, *, entrance='gui'):
-        if entrance not in {'gui', 'mcp', 'installer'}:
+        if entrance not in {'gui', 'mcp', 'installer', 'tray'}:
             raise ValueError('Unknown client entrance')
         self.entrance = entrance
         self.data_dir = Path(data_dir or default_data_dir()).resolve()
@@ -115,7 +115,10 @@ class Client:
                     self.runtime = None
                     raise ClientError('service_version_mismatch', service_mismatch_message(contract), mismatch_details(contract))
                 if result.get('maintenance'):
-                    raise ClientError('service_updating', '后台正在准备更新，暂不接收新操作；请完成更新后重新打开软件。')
+                    message = ('后台正在退出，暂不接收新操作；稍后重新打开管理软件可恢复使用。'
+                               if result.get('shutdown_reason') == 'exit' else
+                               '后台正在准备更新，暂不接收新操作；请完成更新后重新打开软件。')
+                    raise ClientError('service_updating', message)
             return result
         except urllib.error.HTTPError as error:
             try:
@@ -175,3 +178,6 @@ class Client:
         An ordinary state preflight would intentionally reject maintenance.
         """
         return self._request('maintenance', 'shutdown-if-idle', {}, timeout=30)
+
+    def stop_service(self):
+        return self._request('maintenance', 'shutdown-if-idle', {'reason': 'exit'}, timeout=30)

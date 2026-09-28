@@ -482,6 +482,21 @@ class MainWindow(QMainWindow):
         finally:
             dialog.deleteLater()
 
+    def activate_from_tray(self, command='show'):
+        if self.closed:
+            return
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        if command == 'update':
+            self.open_update()
+        elif command == 'exit':
+            from .gui_shutdown import request_exit
+            request_exit(self)
+
     def search(self):
         def selected(entity):
             if entity["type"] in {"task", "note", "milestone", "topic"}:
@@ -549,18 +564,27 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def run(data_dir, argv=None):
+def run(data_dir, argv=None, *, show_update=False):
     from .branding import set_windows_identity, configure_application
     set_windows_identity()
     app = QApplication.instance() or QApplication(argv or [])
     configure_application(app)
+    from .gui_instance import WindowInstance, notify_window
+    instance = WindowInstance(data_dir, app)
+    if not instance.acquire():
+        if not notify_window(data_dir, 'update' if show_update else 'show'):
+            QMessageBox.information(None, '个人事务管理', '已有窗口正在启动或退出，请稍后重试。')
+        return 0
     manager = install_gui_gc(app)
     app.setApplicationName("个人事务管理")
     app.setOrganizationName("PersonalManagement")
     app.setStyle("Fusion")
     configure_palette(app)
     window = MainWindow(data_dir)
+    instance.requested.connect(window.activate_from_tray)
     window.show()
+    if show_update:
+        QTimer.singleShot(0, window.open_update)
     result = app.exec()
     # Direct application.exit() can bypass Quit events. Keep Qt objects alive
     # and continue owner-thread collection until bounded client calls finish.
@@ -568,4 +592,5 @@ def run(data_dir, argv=None):
         app.processEvents()
         manager.poll()
         QThread.msleep(10)
+    instance.close()
     return result

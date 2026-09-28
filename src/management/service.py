@@ -36,6 +36,7 @@ class Server(ThreadingHTTPServer):
         self._maintenance_lock = threading.Lock()
         self.active_requests = 0
         self.maintenance = False
+        self.shutdown_reason = 'update'
         self._update_finisher = None
         self._update_finished = False
         self.client_entrances = {}
@@ -56,7 +57,7 @@ class Server(ThreadingHTTPServer):
     def observe_entrance(self, headers):
         version, protocol = headers.get(VERSION_HEADER), headers.get(PROTOCOL_HEADER)
         entrance = headers.get(ENTRANCE_HEADER)
-        entrance = entrance if entrance in {'gui', 'mcp', 'installer'} else 'unknown'
+        entrance = entrance if entrance in {'gui', 'mcp', 'installer', 'tray'} else 'unknown'
         verified = version == self.contract['app_version'] and protocol == str(self.contract['protocol_version'])
         # Diagnostics only: caller-declared role is not an authorization claim.
         with self._activity_lock:
@@ -66,13 +67,15 @@ class Server(ThreadingHTTPServer):
                 'verified': verified, 'checked_at': now()}
         return verified
 
-    def prepare_update(self, *, drain_timeout=10):
+    def prepare_update(self, *, drain_timeout=10, reason='update'):
+        if reason not in {'exit', 'update'}:
+            raise BusinessError('validation', '退出方式无效。')
         if not self._maintenance_lock.acquire(blocking=False):
             raise BusinessError('update_draining', '正在等待后台退出，请稍后再次检查。')
         try:
             with self._activity_lock:
                 if self.active_requests:
-                    raise BusinessError('update_busy', '还有操作正在执行，请等待保存、导入或查询完成后再准备更新。',
+                    raise BusinessError('update_busy', '还有操作正在执行，请等待保存、导入或查询完成后再退出后台。',
                                         {'active_requests': self.active_requests})
                 self.maintenance = True
             if not self.stopping.is_set():
@@ -88,7 +91,8 @@ class Server(ThreadingHTTPServer):
                             'pending_file_operations': c.execute("SELECT count(*) FROM io_operations WHERE status IN ('preparing','ready')").fetchone()[0],
                         }
                         if any(counts.values()) or self.core.cancel_events:
-                            raise BusinessError('update_busy', '还有任务或资料操作尚未结束，请等待完成后再更新；本次没有停止任务。', counts)
+                            raise BusinessError('update_busy', '还有任务或资料操作尚未结束，请等待完成后再退出；本次没有停止任务。', counts)
+                        self.shutdown_reason = reason
                         self._write_update_marker('draining')
                         self.stopping.set()
                 except Exception:
@@ -139,7 +143,7 @@ class Server(ThreadingHTTPServer):
     def _write_update_marker(self, status):
         marker = {'format': 'personal-management-update/1', 'data_dir': str(self.core.root),
                   'app_version': self.contract['app_version'], 'pid': os.getpid(),
-                  'status': status, 'prepared_at': now()}
+                  'status': status, 'prepared_at': now(), 'reason': self.shutdown_reason}
         temporary = self.core.root / 'update_pending.json.new'
         temporary.write_text(encode(marker), encoding='utf-8')
         os.replace(temporary, self.core.root / 'update_pending.json')
@@ -217,9 +221,9 @@ class Handler(BaseHTTPRequestHandler):
                         '若从 Codex 发起，请在任务空闲后重启 MCP 连接以加载新版接口。',
                         {'service_version': self.server.contract['app_version'], 'required_protocol': self.server.contract['protocol_version']})
             if (category, name) == ('maintenance', 'shutdown-if-idle'):
-                if data:
-                    raise BusinessError('validation', '准备更新不接受业务修改参数。')
-                value = self.server.prepare_update()
+                if data not in ({}, {'reason': 'exit'}):
+                    raise BusinessError('validation', '退出后台不接受业务修改参数。')
+                value = self.server.prepare_update(reason='exit') if data else self.server.prepare_update()
                 self.send_json(value)
                 threading.Thread(target=self.server.shutdown, name='management-update-shutdown', daemon=True).start()
                 return
@@ -227,9 +231,15 @@ class Handler(BaseHTTPRequestHandler):
                 value = self.server.core.query('state', **data) if name == 'state' else {'data_dir': str(self.server.core.root)}
                 with self.server._activity_lock:
                     value = {**value, 'service_contract': self.server.contract,
-                             'maintenance': self.server.maintenance}
+                             'maintenance': self.server.maintenance,
+                             'shutdown_reason': self.server.shutdown_reason if self.server.maintenance else None}
                     if name == 'runtime_status':
                         value['client_entrances'] = dict(self.server.client_entrances)
+                if name == 'runtime_status':
+                    with self.server.core.store.connect() as connection:
+                        value['jobs'] = dict(connection.execute("SELECT status,count(*) FROM jobs WHERE status IN ('queued','running','awaiting_review') GROUP BY status"))
+                    from .tray_runtime import tray_status
+                    value['tray'] = tray_status(self.server.core.root)
             else:
                 with self.server.activity():
                     value = self.dispatch(category, name, data)
@@ -286,6 +296,8 @@ def run_service(data_dir, resume_token=None):
         background = Background(core, server.stopping)
         server.background = background
         background.start()
+        from .tray_runtime import start_tray_supervisor
+        start_tray_supervisor(root, server.stopping)
         if resume_token is not None:
             # Clear only after this new process owns the data, publishes its
             # connection and completes recovery. Failed startup keeps the fence.

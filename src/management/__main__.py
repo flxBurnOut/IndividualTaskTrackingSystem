@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--service', action='store_true')
     parser.add_argument('--bootstrap-service', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--resume-update', help=argparse.SUPPRESS)
+    parser.add_argument('--tray', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--show-update', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
     parser.add_argument('--mcp-discussion')
     parser.add_argument('--discussion-epoch')
@@ -49,6 +51,9 @@ def main():
     if args.verify_ui:
         from .verify_ui import verify
         return verify(args.data_dir, args.verify_ui)
+    if args.tray:
+        from .gui_tray import run
+        return run(args.data_dir)
     if args.choose_data:
         from .launcher import choose_data_dir
         selected = choose_data_dir()
@@ -78,7 +83,7 @@ def main():
         QMessageBox.warning(None, '更新尚未完成', str(error))
         return 1
     from .gui import run
-    return run(args.data_dir)
+    return run(args.data_dir, show_update=args.show_update)
 
 
 if __name__ == '__main__':

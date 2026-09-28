@@ -29,7 +29,7 @@ class _Worker(QObject):
                     factory = Client
                 self.client = factory(self.data_dir)
             if method == "maintenance":
-                result = self.client.prepare_update()
+                result = self.client.stop_service() if name == 'stop_service' else self.client.prepare_update()
             elif method == "command":
                 options=dict(arguments.get("options", {}))
                 if name=='send_message':
@@ -107,6 +107,9 @@ class ServiceBridge(QObject):
 
     def prepare_update(self, callback=None, error=None):
         return self._submit('maintenance', 'prepare_update', {}, callback, error)
+
+    def stop_service(self, callback=None, error=None):
+        return self._submit('maintenance', 'stop_service', {}, callback, error)
 
     def command(self, name, payload, callback=None, error=None, **options):
         options.setdefault("epoch", self.epoch)

@@ -58,7 +58,9 @@ class UpdatePending(RuntimeError):
     code = 'update_pending'
     message = '此数据空间已暂停后台以准备更新。请完成安装后打开个人事务管理；若取消更新，也请主动打开软件恢复使用。'
 
-    def __init__(self):
+    def __init__(self, reason='update'):
+        if reason == 'exit':
+            self.message = '后台已由用户退出。请主动打开个人事务管理恢复使用；Codex 不会自动重新启动已退出的后台。'
         super().__init__(self.message)
 
 
@@ -77,7 +79,11 @@ def require_no_pending_update(root, resume_token=None):
                 return
         except (OSError, ValueError, AttributeError):
             pass
-    raise UpdatePending()
+    try:
+        reason = json.loads(marker.read_text('utf-8')).get('reason', 'update')
+    except (OSError, ValueError, AttributeError):
+        reason = 'update'
+    raise UpdatePending(reason)
 
 
 def read_startup_failure(root, not_before):
@@ -193,7 +199,7 @@ def _windows_broker_start(root, resume_token=None):
         allowed = {'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP',
                    'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA',
                    'PROGRAMFILES', 'PROGRAMFILES(X86)', 'HOMEDRIVE', 'HOMEPATH',
-                   'USERNAME', 'USERDOMAIN', 'CODEX_HOME', 'PYTHONPATH'}
+                   'USERNAME', 'USERDOMAIN', 'CODEX_HOME', 'PYTHONPATH', 'PERSONAL_MANAGEMENT_NO_TRAY'}
         startup.EnvironmentVariables = [key + '=' + value for key, value in os.environ.items()
                                         if key.upper() in allowed] + ['PYTHONUTF8=1']
         process_class = provider.Get('Win32_Process')

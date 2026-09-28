@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -7,13 +8,14 @@ import sys
 import time
 import uuid
 import psutil
+from workflow import runtime_directory, require_test_workspace, checked_path
 from management.client import Client
 from management import __version__
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'release' / os.environ.get('PM_PACKAGE_NAME','PersonalManagement-'+__version__) / 'PersonalManagementService.exe'
+EXE = runtime_directory(__version__) / 'PersonalManagementService.exe'
 GUI = EXE.with_name('PersonalManagement.exe')
 
 
@@ -168,11 +170,12 @@ async def verify_frozen_mcp_plan_revision(client, params):
     return evidence
 
 
-async def main():
-    root = ROOT / '.test-output' / ('packaged-' + uuid.uuid4().hex[:10])
+async def main(work_dir, report_path):
+    root = require_test_workspace(work_dir) / 'package'
     root.mkdir(parents=True)
     data = root / 'data'
     environment = dict(os.environ)
+    environment['PERSONAL_MANAGEMENT_NO_TRAY'] = '1'
     environment.pop('PYTHONPATH', None)
     environment.pop('VIRTUAL_ENV', None)
     report = {'synthetic_only': True, 'package': str(EXE.parent), 'data_dir': str(data)}
@@ -340,7 +343,7 @@ async def main():
         report['error'] = repr(error)
         raise
     finally:
-        report_path = ROOT / '.build' / 'packaged-smoke.json'
+        report_path = checked_path(report_path, ROOT / '.build' / 'checks')
         report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         if (data/'runtime.json').exists():
             runtime=json.loads((data/'runtime.json').read_text('utf-8'))
@@ -354,4 +357,8 @@ async def main():
         print(json.dumps(report,ensure_ascii=False,indent=2))
 
 if __name__=='__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description='Internal package check; normally use packaging/check.py package')
+    parser.add_argument('--work-dir', type=Path, required=True)
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args()
+    asyncio.run(main(args.work_dir, args.report))

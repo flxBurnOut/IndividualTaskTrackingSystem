@@ -2,6 +2,7 @@
 /*
 !/.gitignore
 !/README.md
+!/AGENTS.md
 !/pyproject.toml
 !/启动个人事务管理.vbs
 !/src/
@@ -19,6 +20,7 @@
 !/docs/发布说明_1.0.1.md
 !/docs/发布说明_1.0.2.md
 !/docs/发布说明_1.1.0.md
+!/docs/发布说明_1.1.1.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -29,6 +31,11 @@
 !/packaging/version_info.py
 !/packaging/smoke.py
 !/packaging/upgrade_smoke.py
+!/packaging/tray_smoke.py
+!/packaging/workflow.py
+!/packaging/check.py
+!/packaging/maintenance.py
+!/packaging/publish.py
 !/packaging/codex_entry.py
 !/packaging/installer.iss
 !/packaging/build_installer.py

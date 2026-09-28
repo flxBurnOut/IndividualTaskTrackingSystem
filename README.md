@@ -1,12 +1,14 @@
 # 个人事务管理
 
-**v1.1.0 · 保留资料的版本升级**
+**v1.1.1 · Windows 后台托盘**
+
+关闭窗口后可从 Windows 托盘查看后台状态、重新打开窗口或正常退出后台。
 
 Windows 本地个人事务管理软件。课程、项目、任务、计划、复盘、资料与可选的 Codex 协助，共用一份本机业务记录。基于 Python、PySide6 和 SQLite。
 
 ## 安装与开始使用
 
-从 [v1.1.0 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.1.0) 下载 `PersonalManagement-1.1.0-Setup-x64.exe` 和 `SHA256SUMS.txt`，运行安装程序，再从“个人事务管理”快捷方式启动。仓库为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。旧版用户请先阅读下方升级说明，安装时核对原数据位置。
+从 [v1.1.1 Release](https://github.com/flxBurnOut/IndividualTaskTrackingSystem/releases/tag/v1.1.1) 下载 `PersonalManagement-1.1.1-Setup-x64.exe` 和 `SHA256SUMS.txt`，运行安装程序，再从“个人事务管理”快捷方式启动。仓库为私有，下载需要相应访问权限。安装器按当前 Windows 用户安装，无需把个人数据放进程序目录。旧版用户请先阅读下方升级说明，安装时核对原数据位置。
 
 | 内容 | 默认位置 |
 | --- | --- |
@@ -39,6 +41,7 @@ Windows 本地个人事务管理软件。课程、项目、任务、计划、复
 - [会话与原文件目录](docs/固定会话与原文件目录.md)：事项归属、数据位置与资料版本。
 - [Codex 接口](docs/Codex接口与后台推理.md)：MCP、候选和桌面连接的技术边界。
 - [开发与扩展](docs/开发与扩展.md)：源码运行、接口和发布检查。
+- [v1.1.1 发布说明](docs/发布说明_1.1.1.md)：后台托盘、窗口复用和正常退出。
 - [v1.1.0 发布说明](docs/发布说明_1.1.0.md)：保留资料、版本核验和安全更新退出。
 - [v1.0.1 发布说明](docs/发布说明_1.0.1.md)：计划修改与依赖保护修复。
 - [v1.0.0 发布说明](docs/发布说明_1.0.0.md)：首发范围和已知限制。
@@ -66,11 +69,13 @@ python -m venv .venv
 开发和测试使用独立数据目录，不指向日常业务数据。
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q --basetemp .test-output/pytest
+.\.venv\Scripts\python.exe packaging/check.py focused tests/test_service.py
 .\.venv\Scripts\python.exe packaging/build.py
 ```
 
-便携构建输出为 `release/PersonalManagement-1.1.0/`。可运行其中的 `PersonalManagement.exe`；用 `--choose-data` 或“选择数据空间”入口只改变本次打开的数据目录，不永久改写默认入口。长期使用已有数据请创建指向该目录的快捷方式。安装器及验证步骤见开发文档。
+便携程序位于 `release/PersonalManagement-1.1.1/app/`，安装包、校验文件和清单位于同一版本目录。可运行 `app/PersonalManagement.exe`；用 `--choose-data` 或“选择数据空间”入口只改变本次打开的数据目录，不永久改写默认入口。长期使用已有数据请创建指向该目录的快捷方式。安装器及验证步骤见开发文档。
+
+测试统一使用 `packaging/check.py`，按变更选择检查类型。相同输入可复用上次成功结果，临时数据与测试进程默认自动回收；全量回归需显式选择 `full`。详见 [AGENTS.md](AGENTS.md)。
 
 ## 仓库范围
 
