@@ -96,6 +96,8 @@ class PlanDialog(FormDialog):
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.buttons.accepted.connect(self.save)
         self.load_context()
+        from .gui_tutorials import install_dialog_tutorial
+        install_dialog_tutorial(self, 'plan')
 
     def mark_dirty(self,*_):
         if not self.loading_fields:self.dirty=True
@@ -821,6 +823,9 @@ class SettingsDialog(QDialog):
         self.fit_settings_fields()
         self.load()
         self.load_review_times()
+
+        from .gui_tutorials import install_dialog_tutorial
+        install_dialog_tutorial(self, 'settings')
 
     def fit_settings_fields(self):
         # Scroll pages keep the content's natural height; font changes must

@@ -121,6 +121,8 @@ class AssistanceDialog(QDialog):
         self.apply=QPushButton('核对后保存这些变更');self.apply.setObjectName('Primary');self.apply.clicked.connect(self.apply_result);self.apply.hide()
         self.connection_send_timer=QTimer(self);self.connection_send_timer.setSingleShot(True);self.connection_send_timer.setInterval(30000);self.connection_send_timer.timeout.connect(self.cancel_pending_connection_send)
         self.timer=QTimer(self);self.timer.setInterval(1500);self.timer.timeout.connect(self.tick);self.timer.start();self.finished.connect(self.finished_dialog);self.refresh_chips();self.load_settings();self.poll();self.load_source_titles()
+        from .gui_tutorials import install_dialog_tutorial
+        install_dialog_tutorial(self, 'discussion')
         if self.codex_connection is not None:
             self.codex_connection.changed.connect(self.desktop_connection_changed)
             self.desktop_connection_changed(self.codex_connection.snapshot())

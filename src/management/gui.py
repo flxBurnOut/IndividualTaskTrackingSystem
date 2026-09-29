@@ -126,6 +126,16 @@ class MainWindow(QMainWindow):
         self.codex_connection = CodexConnectionController(data_dir, self, bridge=self.bridge,
             step=desktop_step, automatic=client_factory is None)
         self._build()
+        from .gui_onboarding import OnboardingManager
+        from .gui_tutorials import install_main_tutorials
+        self.onboarding = OnboardingManager(self, self.data_dir)
+        self.onboarding.error.connect(lambda message: self.statusBar().showMessage(message, 10000))
+        self.guide_current.triggered.connect(self.onboarding.show_current)
+        self.guide_intro.triggered.connect(self.show_intro)
+        self.guide_automatic.setChecked(self.onboarding.automatic)
+        self.guide_automatic.toggled.connect(self.onboarding.set_automatic)
+        self.onboarding.automatic_changed.connect(self.guide_automatic.setChecked)
+        install_main_tutorials(self)
         self.codex_connection.changed.connect(self.show_codex_connection)
         bind_theme(self, self.refresh_global_metrics)
         self.poll = QTimer(self)
@@ -164,6 +174,16 @@ class MainWindow(QMainWindow):
         self.create_menu = QMenu(self.new_button)
         self.new_button.setMenu(self.create_menu)
         side.addWidget(self.new_button)
+        self.guide_button = MenuButton("使用指南")
+        self.guide_button.setToolTip("重新查看功能介绍，或设置自动介绍")
+        self.guide_menu = QMenu(self.guide_button)
+        self.guide_current = self.guide_menu.addAction("重看当前面板介绍")
+        self.guide_intro = self.guide_menu.addAction("查看入门导览")
+        self.guide_menu.addSeparator()
+        self.guide_automatic = self.guide_menu.addAction("自动介绍新面板")
+        self.guide_automatic.setCheckable(True)
+        self.guide_button.setMenu(self.guide_menu)
+        side.addWidget(self.guide_button)
         side.addWidget(plain_label("本地保存 · 同一份记录", "SidebarHint"))
         outer.addWidget(sidebar)
         main = QWidget()
@@ -333,6 +353,10 @@ class MainWindow(QMainWindow):
         self.page_subtitle.setText(titles[section][1])
         self.notice.hide()
         self.refresh()
+
+    def show_intro(self):
+        self.navigate('dashboard')
+        self.onboarding.show('dashboard')
 
     def refresh(self):
         if not self.type_map or self.closed:
@@ -539,6 +563,7 @@ class MainWindow(QMainWindow):
                 return
             self.review_pending = False
         self.closed = True
+        self.onboarding.stop()
         self.poll.stop()
         self.codex_connection.request_stop()
         if self.bridge.callbacks:

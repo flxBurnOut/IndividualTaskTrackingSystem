@@ -548,6 +548,9 @@ class EntityForm(FormDialog):
             self.delete_button.clicked.connect(self.delete_task)
             self.buttons.addButton(self.delete_button, QDialogButtonBox.ButtonRole.ActionRole)
 
+        from .gui_tutorials import install_dialog_tutorial
+        install_dialog_tutorial(self, 'editor')
+
     def delete_task(self):
         dialog = DeleteTaskDialog(self.bridge, self.entity, self, self.on_saved)
         try:

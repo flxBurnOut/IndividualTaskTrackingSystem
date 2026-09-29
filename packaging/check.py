@@ -117,7 +117,8 @@ def run_checked(args, run):
         log_created = True
         for path in [*run.folder.glob('*.xml'), run.folder / 'result.json']:
             path.unlink(missing_ok=True)
-        environment = dict(os.environ, PERSONAL_MANAGEMENT_NO_TRAY='1', PYTHONUTF8='1')
+        environment = dict(os.environ, PERSONAL_MANAGEMENT_NO_TRAY='1', PERSONAL_MANAGEMENT_NO_ONBOARDING='1', PYTHONUTF8='1')
+        environment['PERSONAL_MANAGEMENT_CHECK_REPORT_DIR'] = str(run.folder)
         if args.profile == 'installer':
             environment['PERSONAL_MANAGEMENT_INSTALLER_TEST'] = '1'
         results = []

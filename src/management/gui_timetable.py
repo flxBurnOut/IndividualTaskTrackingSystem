@@ -203,6 +203,8 @@ class TimetableDialog(QDialog):
         layout.addWidget(label('点击课程格子可修改；课表只提供固定框架，不会自动生成每日计划。', 'Quiet'))
         self.bridge.query('capabilities', self.loaded_capabilities, self.error)
         self.load_timetables(); self.refresh()
+        from .gui_tutorials import install_dialog_tutorial
+        install_dialog_tutorial(self, 'timetable')
 
     def loaded_capabilities(self, result): self.capabilities = result
 

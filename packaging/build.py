@@ -32,11 +32,12 @@ def main():
     (package / '选择数据空间.vbs').write_text('Set shell = CreateObject("WScript.Shell")\nSet fso = CreateObject("Scripting.FileSystemObject")\nbase = fso.GetParentFolderName(WScript.ScriptFullName)\nshell.Run Chr(34) & base & "\\PersonalManagement.exe" & Chr(34) & " --choose-data", 1, False\n', encoding='ascii')
     (package / '创建快捷方式.vbs').write_text('Set shell = CreateObject("WScript.Shell")\nSet fso = CreateObject("Scripting.FileSystemObject")\nbase = fso.GetParentFolderName(WScript.ScriptFullName)\nshell.Run Chr(34) & base & "\\PersonalManagement.exe" & Chr(34) & " --install-shortcuts --choose-data", 1, False\n', encoding='ascii')
     (package / '详细使用说明.md').write_text((ROOT / 'docs' / '使用说明.md').read_text('utf-8-sig'), encoding='utf-8')
+    (package / '新手引导.md').write_text((ROOT / 'docs' / '新手引导.md').read_text('utf-8-sig'), encoding='utf-8')
     (package / '发布说明.md').write_text((ROOT / 'docs' / ('发布说明_'+version+'.md')).read_text('utf-8-sig'), encoding='utf-8')
     from license_notices import write_notices
     write_notices(package)
     files = [p for p in package.rglob('*') if p.is_file()]
-    forbidden = {'.analysis', '.test-output', '.venv', 'database.sqlite3', 'runtime.json', 'auth.json', 'restore_pending.json', 'update_pending.json', 'upgrade-state.json', 'upgrade-backups', 'schema-upgrade.lock', 'startup_failure.json', 'gui.lock', 'tray.lock', 'tray-status.json', 'tray-status.json.new'}
+    forbidden = {'.analysis', '.test-output', '.venv', 'database.sqlite3', 'runtime.json', 'auth.json', 'restore_pending.json', 'update_pending.json', 'upgrade-state.json', 'upgrade-backups', 'schema-upgrade.lock', 'startup_failure.json', 'gui.lock', 'tray.lock', 'tray-status.json', 'tray-status.json.new', 'ui-onboarding.json'}
     for path in files:
         if forbidden.intersection(path.relative_to(package).parts):
             raise RuntimeError('Private/runtime data present in release: ' + str(path))

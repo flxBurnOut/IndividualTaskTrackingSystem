@@ -195,6 +195,7 @@ async def main(work_dir, report_path):
         service = psutil.Process(runtime['pid'])
         report['frozen_service'] = Path(service.exe()).name == EXE.name
         verify_report = root / 'frozen-gui.json'
+        before_onboarding = client.state()['revision']
         gui = subprocess.Popen([str(GUI), '--data-dir', str(data), '--verify-ui', str(verify_report)], env=environment, creationflags=subprocess.CREATE_NO_WINDOW)
         time.sleep(1)
         gui_process = psutil.Process(gui.pid)
@@ -203,6 +204,9 @@ async def main(work_dir, report_path):
         gui.wait(timeout=30)
         report['gui'] = json.loads(verify_report.read_text('utf-8'))
         assert report['gui']['loaded'] and report['gui']['visible']
+        assert gui.returncode == 0 and report['gui']['onboarding']['passed']
+        assert report['gui']['onboarding']['steps'] == 7 and report['gui']['onboarding']['progress_saved']
+        assert client.state()['revision'] == before_onboarding
         report['fresh_empty_after_gui'] = client.state()['counts'] == {}
         skills=client.query('skills')['items'];assert any(x['id']=='course-notes' and x['instructions'] for x in skills)
         report['packaged_notes_skill']=True
@@ -324,6 +328,7 @@ async def main(work_dir, report_path):
         dark_gui=subprocess.Popen([str(GUI),'--data-dir',str(data),'--verify-ui',str(dark_report)],env=environment,creationflags=subprocess.CREATE_NO_WINDOW)
         dark_gui.wait(timeout=30);assert dark_gui.returncode==0
         report['dark_gui']=json.loads(dark_report.read_text('utf-8'));assert report['dark_gui']['loaded'] and report['dark_gui']['visible'] and report['dark_gui']['appearance']['theme']=='dark' and report['dark_gui']['font_pixel_size']==18
+        assert report['dark_gui']['onboarding']['passed']
         report['recovery_and_appearance']={'three_of_eight':True,'not_auto_completed':True,'dark_large_font_saved':True}
         receipt = client.command('create_artifact_job', {'kind':'docx','relative_path':'synthetic.docx','title':'合成文档','content':'仅用于发布包测试。'})
         job_id = receipt['result']['job']['id']

@@ -16,11 +16,13 @@
 !/docs/开发与扩展.md
 !/docs/Codex接口与后台推理.md
 !/docs/固定会话与原文件目录.md
+!/docs/新手引导.md
 !/docs/发布说明_1.0.0.md
 !/docs/发布说明_1.0.1.md
 !/docs/发布说明_1.0.2.md
 !/docs/发布说明_1.1.0.md
 !/docs/发布说明_1.1.1.md
+!/docs/发布说明_1.2.0.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -66,6 +68,8 @@ __pycache__/
 *.pfx
 auth.json
 runtime.json
+ui-onboarding.json
+.ui-onboarding-*.tmp
 config.local.*
 settings.local.*
 .DS_Store

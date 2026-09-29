@@ -7,8 +7,8 @@ import sys
 import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
-from PySide6.QtCore import QDate, QMimeData, QPointF, Qt, QUrl, QTimer
-from PySide6.QtGui import QDropEvent, QDesktopServices
+from PySide6.QtCore import QDate, QEvent, QMimeData, QPointF, Qt, QUrl, QTimer
+from PySide6.QtGui import QDropEvent, QDesktopServices, QFontDatabase
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QDialogButtonBox, QMessageBox
 from management.client import Client
@@ -18,6 +18,13 @@ from management.gui_workspace import CountProgress
 @pytest.fixture(scope="session")
 def app_v2():
     app = QApplication.instance() or QApplication([])
+    # The Windows offscreen plugin does not discover system fonts itself.
+    # Load real Chinese glyphs so layout checks and retained screenshots are useful.
+    if app.platformName() == 'offscreen' and os.name == 'nt':
+        for name in ('msyh.ttc', 'msyhbd.ttc'):
+            font_path = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / name
+            if font_path.is_file():
+                QFontDatabase.addApplicationFont(str(font_path))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
     return app
@@ -48,7 +55,12 @@ def shell(app_v2, tmp_path):
         if window:
             window.review_pending = False
             window.close()
-            wait(app_v2, lambda: not window.bridge.thread.isRunning() and not window.bridge.mutation_thread.isRunning())
+            wait(app_v2, lambda: not window.isVisible() and not window.bridge.thread.isRunning() and not window.bridge.mutation_thread.isRunning())
+            # Retire this fixture on the Qt owner thread before the next case;
+            # don't leave closed windows and their signal cycles for later GC.
+            window.deleteLater()
+            app_v2.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app_v2.processEvents()
         if process.poll() is None:
             process.terminate()
         process.wait(timeout=10)
@@ -59,6 +71,129 @@ def create(client, kind, title, data=None, parent_id=None):
 
 def text_in(widget):
     return "\n".join(label.text() for label in widget.findChildren(QLabel)) + "\n" + "\n".join(button.text() for button in widget.findChildren(QPushButton))
+
+
+def test_guides_cover_main_panels_without_changing_business_data(app_v2, shell, tmp_path):
+    from management.gui_theme import apply_appearance
+    from management.verify_ui import capture_onboarding
+    from PySide6.QtWidgets import QStyle, QStyleOptionButton
+    client = Client(shell.data_dir, autostart=False)
+    before = client.state()
+    manager = shell.onboarding
+    assert shell.guide_button.text() == '使用指南'
+    evidence = capture_onboarding(shell, tmp_path / 'packaged-gui.json')
+    assert evidence['passed'] and evidence['progress_saved'] and evidence['steps'] == 7
+    assert Path(evidence['screenshot']).is_file()
+    for section, key in [('dashboard', 'dashboard'), ('today', 'today'),
+                         ('projects', 'projects'), ('reviews', 'review.daily')]:
+        shell.navigate(section)
+        wait(app_v2, lambda: not shell.bridge.callbacks)
+        assert manager.show_current()
+        assert manager.active_key == key
+        overlay = manager.overlay
+        # Walk every real target, including the empty-data fallback targets.
+        for _ in overlay.steps:
+            app_v2.processEvents()
+            assert overlay.isVisible()
+            QTest.mouseClick(overlay.next_button, Qt.MouseButton.LeftButton)
+        assert manager.overlay is None
+    shell.review_page.tabs.setCurrentIndex(1)
+    assert manager.show_current()
+    assert manager.active_key == 'review.weekly'
+    manager.overlay.skip_button.click()
+    assert client.state()['revision'] == before['revision']
+    assert (shell.data_dir / 'ui-onboarding.json').exists()
+
+    shell.navigate('dashboard')
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    report_dir = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(tmp_path)))
+    try:
+        for theme, size in [('light', 13), ('dark', 20)]:
+            apply_appearance(app_v2, {'theme': theme, 'font_size': size})
+            assert manager.show('dashboard')
+            QTest.qWait(200)
+            overlay = manager.overlay
+            assert overlay.rect().contains(overlay.card.geometry())
+            for button in (overlay.back_button, overlay.next_button, overlay.skip_button, overlay.disable_button):
+                option = QStyleOptionButton()
+                button.initStyleOption(option)
+                contents = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, button)
+                text_bounds = button.fontMetrics().boundingRect(button.text())
+                assert contents.height() >= text_bounds.height(), (theme, button.text(), contents, text_bounds)
+                assert contents.width() >= text_bounds.width(), (theme, button.text(), contents, text_bounds)
+            assert shell.grab().save(str(report_dir / f'onboarding-{theme}.png'))
+            overlay.skip_button.click()
+    finally:
+        apply_appearance(app_v2, shell._saved_appearance)
+
+
+def test_dialog_guides_preserve_unsaved_plan_and_settings(app_v2, shell):
+    from management.gui_workflows import PlanDialog, SettingsDialog
+    manager = shell.onboarding
+    client = Client(shell.data_dir, autostart=False)
+    before = client.state()['revision']
+    plan = PlanDialog(shell.bridge, shell)
+    try:
+        plan.open()
+        wait(app_v2, lambda: not shell.bridge.callbacks)
+        plan.source.setPlainText('尚未保存的安排依据')
+        assert manager.show_current()
+        assert manager.active_key == 'plan'
+        QTest.keyClick(manager.overlay.next_button, Qt.Key.Key_Escape)
+        assert plan.isVisible()
+        assert plan.source.toPlainText() == '尚未保存的安排依据'
+        assert plan.dirty
+    finally:
+        plan.dirty = False
+        plan.close()
+        plan.deleteLater()
+    settings = SettingsDialog(shell.bridge, shell.capabilities, shell.data_dir, shell)
+    try:
+        settings.open()
+        wait(app_v2, lambda: not shell.bridge.callbacks)
+        for index, key in enumerate(['habits', 'display', 'timetable', 'codex', 'data']):
+            settings.tabs.setCurrentIndex(index)
+            app_v2.processEvents()
+            assert manager.show_current()
+            assert manager.active_key == 'settings.' + key
+            if key == 'codex':
+                assert manager.overlay.steps[-1].target is settings.ai_save
+            manager.overlay.skip_button.click()
+        settings.tabs.setCurrentIndex(settings._provider_tab)
+        settings.ai_mode.setCurrentIndex(settings.ai_mode.findData('desktop_shared'))
+        assert manager.show_current()
+        assert manager.overlay.steps[-1].target is settings.codex_bridge_start
+        manager.overlay.skip_button.click()
+        assert settings.guide_button.isVisible()
+        assert client.state()['revision'] == before
+    finally:
+        settings.close()
+        settings.deleteLater()
+
+
+def test_first_visits_offer_guides_after_loading_and_direct_review_entry(app_v2, shell, monkeypatch):
+    monkeypatch.delenv('PERSONAL_MANAGEMENT_NO_ONBOARDING')
+    shell.hide()
+    app_v2.processEvents()
+    shell.show()
+    shell.activateWindow()
+    if app_v2.platformName() == 'offscreen':
+        # The Windows offscreen plugin can lose activation after hide/show.
+        # Model the user focusing this synthetic window without relaxing the
+        # production requirement that tutorials never steal another app's focus.
+        app_v2.setActiveWindow(shell)
+    manager = shell.onboarding
+    wait(app_v2, lambda: manager.active_key == 'dashboard')
+    manager.overlay.skip_button.click()
+    shell.navigate('today')
+    wait(app_v2, lambda: manager.active_key == 'today')
+    manager.overlay.skip_button.click()
+    shell.open_review(QDate.currentDate().toString('yyyy-MM-dd'))
+    wait(app_v2, lambda: manager.active_key == 'review.daily')
+    manager.overlay.skip_button.click()
+    shell.navigate('today')
+    QTest.qWait(500)
+    assert manager.overlay is None
 
 def test_three_sections_six_creation_types_and_removed_toolbar(app_v2, shell):
     assert list(shell.nav_buttons) == ["dashboard", "today", "projects", "reviews"]
