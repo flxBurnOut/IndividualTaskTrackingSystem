@@ -14,6 +14,8 @@
 /docs/*
 !/docs/使用说明.md
 !/docs/Beta开发与验收.md
+!/docs/开发交接与当前状态.md
+!/docs/手动优先与多助手接入方案.md
 !/docs/开发与扩展.md
 !/docs/Codex接口与后台推理.md
 !/docs/固定会话与原文件目录.md
