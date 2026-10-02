@@ -13,6 +13,7 @@
 # Public documentation only.
 /docs/*
 !/docs/使用说明.md
+!/docs/Beta开发与验收.md
 !/docs/开发与扩展.md
 !/docs/Codex接口与后台推理.md
 !/docs/固定会话与原文件目录.md
@@ -70,6 +71,7 @@ auth.json
 runtime.json
 ui-onboarding.json
 .ui-onboarding-*.tmp
+ui-plan-drafts/
 config.local.*
 settings.local.*
 .DS_Store

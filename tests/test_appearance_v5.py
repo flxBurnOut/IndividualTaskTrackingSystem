@@ -49,7 +49,7 @@ def cmd(core,name,p):
     return core.command(name,p,request_id=str(uuid.uuid4()),epoch=state['epoch'],expected_revision=state['revision'])
 
 
-@pytest.mark.parametrize('bad',[{'theme':'invented'},{'theme':[]},{'font_size':True},{'font_size':10},{'font_size':21},{'font_family':'font\nscript'},{'workspace_sidebar_collapsed':'false'},{'unknown':1}])
+@pytest.mark.parametrize('bad',[{'theme':'invented'},{'theme':[]},{'font_size':True},{'font_size':10},{'font_size':21},{'font_family':'font\nscript'},{'workspace_sidebar_collapsed':'false'},{'show_assistants':'false'},{'unknown':1}])
 def test_invalid_preferences_rejected(bad):
     with pytest.raises(BusinessError):normalize_appearance(bad)
 
@@ -59,8 +59,25 @@ def test_partial_settings_persist_and_keep_unrelated_fields(tmp_path):
     cmd(core,'settings',{'settings':{'appearance':{'theme':'dark','font_size':17,'font_family':'Portable Missing Family'}}})
     cmd(core,'settings',{'settings':{'appearance':{'workspace_sidebar_collapsed':True}}})
     saved=Core(core.root).query('settings')['settings']['appearance']
-    assert saved=={'theme':'dark','font_size':17,'font_family':'Portable Missing Family','workspace_sidebar_collapsed':True}
+    assert saved=={'theme':'dark','font_size':17,'font_family':'Portable Missing Family','workspace_sidebar_collapsed':True,'show_assistants':False}
     assert core.query('settings')['settings']['ai']['enabled'] is False
+
+
+def test_legacy_assistant_visibility_survives_unrelated_settings(tmp_path):
+    from management.appearance import assistants_visible
+    core = Core(tmp_path)
+    with core.store.connect() as connection:
+        settings = core.store.meta(connection, 'settings')
+        settings.pop('appearance', None)
+        settings['ai']['enabled'] = True
+        core.store.set_meta(connection, 'settings', settings)
+        connection.commit()
+    assert assistants_visible(core.query('settings')['settings'])
+    cmd(core, 'settings', {'settings': {'timezone':'Asia/Shanghai'}})
+    assert assistants_visible(core.query('settings')['settings'])
+    cmd(core, 'settings', {'settings': {'appearance': {'show_assistants':False}}})
+    assert not assistants_visible(core.query('settings')['settings'])
+    assert core.query('settings')['settings']['ai']['enabled'] is True
 
 
 def test_open_fields_theme_and_font_update_without_losing_edits(app):

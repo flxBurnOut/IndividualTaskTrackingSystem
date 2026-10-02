@@ -75,6 +75,41 @@ def test_no_plan_queries_never_create_questions_or_reviews(core):
     assert count(core, 'checkin') == count(core, 'review') == 0
 
 
+def test_actual_feedback_history_pages_all_original_facts_without_plan_metrics(core):
+    target = task(core, 'Unplanned task')
+    first = fact(core, target, {'completion': 'partial', 'actual_minutes': 12})
+    other = fact(core, target, {'attendance': 'absent'})
+    corrected = command(core, 'record_feedback', {'target_id': target['id'], 'business_date': '2030-01-01',
+        'dimensions': {'completion': 'done', 'actual_minutes': 25},
+        'source_text': 'Explicit correction; the full task is now complete.', 'supersedes_id': first['id']})['entity']
+    fact(core, target, {'completion': 'incomplete'}, day='2030-01-02')
+    command(core, 'delete_task', {'id': target['id'], 'version': target['version']})
+    before = core.query('state')
+    pages = [core.query('actual_feedback', date='2030-01-01', limit=1, offset=offset) for offset in range(3)]
+    assert all(page['total'] == 3 and len(page['items']) == 1 for page in pages)
+    assert [page['next_offset'] for page in pages] == [1, 2, None]
+    rows = [page['items'][0] for page in pages]
+    assert [row['id'] for row in rows] == [corrected['id'], other['id'], first['id']]
+    assert all(row['target_title'] == 'Unplanned task' and row['target_archived'] for row in rows)
+    assert rows[0]['supersedes_id'] == first['id']
+    assert rows[2]['dimensions'] == first['data']['dimensions']
+    assert rows[2]['source_text'] == first['data']['source_text'] and rows[2]['actual_minutes'] == 12
+    assert rows[1]['actual_minutes'] is None and 'completion' not in rows[1]['dimensions']
+    assert not daily(core)['has_plan'] and daily(core)['summary']['total'] == 0
+    assert weekly(core)['coverage']['confirmed_completion_rate'] is None
+    assert count(core, 'plan') == count(core, 'review') == 0
+    assert core.query('state') == before
+
+
+@pytest.mark.parametrize('params', [{}, {'date': 'invalid'}, {'date': '2030-01-01', 'limit': 0},
+                                  {'date': '2030-01-01', 'limit': 101}, {'date': '2030-01-01', 'offset': -1},
+                                  {'date': '2030-01-01', 'offset': True}])
+def test_actual_feedback_history_requires_exact_date_and_bounded_paging(core, params):
+    with pytest.raises(BusinessError) as error:
+        core.query('actual_feedback', **params)
+    assert error.value.code == 'validation'
+
+
 def test_latest_valid_plan_uses_rowid_for_equal_timestamps(core, monkeypatch):
     import management.core as module
     a, b = task(core, 'Old target'), task(core, 'Current target')
@@ -175,10 +210,12 @@ def test_replaced_plan_and_wrong_version_are_rejected(core):
     assert count(core, 'feedback') == 0
 
 
-def test_submit_without_plan_requires_codex_and_writes_nothing(core):
+def test_submit_without_plan_explains_manual_feedback_and_writes_nothing(core):
     with pytest.raises(BusinessError) as error:
         mutate(core, submit_daily, {'date': '2030-01-01', 'plan_id': 'none', 'plan_version': 1, 'answers': []})
     assert error.value.code == 'review_no_plan' and error.value.details['needs_codex']
+    assert '记录实际情况' in error.value.message and '文字小结' in error.value.message
+    assert 'Codex' not in error.value.message
     assert core.query('list')['total'] == 0
 
 

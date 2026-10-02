@@ -25,6 +25,7 @@ TYPE_LABELS = {
     "notification": "通知", "checkin": "完成度复核", "inbox": "收件箱",
     "research_run": "研究运行", "experiment": "实验", "collection_case": "采集 Case",
     "knowledge": "知识主题", "error": "错题", "workflow": "流程",
+    "assessment": "评分项目",
 }
 STATUS_LABELS = {
     "active": "进行中", "pending": "待处理", "todo": "待开始", "done": "已完成",
@@ -433,6 +434,7 @@ class EntityForm(FormDialog):
         self.bridge = bridge
         self.epoch = bridge.epoch
         self.entity = entity
+        self.saving = False
         self.initial_payload = initial_payload or {}
         self.workflow = workflow
         self.on_saved = on_saved
@@ -588,6 +590,8 @@ class EntityForm(FormDialog):
         current = self.entity.get("data", {}) if self.entity else self.initial_payload.get("data", {})
         profile = FORM_PROFILES.get(self.type_box.currentData(), {})
         primary = profile.get('fields', list(raw_fields))
+        if current.get('source_text') and 'source_text' not in primary:
+            primary = [*primary, 'source_text']
         self.primary_field_names = [key for key in primary if key in raw_fields]
         essentials = set(self.primary_field_names)
         raw_fields = {key: raw_fields[key] for key in [*self.primary_field_names, *(k for k in raw_fields if k not in essentials)]}
@@ -741,6 +745,8 @@ class EntityForm(FormDialog):
             self.parent_button.setText('独立任务（可选择归属）' if self.type_box.currentData() == 'task' else '选择归属…')
 
     def save(self):
+        if self.saving:
+            return
         title = self.title_edit.text().strip()
         if not title:
             self.error('请填写' + FORM_PROFILES.get(self.type_box.currentData(), {}).get('title', '名称') + '。')
@@ -766,6 +772,7 @@ class EntityForm(FormDialog):
         except (ValueError, TypeError) as exc:
             self.error(str(exc))
             return
+        self.saving = True
         self.busy()
         if self.entity:
             payload = {"id": self.entity["id"], "version": self.entity["version"], "patch": {"title": title, "status": self.status_box.currentData(), "data": data}}
@@ -774,6 +781,7 @@ class EntityForm(FormDialog):
             payload = {"type": self.type_box.currentData(), "title": title, "status": self.status_box.currentData(), "parent_id": self.parent_id, "data": data}
             command = "create"
         def saved(result):
+            self.saving = False
             if self.on_saved:
                 self.on_saved(result)
             self.accept()
@@ -781,6 +789,20 @@ class EntityForm(FormDialog):
             payload = {"module_id": self.workflow["module_id"], "workflow_id": self.workflow["id"], "input": payload}
             command = "run_workflow"
         self.bridge.command(command, payload, saved, self.error, epoch=self.epoch)
+
+    def error(self, error):
+        self.saving = False
+        super().error(error)
+
+    def reject(self):
+        if not self.saving:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.saving:
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
 
 class FeedbackDialog(FormDialog):

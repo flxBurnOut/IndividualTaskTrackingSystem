@@ -79,3 +79,56 @@ def test_late_overview_does_not_touch_destroyed_panel(app):
     bridge=ControlledBridge();panel=HabitsPanel(bridge,QWidget());request=bridge.take('habits_overview')
     panel.deleteLater();QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
     request['callback']({})
+
+
+@pytest.mark.parametrize('kind', ['behavior', 'capacity', 'protected_time', 'warning', 'temporary'])
+def test_manual_rule_type_creates_correct_structured_fields_without_assistant(app, tmp_path, kind):
+    core=Core(tmp_path);bridge=QueuedCoreBridge(core);panel=HabitsPanel(bridge,QWidget());panel.show()
+    editor=None
+    try:
+        wait(app,lambda:bridge.pending==0)
+        panel.set_assistants_visible(False)
+        assert panel.codex_preparation.isHidden() and panel.discuss_button.isHidden()
+        assert panel.new_rule_button.isVisible() and panel.prep_toggle.isVisible()
+        panel.new_kind.setCurrentIndex(panel.new_kind.findData(kind))
+        panel.new_rule_button.click();editor=panel.dialogs[0]
+        assert editor.kind==kind
+        editor.title.setText('Manual '+kind)
+        if kind in {'behavior','temporary'}:editor.policy.setPlainText('Retain recovery time.')
+        elif kind=='capacity':editor.fields['minutes'].setValue(40)
+        elif kind=='protected_time':
+            editor.fields['start'].setText('23:00');editor.fields['end'].setText('07:00')
+        else:editor.fields['days_before'].setValue(3)
+        editor.save();editor.save();wait(app,lambda:bridge.pending==0)
+        result=core.query('list',type='rule')
+        assert result['total']==1
+        data=result['items'][0]['data']
+        assert data['rule_kind']==kind
+        if kind=='capacity':assert core.query('plan_context',date='2030-01-02')['capacity_minutes']==40
+        elif kind=='protected_time':
+            spans=core.query('plan_context',date='2030-01-02')['protected_times']
+            assert [(p['start_minute'],p['end_minute']) for p in spans]==[(0,420),(1380,1440)]
+        elif kind=='warning':assert data['days_before']==3
+        else:assert data['policy']=='Retain recovery time.'
+        assert core.query('list',type='task')['total']==0
+        assert all(name not in {'create_ai_job','send_message'} for name,*_ in bridge.commands)
+    finally:
+        if editor:
+            editor.dirty=False;editor.close();editor.deleteLater()
+        panel.close();panel.deleteLater();app.processEvents()
+
+
+def test_new_capacity_requires_known_minutes_before_enabling_and_preserves_input(app):
+    bridge=ControlledBridge();editor=HabitEditor(bridge,kind='capacity');editor.show()
+    try:
+        editor.title.setText('Still unknown');editor.save()
+        assert bridge.commands==[] and '尚未明确' in editor.note.text()
+        assert editor.title.text()=='Still unknown'
+        editor.enabled.setChecked(False);editor.save()
+        call=bridge.commands[-1]
+        assert call['payload']['data']['minutes'] is None
+        assert call['payload']['data']['enabled'] is False
+        assert not editor.title.isEnabled()
+        call['error']({'message':'Synthetic failure'})
+        assert editor.title.isEnabled() and editor.title.text()=='Still unknown'
+    finally:editor.saving=editor.dirty=False;editor.close();editor.deleteLater();app.processEvents()

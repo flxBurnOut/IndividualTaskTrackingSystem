@@ -37,7 +37,7 @@ def main():
     from license_notices import write_notices
     write_notices(package)
     files = [p for p in package.rglob('*') if p.is_file()]
-    forbidden = {'.analysis', '.test-output', '.venv', 'database.sqlite3', 'runtime.json', 'auth.json', 'restore_pending.json', 'update_pending.json', 'upgrade-state.json', 'upgrade-backups', 'schema-upgrade.lock', 'startup_failure.json', 'gui.lock', 'tray.lock', 'tray-status.json', 'tray-status.json.new', 'ui-onboarding.json'}
+    forbidden = {'.analysis', '.test-output', '.venv', 'database.sqlite3', 'runtime.json', 'auth.json', 'restore_pending.json', 'update_pending.json', 'upgrade-state.json', 'upgrade-backups', 'schema-upgrade.lock', 'startup_failure.json', 'gui.lock', 'tray.lock', 'tray-status.json', 'tray-status.json.new', 'ui-onboarding.json', 'ui-plan-drafts'}
     for path in files:
         if forbidden.intersection(path.relative_to(package).parts):
             raise RuntimeError('Private/runtime data present in release: ' + str(path))

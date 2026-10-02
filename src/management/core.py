@@ -17,7 +17,7 @@ from .ai_commands import CANDIDATE_COMMANDS
 from .storage import Store, encode, new_id, now
 
 
-COMMANDS = ["attach_conversation", "correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
+COMMANDS = ["create_task_batch", "split_task", "attach_conversation", "correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
             "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "connect_codex", "install_module", "disable_module",
             "create_job", "cancel_job", "resume_context_operation", "apply_proposal", "promote_checklist", "run_workflow", "undo",
             "import_asset", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
@@ -146,6 +146,9 @@ class Core:
             return {**result, **state}
 
     def _query(self, c, name, p):
+        if name == 'preview_task_batch':
+            from .task_batches import preview
+            return preview(self, c, p)
         if name == 'dashboard':
             from .dashboard import overview
             return overview(self,c,p)
@@ -176,12 +179,18 @@ class Core:
         if name in {'daily_review', 'weekly_review'}:
             from .reviews import query_daily, query_weekly
             return (query_daily if name == 'daily_review' else query_weekly)(self,c,p)
+        if name == 'actual_feedback':
+            from .reviews import query_actual_feedback
+            return query_actual_feedback(self, c, p)
         if name == 'review_preferences':
             from .workspace import review_preferences
             return review_preferences(self,c)
         if name == 'workspace_tasks':
             from .task_views import workspace_tasks
             return workspace_tasks(self,c,p)
+        if name == 'task_pool':
+            from .task_views import task_pool
+            return task_pool(self,c,p)
         if name == 'object_workspace':
             from .workspace import object_workspace
             return object_workspace(self,c,p)
@@ -271,6 +280,9 @@ class Core:
                     "notifications": notices, "counts": context["coverage"], "unknowns": context["unknowns"]}
         if name == "review":
             return self.review(c, p["start"], p["end"])
+        if name == 'assistant_activity':
+            counts = {row['status']: row['total'] for row in c.execute("SELECT status,count(*) AS total FROM jobs WHERE status IN ('queued','running','awaiting_review') GROUP BY status")}
+            return {'active': counts.get('queued', 0) + counts.get('running', 0), 'awaiting_review': counts.get('awaiting_review', 0)}
         if name == "jobs":
             limit = max(1, min(100, int(p.get('limit', 30))))
             offset = max(0, int(p.get('offset', 0)))
@@ -514,6 +526,9 @@ class Core:
         return None
 
     def _dispatch(self, c, name, p, rid, prepared=None):
+        if name in {'create_task_batch', 'split_task'}:
+            from .task_batches import apply
+            return apply(self, c, p, rid, mode='split' if name == 'split_task' else 'create')
         if name == 'connect_codex':
             settings = self.store.meta(c, 'settings')
             settings['codex_project'] = copy.deepcopy(prepared['project'])
@@ -703,6 +718,8 @@ class Core:
             value.setdefault("favorites", [])
             from .appearance import DEFAULT_APPEARANCE, normalize_appearance
             value.setdefault("appearance", copy.deepcopy(DEFAULT_APPEARANCE))
+            if 'show_assistants' not in old.get('appearance', {}):
+                value['appearance']['show_assistants'] = bool(old.get('ai', {}).get('enabled'))
             value.setdefault("charts", {"weekly_style":"columns"})
             from .timetable import normalize_timetable_defaults
             value.setdefault("timetable_defaults", normalize_timetable_defaults({}))

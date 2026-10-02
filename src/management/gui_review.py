@@ -7,11 +7,291 @@ import json
 
 from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtWidgets import (
-    QDateEdit, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QDateEdit, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QTextEdit,
     QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 from .gui_charts import CoverageChart, ORIGINAL_LABELS, WeekDaysChart
 from .gui_calendar import install_calendar
+from .gui_forms import EntityPicker, FeedbackDialog, FormDialog, FIELD_LABELS
+
+
+class ActualFeedbackDialog(FeedbackDialog):
+    """The existing feedback command with a dated entry and draft protection."""
+    def __init__(self, bridge, target, date, parent=None, on_saved=None):
+        self.saving = self.dirty = False
+        def saved(receipt):
+            self.saving = self.dirty = False
+            if on_saved:
+                on_saved(receipt)
+        super().__init__(bridge, target, parent, on_saved=saved)
+        self.date.setDate(QDate.fromString(date, 'yyyy-MM-dd'))
+        self.date.dateChanged.connect(self._changed)
+        self.source.textChanged.connect(self._changed)
+        for box in self.editors.values():
+            box.currentIndexChanged.connect(self._changed)
+        self.minutes.enabled.toggled.connect(self._changed)
+        self.minutes.editor.valueChanged.connect(self._changed)
+
+    def _changed(self, *_):
+        self.dirty = True
+
+    def save(self):
+        if not self.saving:
+            super().save()
+
+    def busy(self):
+        self.saving = True
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        super().busy()
+
+    def error(self, error):
+        self.saving = False
+        super().error(error)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+
+    def reject(self):
+        if self.saving:
+            return
+        if self.dirty and QMessageBox.question(self, '尚未保存', '放弃这次尚未保存的执行反馈？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.saving:
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+
+class ActualFeedbackHistoryDialog(QDialog):
+    """Read back all dated statements, including superseded ones, without mutations."""
+    VALUE_LABELS = {
+        'done': '已完成', 'incomplete': '未完成', 'not_started': '未开始', 'partial': '部分完成',
+        'blocked': '受阻', 'attended': '已到场', 'absent': '未到场', 'cancelled': '已取消',
+        'asynchronous': '异步替代', 'online_replacement': '在线替代', 'not_viewed': '未观看',
+        'viewed': '已看完', 'not_submitted': '未提交', 'submitted': '已提交', 'accepted': '已验收',
+        'rejected': '被退回', 'not_tested': '尚未测验', 'needs_review': '需要复习',
+        'verified': '已验证掌握', 'unknown': '待确认',
+    }
+
+    def __init__(self, bridge, date, parent=None):
+        super().__init__(parent)
+        self.bridge, self.date = bridge, date
+        self.offset, self.next_offset, self.generation = 0, None, 0
+        self.closed = False
+        self.finished.connect(lambda *_: setattr(self, 'closed', True))
+        self.destroyed.connect(lambda *_: setattr(self, 'closed', True))
+        self.setWindowTitle('已保存实际记录 · ' + date)
+        self.resize(660, 630)
+        layout = QVBoxLayout(self)
+        heading = QLabel(self.windowTitle())
+        heading.setObjectName('DialogHeading')
+        layout.addWidget(heading)
+        hint = QLabel('按保存先后展示这一天的原始反馈，更正前的记录也保留。未计划事项不会加入原计划完成率；每条历史记录不一定代表当前状态。')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.history = QListWidget()
+        self.history.currentItemChanged.connect(self.show_record)
+        layout.addWidget(self.history, 1)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        layout.addWidget(self.details, 2)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        actions = QHBoxLayout()
+        self.previous = QPushButton('上一页')
+        self.previous.clicked.connect(lambda: self.load(max(0, self.offset - 30)))
+        self.next = QPushButton('下一页')
+        self.next.clicked.connect(lambda: self.load(self.next_offset))
+        self.refresh = QPushButton('刷新')
+        self.refresh.clicked.connect(lambda: self.load(0))
+        for button in (self.previous, self.next, self.refresh):
+            actions.addWidget(button)
+        actions.addStretch()
+        close = QPushButton('关闭')
+        close.clicked.connect(self.reject)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        self.load(0)
+
+    @classmethod
+    def dimension_text(cls, dimensions):
+        return '\n'.join(FIELD_LABELS.get(key, key) + '：' +
+                         (str(value) + ' 分钟' if key == 'actual_minutes' else
+                          '部分观看' if key == 'viewing' and value == 'partial' else
+                          cls.VALUE_LABELS.get(str(value), str(value)))
+                         for key, value in dimensions.items())
+
+    def show_record(self, item, previous=None):
+        if item is None:
+            self.details.clear()
+            return
+        row = item.data(Qt.ItemDataRole.UserRole)
+        note = '\n原事项已删除，历史反馈仍保留。' if row.get('target_archived') else ''
+        if not row.get('target_available', True):
+            note += '\n原事项暂不可用，以下为原始反馈。'
+        if row.get('supersedes_id'):
+            note += '\n这是一条更正记录，原反馈仍保留。'
+        text = row['target_title'] + '\n归属日期：' + row['business_date'] + note
+        text += '\n\n' + self.dimension_text(row['dimensions'])
+        text += '\n\n原始反馈：\n' + row['source_text']
+        self.details.setPlainText(text)
+
+    def load(self, offset):
+        if offset is None or self.closed:
+            return
+        self.generation += 1
+        generation = self.generation
+        self.previous.setEnabled(False)
+        self.next.setEnabled(False)
+        self.status.setText('正在读取已保存的实际记录…')
+        def loaded(result):
+            if self.closed or generation != self.generation or result.get('date') != self.date:
+                return
+            self.offset, self.next_offset = offset, result.get('next_offset')
+            self.history.clear()
+            for row in result.get('items', []):
+                preview = self.dimension_text(row['dimensions']).replace('\n', ' · ')
+                item = QListWidgetItem(row['target_title'] + '\n' + preview)
+                item.setData(Qt.ItemDataRole.UserRole, row)
+                self.history.addItem(item)
+            self.previous.setEnabled(self.offset > 0)
+            self.next.setEnabled(self.next_offset is not None)
+            total = result.get('total', self.history.count())
+            self.status.setText(f'共 {total} 条原始反馈 · 当前第 {offset + 1}–{offset + self.history.count()} 条' if total else '这一天尚未保存实际记录。可回到复盘页选择“记录实际情况”。')
+            if self.history.count():
+                self.history.setCurrentRow(0)
+        def failed(error):
+            if not self.closed and generation == self.generation:
+                self.status.setText('读取失败，已有记录显示保留。请点击刷新重试。' + ReviewPage._error_text(error))
+                self.previous.setEnabled(self.offset > 0)
+                self.next.setEnabled(self.next_offset is not None)
+        self.bridge.query('actual_feedback', loaded, failed, date=self.date, limit=30, offset=offset)
+
+
+class ReviewNotesDialog(FormDialog):
+    """Append-only dated notes; never invent a plan or completion measurements."""
+    def __init__(self, bridge, date, parent=None, on_saved=None):
+        super().__init__('文字小结 · ' + date, parent)
+        self.bridge, self.date, self.on_saved = bridge, date, on_saved
+        self.epoch = bridge.epoch
+        self.saving = self.dirty = self.dead = False
+        self.generation, self.offset, self.next_offset = 0, 0, None
+        self.destroyed.connect(lambda *_: setattr(self, 'dead', True))
+        hint = QLabel('写下当天发生的事情、感受或下一步想法。文字小结不会自动修改任务状态、补造计划或推算完成率。')
+        hint.setWordWrap(True)
+        self.body_layout.addWidget(hint)
+        self.text = QTextEdit()
+        self.text.setAcceptRichText(False)
+        self.text.setPlaceholderText('今天实际发生了什么？有哪些需要以后调整的地方？')
+        self.text.textChanged.connect(self._changed)
+        self.body_layout.addWidget(self.text)
+        self.body_layout.addWidget(QLabel('这一天已保存的小结（每次保存保留为独立记录）'))
+        self.history = QListWidget()
+        self.history.setMaximumHeight(120)
+        self.history.currentItemChanged.connect(self._show_note)
+        self.body_layout.addWidget(self.history)
+        self.saved_text = QTextEdit()
+        self.saved_text.setReadOnly(True)
+        self.saved_text.setMaximumHeight(130)
+        self.body_layout.addWidget(self.saved_text)
+        self.history_hint = QLabel()
+        self.history_hint.setWordWrap(True)
+        self.body_layout.addWidget(self.history_hint)
+        self.more = QPushButton('继续查找较早的小结')
+        self.more.clicked.connect(self.load_more)
+        self.body_layout.addWidget(self.more)
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('保存这条小结')
+        self.buttons.accepted.connect(self.save)
+        self.load()
+
+    def _changed(self):
+        self.dirty = True
+
+    def _show_note(self, item, previous=None):
+        self.saved_text.setPlainText(item.data(Qt.ItemDataRole.UserRole) if item else '')
+
+    def load_more(self):
+        if self.next_offset is not None:
+            self.offset = self.next_offset
+            self.load()
+
+    def load(self):
+        self.generation += 1
+        generation = self.generation
+        self.more.setEnabled(False)
+        def loaded(result):
+            if self.dead or generation != self.generation:
+                return
+            for entity in result.get('items', []):
+                data = entity.get('data') or {}
+                if data.get('start') != self.date or data.get('end') != self.date or not data.get('content'):
+                    continue
+                preview = str(data['content']).splitlines()[0][:70]
+                item = QListWidgetItem(entity['title'] + '\n' + preview)
+                item.setData(Qt.ItemDataRole.UserRole, str(data['content']))
+                self.history.addItem(item)
+            self.next_offset = result.get('next_offset')
+            self.more.setText('继续查找较早的小结')
+            self.more.setVisible(self.next_offset is not None)
+            self.more.setEnabled(self.next_offset is not None)
+            self.history_hint.setText(f'已找到 {self.history.count()} 条当天小结。' + ('仍有较早记录可继续查找。' if self.next_offset is not None else ''))
+            if self.history.count() and self.history.currentRow() < 0:
+                self.history.setCurrentRow(0)
+        def failed(error):
+            if self.dead or generation != self.generation:
+                return
+            self.history_hint.setText('历史小结读取失败：' + ReviewPage._error_text(error))
+            self.more.setText('重试读取历史小结')
+            self.next_offset = self.offset
+            self.more.setEnabled(True)
+            self.more.show()
+        self.bridge.query('list', loaded, failed, type='review', search=self.date, limit=30, offset=self.offset)
+
+    def save(self):
+        if self.saving:
+            return
+        text = self.text.toPlainText().strip()
+        if not text:
+            self.error('请先填写当天的小结。')
+            return
+        self.saving = True
+        self.busy()
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        def saved(receipt):
+            if self.dead:
+                return
+            self.saving = self.dirty = False
+            self.accept()
+            if self.on_saved:
+                self.on_saved(receipt)
+        def failed(error):
+            if self.dead:
+                return
+            self.saving = False
+            self.error(error)
+            self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+        self.bridge.command('save_review', {'start': self.date, 'end': self.date,
+            'title': self.date + ' · 文字小结', 'text': text}, saved, failed, epoch=self.epoch)
+
+    def reject(self):
+        if self.saving:
+            return
+        if self.dirty and QMessageBox.question(self, '尚未保存', '放弃这条尚未保存的文字小结？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.saving:
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
 
 class ReviewPage(QWidget):
@@ -28,6 +308,8 @@ class ReviewPage(QWidget):
         self._pending = False
         self.item_buttons, self.item_labels = {}, {}
         self.daily_data, self.weekly_data = None, None
+        self.dialogs = []
+        self._assistants_visible = True
         self._build()
 
     def _build(self):
@@ -70,7 +352,19 @@ class ReviewPage(QWidget):
         self.notice.setWordWrap(True)
         self.notice.setObjectName('Notice')
         day_layout.addWidget(self.notice)
-        self.codex_button = QPushButton('到 Codex 按实际情况复盘')
+        manual_actions = QHBoxLayout()
+        self.feedback_button = QPushButton('记录实际情况')
+        self.feedback_button.setObjectName('Primary')
+        self.feedback_button.clicked.connect(self._record_actual)
+        manual_actions.addWidget(self.feedback_button)
+        self.notes_button = QPushButton('写小结 / 查看已保存小结')
+        self.notes_button.clicked.connect(self._open_notes)
+        manual_actions.addWidget(self.notes_button)
+        day_layout.addLayout(manual_actions)
+        self.feedback_history_button = QPushButton('查看已保存实际记录')
+        self.feedback_history_button.clicked.connect(self._open_actual_history)
+        day_layout.addWidget(self.feedback_history_button)
+        self.codex_button = QPushButton('请助手协助复盘')
         self.codex_button.clicked.connect(self._ask_codex)
         day_layout.addWidget(self.codex_button)
         self.daily_chart = CoverageChart()
@@ -133,6 +427,40 @@ class ReviewPage(QWidget):
 
     def set_weekly_style(self, style):
         self.week_days.set_style(style)
+
+    def set_assistants_visible(self, visible):
+        self._assistants_visible = bool(visible)
+        self._render_daily()
+
+    def _keep_dialog(self, dialog):
+        self.dialogs.append(dialog)
+        dialog.finished.connect(lambda *_: self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+        dialog.open()
+        return dialog
+
+    def _manual_saved(self, receipt):
+        self.message.setText('已保存。可通过“查看已保存实际记录”回读反馈，或通过“写小结 / 查看已保存小结”回读小结。')
+        self.message.show()
+        self.refresh()
+        if self.on_changed:
+            self.on_changed(receipt)
+
+    def _record_actual(self):
+        day = self._date
+        picker = EntityPicker(self.bridge, self, allowed_types=['task', 'event', 'milestone', 'checklist', 'assessment'])
+        picker.setWindowTitle('选择实际执行的事项 · ' + day)
+        picker.heading.setText('选择要记录实际情况的任务或日程')
+        def chosen():
+            if picker.selected:
+                self._keep_dialog(ActualFeedbackDialog(self.bridge, picker.selected, day, self, self._manual_saved))
+        picker.accepted.connect(chosen)
+        self._keep_dialog(picker)
+
+    def _open_notes(self):
+        self._keep_dialog(ReviewNotesDialog(self.bridge, self._date, self, self._manual_saved))
+
+    def _open_actual_history(self):
+        self._keep_dialog(ActualFeedbackHistoryDialog(self.bridge, self._date, self))
 
     def set_date(self, dateISO):
         parsed = QDate.fromString(str(dateISO), 'yyyy-MM-dd')
@@ -264,7 +592,7 @@ class ReviewPage(QWidget):
         known = value is not None
         has_plan = bool(value and value.get('can_review',value.get('has_plan')))
         self.notice.setVisible(known and not has_plan)
-        self.codex_button.setVisible(known and not has_plan)
+        self.codex_button.setVisible(self._assistants_visible and known and not has_plan)
         self.codex_button.setEnabled(self.on_codex is not None)
         self.confirm_button.setVisible(has_plan)
         self.daily_chart.setVisible(has_plan)
@@ -273,7 +601,7 @@ class ReviewPage(QWidget):
             self.daily_heading.setText(self._date + ' · 正在读取计划')
         elif not has_plan:
             self.daily_heading.setText(self._date + ' · 缺少每日计划')
-            self.notice.setText('这一天没有每日计划，无法按计划逐项复核。请到 Codex 根据实际发生的事情复盘；这里不会自动生成问卷或把缺计划记为失败。')
+            self.notice.setText('这一天没有每日计划，无法按计划逐项复核。仍可选择任务或日程记录实际情况，也可以保存文字小结；不会补造计划或把缺计划记为失败。')
         else:
             plan = value.get('plan') or {}
             self.daily_heading.setText(self._date + ' · ' + (plan.get('title') or '当天固定安排'))

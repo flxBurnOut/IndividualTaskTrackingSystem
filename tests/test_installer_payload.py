@@ -26,6 +26,7 @@ SPEC.loader.exec_module(BUILD)
     "tray-status.json",
     "tray-status.json.new",
     "ui-onboarding.json",
+    "ui-plan-drafts/synthetic-draft.json",
     "_internal/upgrade-backups/personal-attachment.txt",
 ])
 def test_user_upgrade_state_is_rejected_before_installer_compilation(tmp_path, monkeypatch, private_path):

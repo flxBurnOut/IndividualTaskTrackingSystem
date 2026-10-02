@@ -105,6 +105,7 @@ def object_workspace(core,c,p):
     limit=max(1,min(100,int(p.get('limit',50))))
     separate=bool(p.get('separate_tasks',False))
     condition="parent_id=? AND archived=0 AND type!='file_reference'"+(" AND type!='task'" if separate else '')
+    if entity['type']=='course': condition += " AND type!='assessment'"
     child_total=c.execute('SELECT count(*) FROM entities WHERE '+condition,(entity['id'],)).fetchone()[0]
     child_rows=c.execute('SELECT * FROM entities WHERE '+condition+' ORDER BY updated_at DESC,id LIMIT ? OFFSET ?',(entity['id'],limit,offset))
     children={'items':[presenter.entity(core.store.entity(r)) for r in child_rows],'total':child_total,'next_offset':offset+limit if offset+limit<child_total else None}
@@ -131,12 +132,25 @@ def object_workspace(core,c,p):
     course_info=None
     if entity['type']=='course':
         groups={}
+        course_limit=max(1,min(100,int(p.get('course_limit',50))))
         for kind,key,where in [('assessment','assessments','parent_id=?'),('event','events',"json_extract(data,'$.owner_id')=?")]:
+            group_offset=max(0,int(p.get(key+'_offset',0)))
             groups[key+'_total']=c.execute("SELECT count(*) FROM entities WHERE type=? AND archived=0 AND "+where,(kind,entity['id'])).fetchone()[0]
-            groups[key]=[core.store.entity(row) for row in c.execute("SELECT * FROM entities WHERE type=? AND archived=0 AND "+where+" ORDER BY title,id LIMIT 100",(kind,entity['id']))]
-        groups['complete']=groups['assessments_total']<=100 and groups['events_total']<=100
+            groups[key]=[core.store.entity(row) for row in c.execute("SELECT * FROM entities WHERE type=? AND archived=0 AND "+where+" ORDER BY title,id LIMIT ? OFFSET ?",(kind,entity['id'],course_limit,group_offset))]
+            groups[key+'_offset']=group_offset
+            groups[key+'_next_offset']=group_offset+course_limit if group_offset+course_limit<groups[key+'_total'] else None
+        groups['complete']=all(groups[key+'_offset']==0 and groups[key+'_next_offset'] is None for key in ('assessments','events'))
         course_info=groups
-    return {'entity':entity,'tasks_separated':separate,'course_info':course_info,'children':[x for x in children['items'] if x['type']!='file_reference'],'children_total':children['total'],'next_offset':children['next_offset'],'files':files,'files_offset':files_offset,'files_next_offset':files_next_offset,'files_has_more':files_next_offset is not None,'summary':{'total_tasks':total,'done_tasks':done,'incomplete_tasks':incomplete,'unknown_tasks':unknown,'active_tasks':total-done,'coverage_label':'任务条目完成情况'},'task_states':task_states}
+    dependencies=None
+    if entity['type']=='task':
+        dependency_offset=max(0,int(p.get('dependencies_offset',0)))
+        dependency_limit=max(1,min(100,int(p.get('dependencies_limit',50))))
+        where="l.kind='depends_on' AND (l.source_id=? OR l.target_id=?)"
+        args=(entity['id'],entity['id'])
+        dependency_total=c.execute('SELECT count(*) FROM links l WHERE '+where,args).fetchone()[0]
+        dependency_rows=c.execute('SELECT l.*,a.title AS source_title,b.title AS target_title FROM links l JOIN entities a ON a.id=l.source_id JOIN entities b ON b.id=l.target_id WHERE '+where+' ORDER BY l.id LIMIT ? OFFSET ?',(*args,dependency_limit,dependency_offset))
+        dependencies={'items':[dict(row) for row in dependency_rows],'total':dependency_total,'offset':dependency_offset,'next_offset':dependency_offset+dependency_limit if dependency_offset+dependency_limit<dependency_total else None}
+    return {'entity':entity,'tasks_separated':separate,'course_info':course_info,'dependencies':dependencies,'children':[x for x in children['items'] if x['type']!='file_reference'],'children_total':children['total'],'offset':offset,'next_offset':children['next_offset'],'files':files,'files_offset':files_offset,'files_next_offset':files_next_offset,'files_has_more':files_next_offset is not None,'summary':{'total_tasks':total,'done_tasks':done,'incomplete_tasks':incomplete,'unknown_tasks':unknown,'active_tasks':total-done,'coverage_label':'任务条目完成情况'},'task_states':task_states}
 
 
 def open_resource(core,p):

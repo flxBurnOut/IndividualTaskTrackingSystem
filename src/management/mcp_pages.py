@@ -1,4 +1,4 @@
-"""Stateless, byte-bounded transport for four ordinary business read views.
+"""Stateless, byte-bounded transport for ordinary business read views.
 
 This does not change a query into a different context collection. Every fragment
 comes from the exact original query, including its defaults, explicit nulls,
@@ -18,14 +18,14 @@ from .schemas import BusinessError
 from .storage import encode
 
 
-PageQuery = Literal['get', 'receipt', 'list', 'source_content']
-PAGE_QUERIES = frozenset({'get', 'receipt', 'list', 'source_content'})
+PageQuery = Literal['get', 'receipt', 'list', 'source_content', 'task_pool', 'actual_feedback', 'preview_task_batch']
+PAGE_QUERIES = frozenset({'get', 'receipt', 'list', 'source_content', 'task_pool', 'actual_feedback', 'preview_task_batch'})
 FORMAT = 'business-query-json/1'
 
 
 def validate_request(name, params, offset, version):
     if name not in PAGE_QUERIES or not isinstance(params, dict):
-        raise BusinessError('business_page_query', '此续读入口只支持对象、回执、记录列表和资料正文。')
+        raise BusinessError('business_page_query', '此续读入口支持对象、回执、记录列表、资料正文、任务池、实际反馈和批量任务预览。')
     if type(offset) is not int or offset < 0:
         raise BusinessError('business_page_cursor', '片段位置必须是返回的非负整数。')
     if version is not None and (not isinstance(version, str) or re.fullmatch(r'[0-9a-f]{64}', version) is None):

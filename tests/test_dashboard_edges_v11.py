@@ -60,17 +60,20 @@ def test_past_warning_newest_request_wins_and_collapsing_invalidates(app):
     finally:page.close();page.deleteLater();app.processEvents()
 
 
-def test_dashboard_refreshes_on_clock_minute_without_business_changes(app,monkeypatch):
+@pytest.mark.parametrize('section', ['dashboard', 'tasks'])
+def test_dashboard_refreshes_on_clock_minute_without_business_changes(app,monkeypatch,section):
     import management.gui as gui
-    bridge=ControlledBridge();calls=[];date=QDate(2030,1,2);clock=[date,101]
+    bridge=ControlledBridge();calls=[];activity_calls=[];date=QDate(2030,1,2);clock=[date,101]
     monkeypatch.setattr(gui,'clock_snapshot',lambda zone:tuple(clock))
     host=SimpleNamespace(closed=False,poll_pending=False,type_map={'task':{}},_business_timezone='Asia/Shanghai',_calendar_day=date,_clock_minute=100,
-        today_page=SimpleNamespace(date=QDateEdit(date)),section='dashboard',bridge=bridge,change_cursor=0,refresh=lambda:calls.append('refresh'),load_display_preferences=lambda:None,show_error=lambda e:None)
+        today_page=SimpleNamespace(date=QDateEdit(date)),section=section,bridge=bridge,change_cursor=0,refresh=lambda:calls.append('refresh'),
+        refresh_assistant_activity=lambda:activity_calls.append('activity'),load_display_preferences=lambda:None,show_error=lambda e:None)
     MainWindow.poll_changes(host);bridge.deliver('changes',{'items':[],'cursor':0});assert calls==['refresh']
     MainWindow.poll_changes(host);bridge.deliver('changes',{'items':[],'cursor':0});assert calls==['refresh']
     clock[0]=date.addDays(1);clock[1]=102
     MainWindow.poll_changes(host);bridge.deliver('changes',{'items':[],'cursor':0})
     assert host.today_page.date.date()==date.addDays(1) and calls==['refresh','refresh']
+    assert activity_calls==['activity','activity'] and bridge.commands==[]
     host.today_page.date.deleteLater();app.processEvents()
 
 

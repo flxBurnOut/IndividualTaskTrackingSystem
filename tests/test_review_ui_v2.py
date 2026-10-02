@@ -84,6 +84,187 @@ def test_no_plan_is_explicit_and_reading_never_creates_question(page):
     assert '实际情况' in prompts[0] and bridge.commands == []
 
 
+def test_manual_actual_feedback_uses_selected_date_without_creating_plan(page, app):
+    from PySide6.QtWidgets import QDialogButtonBox
+    widget, bridge = page
+    load(widget, bridge, daily(has_plan=False))
+    widget.set_assistants_visible(False)
+    assert widget.codex_button.isHidden()
+    assert not widget.feedback_button.isHidden() and not widget.notes_button.isHidden()
+    widget.feedback_button.click()
+    picker = widget.dialogs[0]
+    entity = {'id': 'unplanned-task', 'title': 'Actual work', 'type': 'task', 'data': {}, 'status': 'todo'}
+    bridge.deliver('list', {'items': [entity], 'total': 1, 'next_offset': None})
+    assert bridge.queries[-1]['params']['types'] == ['task', 'event', 'milestone', 'checklist', 'assessment']
+    # The date is captured at opening, even if the underlying page moves later.
+    widget.set_date('2030-01-08')
+    picker.items.setCurrentRow(0)
+    picker.choose()
+    editor = widget.dialogs[0]
+    try:
+        assert editor.date.date().toString('yyyy-MM-dd') == '2030-01-07'
+        editor.editors['completion'].setCurrentIndex(editor.editors['completion'].findData('partial'))
+        editor.source.setPlainText('Only the first exercise was completed.')
+        editor.save()
+        editor.save()
+        assert len(bridge.commands) == 1
+        call = bridge.commands[0]
+        assert call['name'] == 'record_feedback'
+        assert call['payload'] == {'target_id': entity['id'], 'business_date': '2030-01-07',
+                                   'dimensions': {'completion': 'partial'}, 'source_text': 'Only the first exercise was completed.'}
+        assert not editor.buttons.button(QDialogButtonBox.StandardButton.Cancel).isEnabled()
+        editor.close()
+        assert editor.isVisible()
+        call['error']({'code': 'validation', 'message': 'Synthetic failure'})
+        assert editor.source.toPlainText() == 'Only the first exercise was completed.'
+        assert editor.buttons.button(QDialogButtonBox.StandardButton.Save).isEnabled()
+    finally:
+        editor.saving = editor.dirty = False
+        editor.close()
+        editor.deleteLater()
+        picker.deleteLater()
+        app.processEvents()
+
+
+def test_manual_notes_save_real_text_and_reopen_without_plan_or_feedback(app, tmp_path):
+    from management.core import Core
+    from management.gui_review import ReviewNotesDialog
+    from test_ux_workflows_v2 import QueuedCoreBridge, wait
+    core = Core(tmp_path)
+    bridge = QueuedCoreBridge(core)
+    notes = ReviewNotesDialog(bridge, '2030-01-07')
+    notes.show()
+    reopened = None
+    try:
+        wait(app, lambda: bridge.pending == 0)
+        notes.text.setPlainText('I rested today; tomorrow I want to review the first exercise.')
+        notes.save()
+        notes.save()
+        wait(app, lambda: bridge.pending == 0)
+        saved = core.query('list', type='review')
+        assert saved['total'] == 1
+        assert saved['items'][0]['data']['start'] == saved['items'][0]['data']['end'] == '2030-01-07'
+        assert saved['items'][0]['data']['content'] == notes.text.toPlainText()
+        assert core.query('list', type='plan')['total'] == 0
+        assert core.query('list', type='feedback')['total'] == 0
+        review = core.query('daily_review', date='2030-01-07')
+        assert review['has_plan'] is False and review['summary']['total'] == 0
+        reopened = ReviewNotesDialog(bridge, '2030-01-07')
+        reopened.show()
+        wait(app, lambda: bridge.pending == 0)
+        assert reopened.history.count() == 1
+        assert reopened.saved_text.toPlainText() == notes.text.toPlainText()
+        assert reopened.text.toPlainText() == ''
+    finally:
+        for dialog in (notes, reopened):
+            if dialog:
+                dialog.saving = dialog.dirty = False
+                dialog.close()
+                dialog.deleteLater()
+        app.processEvents()
+
+
+def test_manual_notes_keep_draft_on_failure_and_do_not_clear_other_dates(page, app, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    widget, bridge = page
+    load(widget, bridge, daily(has_plan=False))
+    widget.notes_button.click()
+    notes = widget.dialogs[0]
+    try:
+        bridge.deliver('list', {'items': [], 'total': 0, 'next_offset': None})
+        notes.text.setPlainText('Keep this unsaved observation')
+        monkeypatch.setattr(QMessageBox, 'question', lambda *_: QMessageBox.StandardButton.No)
+        notes.reject()
+        assert notes.isVisible()
+        widget.set_date('2030-01-08')
+        notes.save()
+        notes.save()
+        assert len(bridge.commands) == 1
+        assert bridge.commands[0]['payload']['start'] == '2030-01-07'
+        notes.close()
+        assert notes.isVisible()
+        bridge.commands[0]['error']({'message': 'Synthetic save failure'})
+        assert notes.text.toPlainText() == 'Keep this unsaved observation'
+        assert notes.dirty and not notes.saving
+        assert 'Synthetic save failure' in notes.error_label.text()
+    finally:
+        notes.saving = notes.dirty = False
+        notes.close()
+        notes.deleteLater()
+        app.processEvents()
+
+
+def test_manual_notes_paging_excludes_other_date_ranges_and_keeps_complete_text(app):
+    from management.gui_review import ReviewNotesDialog
+    bridge = ControlledBridge()
+    notes = ReviewNotesDialog(bridge, '2030-01-07')
+    try:
+        bridge.deliver('list', {'items': [{'title': 'Weekly note', 'data': {'start': '2030-01-07', 'end': '2030-01-13', 'content': 'Other range'}}],
+                                'next_offset': 30, 'total': 31})
+        assert notes.history.count() == 0 and notes.more.isEnabled()
+        notes.more.click()
+        assert bridge.queries[-1]['params']['offset'] == 30
+        complete_text = 'Long precise observation. ' * 200
+        bridge.deliver('list', {'items': [{'title': 'Day note', 'data': {'start': '2030-01-07', 'end': '2030-01-07', 'content': complete_text}}],
+                                'next_offset': None, 'total': 31})
+        assert notes.history.count() == 1 and notes.saved_text.toPlainText() == complete_text
+        assert notes.more.isHidden()
+        assert bridge.commands == []
+    finally:
+        notes.close()
+        notes.deleteLater()
+        app.processEvents()
+
+
+def test_unplanned_feedback_saved_in_ui_can_be_read_back_across_pages(app, tmp_path):
+    from management.core import Core
+    from management.gui_review import ActualFeedbackDialog
+    from test_ux_workflows_v2 import QueuedCoreBridge, cmd, wait
+    core = Core(tmp_path)
+    target = cmd(core, 'create', {'type': 'task', 'title': 'Unplanned actual task'})['result']['entity']
+    for number in range(30):
+        cmd(core, 'record_feedback', {'target_id': target['id'], 'business_date': '2030-01-07',
+            'dimensions': {'completion': 'partial'}, 'source_text': 'Earlier observation ' + str(number)})
+    bridge = QueuedCoreBridge(core)
+    page = ReviewPage(bridge)
+    page.set_date('2030-01-07')
+    page.set_assistants_visible(False)
+    editor = ActualFeedbackDialog(bridge, target, '2030-01-07', on_saved=page._manual_saved)
+    editor.show()
+    history = None
+    try:
+        wait(app, lambda: bridge.pending == 0)
+        editor.editors['completion'].setCurrentIndex(editor.editors['completion'].findData('done'))
+        editor.source.setPlainText('Finished the exact task; no attendance or mastery claim.')
+        editor.save()
+        wait(app, lambda: bridge.pending == 0)
+        assert '查看已保存实际记录' in page.message.text()
+        before = core.query('state')
+        page.feedback_history_button.click()
+        history = page.dialogs[0]
+        wait(app, lambda: bridge.pending == 0)
+        assert history.history.count() == 30 and history.next.isEnabled()
+        assert '已完成' in history.details.toPlainText()
+        assert editor.source.toPlainText() in history.details.toPlainText()
+        assert '掌握情况' not in history.details.toPlainText()
+        history.next.click()
+        wait(app, lambda: bridge.pending == 0)
+        assert history.history.count() == 1 and not history.next.isEnabled()
+        assert 'Earlier observation 0' in history.details.toPlainText()
+        assert history.previous.isEnabled() and history.details.isReadOnly()
+        assert core.query('state') == before
+        assert core.query('daily_review', date='2030-01-07')['summary']['total'] == 0
+        assert core.query('list', type='plan')['total'] == 0
+    finally:
+        for dialog in (editor, history, page):
+            if dialog:
+                if hasattr(dialog, 'dirty'):
+                    dialog.dirty = dialog.saving = False
+                dialog.close()
+                dialog.deleteLater()
+        app.processEvents()
+
+
 def test_two_explicit_choices_submit_only_selected_and_fence_double_click(page):
     widget, bridge = page
     load(widget, bridge)

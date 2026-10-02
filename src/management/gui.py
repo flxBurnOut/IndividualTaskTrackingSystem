@@ -15,13 +15,14 @@ from .gui_codex_connection import CodexConnectionController
 from .gui_forms import EntityForm
 from .gui_workflows import AssistanceDialog, PlanDialog, SettingsDialog
 from .gui_today import TodayPage
+from .gui_tasks import TasksPage
 from .gui_dashboard import DashboardPage
 from .gui_workspace import BASE_TYPES, TREE_TYPES, WorkspacePage, TaskDetailDialog, make_button, plain_label
 from .gui_review import ReviewPage
 from .gui_calendar import install_calendar
 
-NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("projects", "项目与课程"), ("reviews", "复盘")]
-from .appearance import normalize_appearance
+NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("tasks", "任务"), ("projects", "项目与课程"), ("reviews", "复盘")]
+from .appearance import normalize_appearance, assistants_visible
 from .gui_theme import apply_appearance, current_appearance, stylesheet, bind_theme
 
 # Kept as an import-compatible light default for embedders and tests.
@@ -123,6 +124,9 @@ class MainWindow(QMainWindow):
         self._saved_appearance = normalize_appearance()
         self._sidebar_pending = False
         self._sidebar_desired = False
+        self._assistants_visible = False
+        self._assistant_activity_pending = False
+        self._assistant_work_pending = False
         self.codex_connection = CodexConnectionController(data_dir, self, bridge=self.bridge,
             step=desktop_step, automatic=client_factory is None)
         self._build()
@@ -207,6 +211,9 @@ class MainWindow(QMainWindow):
         self.update_button = make_button('版本与更新', self.open_update)
         self.update_button.setObjectName('QuietButton')
         header.addWidget(self.update_button)
+        self.jobs_button = make_button('助手处理记录', self.open_jobs)
+        self.jobs_button.hide()
+        header.addWidget(self.jobs_button)
         main_layout.addLayout(header)
         self.notice = plain_label("", "Notice")
         self.notice.hide()
@@ -227,6 +234,8 @@ class MainWindow(QMainWindow):
         install_calendar(self.today_page.date)
         self.today_page.error.connect(self.show_error)
         self.today_page.review_attention.connect(self.review_attention_changed)
+        self.tasks_page = TasksPage(self.bridge, self, on_task=self.open_task, on_edit=self.edit_entity, on_changed=self.saved, on_plan=self.manual_plan)
+        self.tasks_page.error.connect(self.show_error)
         self.workspace_page = WorkspacePage(self.bridge, self, on_create=self.create_entity, on_edit=self.edit_entity, on_changed=self.workspace_changed, on_codex=self.workspace_assistance)
         self.workspace_page.error.connect(self.show_error)
         if hasattr(self.workspace_page, 'sidebar_collapsed_changed'):
@@ -238,6 +247,7 @@ class MainWindow(QMainWindow):
         self.dashboard_page.review_attention.connect(self.review_attention_changed)
         self.pages.addWidget(self.dashboard_page)
         self.pages.addWidget(self.today_page)
+        self.pages.addWidget(self.tasks_page)
         self.pages.addWidget(self.workspace_page)
         self.pages.addWidget(self.review_page)
         main_layout.addWidget(self.pages, 1)
@@ -269,7 +279,7 @@ class MainWindow(QMainWindow):
     def show_codex_connection(self, value):
         if self.closed:
             return
-        self.codex_connection_panel.setVisible(value['required'])
+        self.codex_connection_panel.setVisible(value['required'] and self._assistants_visible)
         self.codex_connection_note.setText(value['message'])
         self.codex_connection_retry.setVisible(True)
         self.codex_connection_retry.setText('检查连接' if value.get('ready') else '连接 Codex')
@@ -295,7 +305,16 @@ class MainWindow(QMainWindow):
         if epoch == self._display_epoch and revision is not None and self._display_revision is not None and revision < self._display_revision:
             return
         self._display_epoch, self._display_revision = epoch, revision
+        self._assistants_visible = assistants_visible(settings)
+        for page in (self.today_page, self.workspace_page, self.review_page):
+            page.set_assistants_visible(self._assistants_visible)
+        for dialog in self.dialogs:
+            if hasattr(dialog, 'set_assistants_visible'):
+                dialog.set_assistants_visible(self._assistants_visible)
         self.codex_connection.configure(settings)
+        self.show_codex_connection(self.codex_connection.snapshot())
+        self.jobs_button.setVisible(self._assistants_visible or self._assistant_work_pending)
+        self.refresh_assistant_activity()
         self._business_timezone = settings.get("timezone")
         self._saved_appearance = normalize_appearance(settings.get('appearance'))
         apply_appearance(QApplication.instance(), self._saved_appearance)
@@ -342,10 +361,11 @@ class MainWindow(QMainWindow):
             return
         self.section = section
         self.nav_buttons[section].setChecked(True)
-        self.pages.setCurrentIndex({"dashboard": 0, "today": 1, "projects": 2, "reviews": 3}[section])
+        self.pages.setCurrentWidget({'dashboard': self.dashboard_page, 'today': self.today_page, 'tasks': self.tasks_page, 'projects': self.workspace_page, 'reviews': self.review_page}[section])
         titles = {
             "dashboard": ("总览", "日期、本周安排与当前进展。"),
             "today": ("今天", "先看当天的安排，再开始行动。"),
+            "tasks": ("任务", "先记录，按需要整理与安排。"),
             "projects": ("项目与课程", "沿着归属浏览，任务和文件都放在需要它们的地方。"),
             "reviews": ("复盘", "按实际情况确认完成，再看一周的变化。"),
         }
@@ -365,6 +385,8 @@ class MainWindow(QMainWindow):
             self.dashboard_page.refresh()
         elif self.section == "today":
             self.today_page.refresh()
+        elif self.section == "tasks":
+            self.tasks_page.refresh()
         elif self.section == "projects":
             self.workspace_page.refresh()
         else:
@@ -407,7 +429,7 @@ class MainWindow(QMainWindow):
 
     def open_task(self, identifier):
         def loaded(result):
-            dialog = TaskDetailDialog(self.bridge, result["entity"], self, self.edit_entity, on_saved=self.saved, business_date=self.today_page.date_iso() if self.section == "today" else None)
+            dialog = TaskDetailDialog(self.bridge, result["entity"], self, self.edit_entity, on_saved=self.saved, business_date=self.today_page.date_iso() if self.section == "today" else None, assistants_visible=self._assistants_visible)
             self.dialogs.add(dialog)
             dialog.finished.connect(lambda _: self.dialogs.discard(dialog))
             dialog.open()
@@ -416,7 +438,7 @@ class MainWindow(QMainWindow):
     def open_review(self, date, mode="daily"):
         self.section = "reviews"
         self.nav_buttons["reviews"].setChecked(True)
-        self.pages.setCurrentIndex(3)
+        self.pages.setCurrentWidget(self.review_page)
         self.page_title.setText("复盘")
         self.page_subtitle.setText("按实际情况确认完成，再看一周的变化。")
         self.review_page.set_date(date)
@@ -506,6 +528,31 @@ class MainWindow(QMainWindow):
         finally:
             dialog.deleteLater()
 
+    def open_jobs(self):
+        from .gui_workflows import JobsDialog
+        dialog = JobsDialog(self.bridge, self, on_changed=self.saved)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def refresh_assistant_activity(self):
+        if self.closed or self._assistant_activity_pending:
+            return
+        self._assistant_activity_pending = True
+        def loaded(result):
+            self._assistant_activity_pending = False
+            if self.closed:
+                return
+            active, awaiting = result['active'], result['awaiting_review']
+            self._assistant_work_pending = bool(active or awaiting)
+            self.jobs_button.setText(f'助手：{active} 项处理中 · {awaiting} 项待核对' if active or awaiting else '助手处理记录')
+            self.jobs_button.setVisible(self._assistants_visible or self._assistant_work_pending)
+        def failed(_error):
+            self._assistant_activity_pending = False
+            # An optional status read must not interrupt manual work.
+        self.bridge.query('assistant_activity', loaded, failed)
+
     def activate_from_tray(self, command='show'):
         if self.closed:
             return
@@ -546,16 +593,28 @@ class MainWindow(QMainWindow):
         def loaded(result):
             self.poll_pending = False
             self.change_cursor = result.get("cursor", self.change_cursor)
-            if result.get("items") or result.get("reset_required") or clock_changed and self.section in {"dashboard", "today"}:
+            if result.get("items") or result.get("reset_required") or clock_changed and self.section in {"dashboard", "today", "tasks"}:
                 if result.get("reset_required") or any(item.get("action")=="settings" for item in result.get("items",[])):
                     self.load_display_preferences()
                 self.refresh()
+                self.refresh_assistant_activity()
         def failed(error):
             self.poll_pending = False
             self.show_error(error)
         self.bridge.query("changes", loaded, failed, after=self.change_cursor, epoch=self.bridge.epoch, limit=100)
 
     def closeEvent(self, event):
+        if self.tasks_page.quick_pending:
+            self.notice.setText('正在保存任务，请等待结果后再关闭；保存失败时会保留输入。')
+            self.notice.show()
+            event.ignore()
+            return
+        if self.tasks_page.quick_input.text().strip() and not self.tasks_page.quick_pending and not self.close_requested:
+            choice = QMessageBox.question(self, '任务尚未保存', '快速记录中仍有文字。要放弃这些输入并关闭窗口吗？', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if choice != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.tasks_page.quick_input.clear()
         if self.review_pending and not self.close_requested:
             choice = QMessageBox.question(self, "仍有未确认的复盘选择", "本次选择尚未保存。要关闭窗口并放弃这些选择吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
             if choice != QMessageBox.StandardButton.Yes:

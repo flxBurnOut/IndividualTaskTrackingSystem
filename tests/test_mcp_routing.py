@@ -104,6 +104,8 @@ WRITE_CASES = [
     ('execute_command', {'name': 'settings', 'payload': {}}),
     ('execute_command', {'name': 'create_job', 'payload': {'kind': 'ai'}}),
     ('execute_command', {'name': 'apply_proposal', 'payload': {}}),
+    ('execute_command', {'name': 'create_task_batch', 'payload': {}}),
+    ('execute_command', {'name': 'split_task', 'payload': {}}),
 ]
 
 

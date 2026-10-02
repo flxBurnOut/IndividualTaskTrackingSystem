@@ -217,14 +217,14 @@ class Background:
                         from .reviews import query_daily
                         daily=query_daily(self.core,c,{'date':day})
                         if daily['needs_codex']:
-                            text='今天没有明确的每日计划，请到 Codex 按实际情况复盘。'
+                            text='今天没有明确的每日计划。仍可到复盘页选择“记录实际情况”，为任务或日程填写反馈，也可以写下文字小结。'
                         elif daily['summary']['total'] == 0:
                             text='今天的计划没有待确认事项。'
                         else:
                             text=('到每日复盘时间了，请按当天计划和固定安排逐项记录；课程出勤与补课分别确认。' if daily.get('has_fixed_schedule') else '到每日复盘时间了，按今日计划逐项选择完成或未完成后确认。')
                     elif d['workflow'] == 'weekly_review':
                         start=(local.date()-dt.timedelta(days=6)).isoformat()
-                        text='到每周回顾时间了。请在复盘中的每周回顾查看计划与反馈汇总，缺少计划的日期可交给 Codex 梳理。'
+                        text='到每周回顾时间了。请在复盘中的每周回顾查看计划与反馈汇总；缺少计划的日期仍可选择“记录实际情况”或写下文字小结。'
                     else:
                         risks = warning_scan(self.core, c, day)
                         text = '\n'.join(r['title'] + '：' + r['reason'] for r in risks[:50]) if risks else '已检查，当前没有符合已配置规则的新风险。'

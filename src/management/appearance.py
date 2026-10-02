@@ -2,7 +2,7 @@
 from .schemas import BusinessError
 
 DEFAULT_APPEARANCE = {'theme': 'light', 'font_family': 'Microsoft YaHei UI', 'font_size': 13,
-                      'workspace_sidebar_collapsed': False}
+                      'workspace_sidebar_collapsed': False, 'show_assistants': False}
 
 
 def normalize_appearance(value=None, current=None):
@@ -20,4 +20,11 @@ def normalize_appearance(value=None, current=None):
         raise BusinessError('validation', '字体名称无效，请从本机字体列表选择。')
     if type(result['workspace_sidebar_collapsed']) is not bool:
         raise BusinessError('validation', '目录收起设置需要明确的开关值。')
+    if type(result['show_assistants']) is not bool:
+        raise BusinessError('validation', '助手入口需要明确的开关值。')
     return result
+
+
+def assistants_visible(settings):
+    """Keep an existing assistant user's entries; new installs start manually."""
+    return bool(settings.get('appearance', {}).get('show_assistants', settings.get('ai', {}).get('enabled', False)))

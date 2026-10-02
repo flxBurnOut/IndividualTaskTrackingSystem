@@ -15,7 +15,7 @@ def install_main_tutorials(window):
     page = window.dashboard_page
     manager.watch('dashboard', page, lambda: [
         TourStep(page.date, '欢迎使用个人事务管理', '总览汇总今天、本周安排和当前需要留意的事项。接下来用几步认识常用入口；也可以随时跳过。'),
-        TourStep(window.navigation_sidebar, '从这里切换面板', '“今天”按日期安排与执行；“项目与课程”整理任务和资料；“复盘”记录实际结果。第一次进入各面板时会有简短介绍。'),
+        TourStep(window.navigation_sidebar, '从这里切换面板', '“任务”快速记录与整理待办；“今天”按日期安排与执行；“项目与课程”整理任务和资料；“复盘”记录实际结果。'),
         TourStep(window.new_button, '先记录需要做的事', '从“＋ 新建”创建任务、项目、课程、活动、分类或目标。任务可以归属到项目或课程，方便后续安排。'),
         TourStep(window.search_button, '按名称找回记录', '输入任务、项目或课程名称，快速打开已有记录。'),
         TourStep(window.settings_button, '按自己的习惯设置', '这里设置日常习惯、显示、课表、Codex 协助和数据备份。使用基础记录与手动安排不需要连接 Codex。'),
@@ -25,21 +25,27 @@ def install_main_tutorials(window):
     today = window.today_page
     manager.watch('today', today, lambda: [
         TourStep(today.date, '先确认要安排的日期', '切换日期后，这里会显示那一天的计划与固定安排。可以补记过去，也可以提前安排。'),
-        TourStep(today.manual_button, '自己安排一天', '选择已有任务，调整先后顺序、时间和本次完成标准。时间不确定时可以只排先后。'),
-        TourStep(lambda: first_visible(today.plan_button, today.plan_box), '与 Codex 一起安排', '从“生成计划”或“调整计划”进入对应日期的讨论。核对候选内容并保存后，安排才会出现在当天页面。'),
+        TourStep(today.manual_button, '自己安排一天', '从任务池选择任务，调整先后顺序和时间。时间不确定时可以只排先后；完成标准沿用源任务。'),
         TourStep(today.plan_box, '在当天安排中记录实际结果', '这里显示当天计划。点击完成或其他反馈会立即保存，并同步到复盘；请按实际情况选择。'),
         TourStep(today.habits_button, '固定框架与日常习惯', '“日常习惯”设置提醒、准备待办和安排偏好；“每周课表”查看固定时段。固定课表和每日计划分别维护。'),
+    ], host=window, ready=ready)
+    tasks = window.tasks_page
+    manager.watch('tasks', tasks, lambda: [
+        TourStep(tasks.quick_input, '先记下来', '只填标题就能保存，按 Enter 可连续录入。日期、归属和完成标准可以以后补充。'),
+        TourStep(tasks.group_picker, '从全部任务里查找', '按待办、未填日期、到期、未来截止或归属查找，搜索覆盖所有分页。未填日期的任务也可能已加入某天计划，列表会分别显示。'),
+        TourStep(tasks.items, '补充信息与安排', '选择任务后可编辑、拆分、设置前后依赖、加入今天，或打开单日编辑器调整顺序。上方“批量录入”可粘贴多项任务，先预览再一次保存。'),
     ], host=window, ready=ready)
     workspace = window.workspace_page
     manager.watch('projects', workspace, lambda: [
         TourStep(lambda: first_visible(workspace.tree, workspace.expand_directory_button), '按归属整理事项', '展开目录选择项目或课程；目录收起时可先展开。拖动事项会修改真实归属。'),
-        TourStep(workspace.content, '任务和资料放在所属事项里', '右侧显示所选事项的内容。打开项目或课程后，可以继续添加下级事项、任务与资料，也可以与 Codex 讨论。'),
+        TourStep(workspace.content, '任务和资料放在所属事项里', '打开项目或课程后，可以手动添加任务、资料、笔记、评分项和日程；列表底部可以翻页。'),
         TourStep(window.new_button, '从新建开始', '还没有项目或课程时，先在这里创建。随后进入它的详情，逐步补充任务和资料。'),
     ], host=window, ready=ready)
     review = window.review_page
     manager.watch('review.daily', review.daily_tab, lambda: [
         TourStep(review.date_editor, '按日期复盘', '选择要复盘的日期。这里使用已保存的计划、固定安排和执行反馈。'),
         TourStep(review.scroll, '只填写已知的实际情况', '按实际情况选择结果，没有选择的项目仍是未反馈。出勤、任务完成和未反馈分别记录。'),
+        TourStep(review.feedback_button, '没有计划也能记录', '选择已有事项记录真实情况，或写下当天小结；不会自动补造计划。'),
         TourStep(review.confirm_button, '确认后才保存本页选择', '与今天页的即时反馈不同，本页选择需要点击“确认所选结果”才会更新记录。切到“每周回顾”可查看已保存的变化。'),
     ], host=window, ready=ready)
     manager.watch('review.weekly', review.weekly_tab, lambda: [
@@ -93,7 +99,7 @@ def _dialog_steps(dialog, kind):
         return lambda: [
             TourStep(dialog.mode, '选择这一天的安排方式', '先核对日期，再选择常规、低精力、只排先后或休息。具体时间可以留空。'),
             TourStep(dialog.candidates, '从已有任务中挑选', '勾选任务后点击“加入勾选任务”。这里安排已有任务，不会因此重复新建一份任务。'),
-            TourStep(dialog.table, '一行是一项具体安排', '调整每项的先后、时间和本次完成标准。用上移、下移调整顺序，不必把所有步骤都塞进说明。'),
+            TourStep(dialog.table, '一行是一项具体安排', '调整先后和时间，完成标准保持与原任务一致；需要修改标准时编辑源任务。草稿按日期保留，保存时核对原计划版本。'),
             TourStep(dialog.buttons.button(QDialogButtonBox.StandardButton.Save), '核对后保存当天计划', '保存会更新所选日期的安排；已有完成记录会保留。退出引导不会替你保存，也不会清空草稿。'),
         ]
     if kind == 'discussion':
@@ -122,10 +128,12 @@ def _settings_tutorials(dialog, manager):
     tours = {
         '日常习惯': ('habits', lambda: [
             TourStep(dialog.habits.reminder_toggle, '安排复盘提醒', '设置每日复盘和每周回顾提醒。后台运行时按已保存的时间提示，电脑关闭期间不会执行。'),
-            TourStep(dialog.habits.codex_preparation, '把准备工作提前安排', '与 Codex 一起设置课前或截止前的准备待办，核对后保存。其他安排偏好会说明各自的实际作用。'),
+            TourStep(dialog.habits.prep_toggle, '手动设置准备工作', '设置课前或截止前的准备待办，先预览发生日期再保存。'),
+            TourStep(dialog.habits.new_kind, '选择规则类型', '可新建每日容量、休息保护和提前提醒等规则。按已知情况填写，不需要助手。'),
         ]),
         '显示': ('display', lambda: [
             TourStep(dialog.theme_picker, '选适合自己的显示方式', '选择浅色或深色主题，也可以调整字体和字号。'),
+            TourStep(dialog.show_assistants, '按需显示助手', '基础流程无需助手。隐藏入口不会取消正在处理的任务，已有待处理结果仍可查看。'),
             TourStep(dialog.chart_save, '保存后应用显示偏好', '主题、字号和每周回顾图表形式在保存后应用到已经打开的窗口。'),
         ]),
         '课表': ('timetable', lambda: [

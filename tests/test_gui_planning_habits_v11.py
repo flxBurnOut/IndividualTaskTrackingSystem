@@ -19,12 +19,12 @@ def create(core,kind,title,**kw):return cmd(core,'create',{'type':kind,'title':t
 def close(widget,app):
     widget.close();widget.deleteLater();app.processEvents()
 
-def test_manual_day_shows_dated_candidates_courses_and_no_machine_ids(app,tmp_path):
+def test_manual_day_shows_all_open_candidates_courses_and_no_machine_ids(app,tmp_path):
     core=Core(tmp_path)
     course=create(core,'course','SC3060 — Graphics')
     old=create(core,'task','Tutorial 4',parent_id=course['id'],data={'due_date':'2030-01-06'})
     today=create(core,'task','Tutorial 5',parent_id=course['id'],data={'due_date':'2030-01-07'})
-    create(core,'task','Tutorial 6',parent_id=course['id'],data={'scheduled_date':'2030-01-09'})
+    future=create(core,'task','Tutorial 6',parent_id=course['id'],data={'scheduled_date':'2030-01-09'})
     event=create(core,'event','Today lecture',data={'owner_id':course['id'],'date':'2030-01-07','start':'10:00','end':'11:00','hard':True,'time_kind':'exact'})
     create(core,'event','Tomorrow tutorial',data={'owner_id':course['id'],'date':'2030-01-08','start':'10:00','end':'11:00','hard':True,'time_kind':'exact'})
     unknown=create(core,'event','Time not announced',data={'owner_id':course['id'],'hard':True,'time_kind':'date_only'})
@@ -35,11 +35,12 @@ def test_manual_day_shows_dated_candidates_courses_and_no_machine_ids(app,tmp_pa
         assert 'Time not announced' not in dialog.context.text() and 'Time not announced' in dialog.unknowns.text()
         assert dialog.unknowns.isHidden()
         parent=dialog.candidates.topLevelItem(0)
-        assert 'SC3060' in parent.text(0) and parent.childCount()==2
-        assert [parent.child(i).data(0,Qt.ItemDataRole.UserRole)['id'] for i in range(2)]==[old['id'],today['id']]
+        assert 'SC3060' in parent.text(0) and parent.childCount()==3
+        assert {parent.child(i).data(0,Qt.ItemDataRole.UserRole)['id'] for i in range(3)}=={old['id'],today['id'],future['id']}
         for identifier in [old['id'],today['id'],event['id'],unknown['id']]:
             assert identifier not in '\n'.join(label.text() for label in dialog.findChildren(QLabel))
-        parent.child(0).setCheckState(0,Qt.CheckState.Checked);dialog.add_checked();dialog.add_candidate(parent.child(0))
+        selected=next(parent.child(i) for i in range(parent.childCount()) if parent.child(i).data(0,Qt.ItemDataRole.UserRole)['id']==old['id'])
+        selected.setCheckState(0,Qt.CheckState.Checked);dialog.add_checked();dialog.insert_block(old)
         assert dialog.table.rowCount()==1 and 'SC3060' in dialog.table.cellWidget(0,0).text()
         dialog.save();wait(app,lambda:bridge.pending==0)
         assert core.query('daily_review',date='2030-01-07')['items'][0]['target_id']==old['id']
@@ -65,10 +66,10 @@ def test_manual_plan_loads_existing_completed_blocks_and_revises_safely(app,tmp_
     finally:close(dialog,app)
 
 def test_old_date_responses_do_not_replace_new_candidate_context(app):
-    bridge=ControlledBridge();dialog=PlanDialog(bridge,date=QDate(2030,1,7));old=bridge.take('daily_tasks');old_context=bridge.take('plan_context');old_review=bridge.take('daily_review')
+    bridge=ControlledBridge();dialog=PlanDialog(bridge,date=QDate(2030,1,7));old=bridge.take('task_pool');old_context=bridge.take('plan_context');old_review=bridge.take('daily_review')
     try:
         dialog.date.setDate(QDate(2030,1,8))
-        bridge.deliver('daily_tasks',{'items':[{'id':'new','title':'Current day task','data':{},'owner_label':'Course'}],'total':1})
+        bridge.deliver('task_pool',{'items':[{'id':'new','title':'Current day task','data':{},'owner_label':'Course'}],'total':1})
         bridge.deliver('daily_review',{'plan':None});bridge.deliver('plan_context',{'hard_events':[],'unknowns':[],'revision':20,'epoch':'synthetic-epoch'})
         old['callback']({'items':[{'id':'old','title':'Old task'}],'total':1})
         old_context['callback']({'hard_events':[{'title':'Old event'}]});old_review['callback']({'plan':{'id':'old-plan','version':1}})
@@ -79,6 +80,7 @@ def test_old_date_responses_do_not_replace_new_candidate_context(app):
 def test_move_plan_blocks_preserves_identity_and_input(app):
     bridge=ControlledBridge();dialog=PlanDialog(bridge,date=QDate(2030,1,7))
     try:
+        bridge.deliver('daily_review',{'plan':None});bridge.deliver('plan_context',{'hard_events':[],'epoch':bridge.epoch,'revision':10})
         dialog.insert_block({'id':'first','title':'First','data':{}})
         dialog.insert_block({'id':'second','title':'Second','data':{}})
         dialog.table.cellWidget(0,4).setText('First gate');dialog.table.setCurrentCell(0,0);dialog.move_block(1);app.processEvents()
@@ -93,9 +95,10 @@ def test_habits_hide_raw_rules_and_secondary_controls_until_requested(app,tmp_pa
     try:
         wait(app,lambda:bridge.pending==0)
         assert panel.prep_details.isHidden() and panel.rule_details.isHidden()
-        assert panel.codex_preparation.isEnabled() and panel.codex_preparation.text()=='设置课前准备'
+        assert panel.codex_preparation.isEnabled() and panel.codex_preparation.text()=='请助手建议准备规则'
+        assert panel.prep_toggle.objectName()=='Primary' and panel.new_rule_button.objectName()=='Primary'
         visible=[b for b in panel.findChildren(QPushButton) if b.isVisible()]
-        assert len(visible)<=5
+        assert len(visible)<=6
         panel.rules_toggle.click()
         assert panel.rule_details.isVisible() and '何时安排一天、累了怎么安排' in panel.rules.item(0).text()
         assert 'Only plan' not in panel.rule_info.text()

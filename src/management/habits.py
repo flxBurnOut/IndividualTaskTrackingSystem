@@ -12,7 +12,7 @@ def _now():return dt.datetime.now(dt.timezone.utc)
 
 def rule_view(entity,day):
     d=entity['data'];kind=d.get('rule_kind')
-    effect={'warning':'显示提前警戒，不创建待办','capacity':'保存计划时校验可用容量','protected_time':'保存计划时检查时段冲突'}.get(kind,'供 Codex 安排时参考，不会自行执行')
+    effect={'warning':'显示提前警戒，不创建待办','capacity':'保存计划时校验可用容量','protected_time':'保存计划时检查时段冲突'}.get(kind,'安排时供你参考；使用助手时也会提供，不会自行执行')
     state='已保存 · 安排时参考' if kind not in {'warning','capacity','protected_time'} else '已启用'
     enabled=not entity['archived'] and entity['status'] not in {'done','cancelled','draft'} and d.get('enabled',True) is not False
     if not enabled:state='已停用'

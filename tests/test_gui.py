@@ -63,7 +63,12 @@ def create(client, title, kind="task", data=None, parent_id=None):
 
 
 def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, window, monkeypatch):
-    window.codex_connection.configure({'ai': {'enabled': True, 'execution_mode': 'desktop_shared'}})
+    # Exercise the display setting separately from connection permission. Avoid
+    # an unrelated automatic probe replacing the explicitly selected UI states.
+    monkeypatch.setattr(window.codex_connection, 'automatic', False)
+    settings = {'appearance': {'show_assistants': True},
+                'ai': {'enabled': True, 'execution_mode': 'desktop_shared'}}
+    window._apply_display_preferences(settings)
     for state in ('checking', 'desktop_closed', 'connecting', 'ready', 'disconnected', 'unsupported', 'error'):
         window.codex_connection._set_state(state)
         app.processEvents()
@@ -73,11 +78,21 @@ def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, win
         assert '退出 Codex' not in window.codex_connection_note.text()
     calls = []
     monkeypatch.setattr(window.bridge, 'command', lambda name, *args, **kwargs: calls.append(name))
+    connection_signature = window.codex_connection._signature
+    window._apply_display_preferences({**settings, 'appearance': {'show_assistants': False}})
+    app.processEvents()
+    assert not window.codex_connection_panel.isVisible()
+    assert window.codex_connection.required
+    assert window.codex_connection._signature == connection_signature
+    assert settings['ai'] == {'enabled': True, 'execution_mode': 'desktop_shared'}
+    assert calls == []  # Hiding the entry does not disable the configured agent.
+    window._apply_display_preferences(settings)
+    assert window.codex_connection_panel.isVisible()
     window.codex_connection_retry.click()
     assert calls == ['connect_codex']
 
-def test_empty_three_navigation_and_form_create(app, window):
-    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
+def test_empty_five_navigation_and_form_create(app, window):
+    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert not window.today_page.has_plan
     assert Client(window.data_dir, autostart=False).query("state")["counts"] == {}
     form = EntityForm(window.bridge, window.capabilities, window)
@@ -186,14 +201,14 @@ def test_plan_conflict_keeps_draft_open(app, window):
     assert client.query("list", type="plan")["total"] == 0
     form.reject()
 
-def test_ten_extensions_keep_three_navigation_and_typed_fields(app, window):
+def test_ten_extensions_keep_five_navigation_and_typed_fields(app, window):
     client = Client(window.data_dir, autostart=False)
     for index in range(10):
         module = f"synthetic{index}"
         client.command("install_module", {"manifest": {"id": module, "version": 1, "types": [{"id": module + ".record", "label": f"合成类型 {index}", "section": "projects", "parent_types": [None], "fields": [{"id": "amount", "label": "计量", "type": "number"}]}]}})
     window.load_capabilities()
     wait(app, lambda: "synthetic9.record" in window.type_map)
-    assert len(window.nav_buttons) == 4
+    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert len(window.create_menu.actions()) == 6
     assert all("合成类型" not in action.text() for action in window.create_menu.actions())
     form = EntityForm(window.bridge, window.capabilities, window, default_type="synthetic9.record")

@@ -147,7 +147,8 @@ def test_fixed_only_day_keeps_generate_plan_entry_visible():
     page=TodayPage(Bridge())
     try:
         page.refresh()
-        assert not page.plan_button.isHidden() and page.plan_button.text()=='生成计划'
+        assert not page.manual_button.isHidden() and page.manual_button.text()=='安排这一天'
+        assert page.plan_button.isHidden()
     finally:
         page.close();page.deleteLater();app.processEvents()
 

@@ -11,12 +11,13 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import QTime, QDate, Qt, QTimer
+from PySide6.QtGui import QShortcut, QKeySequence
 from .appearance import normalize_appearance
 from .gui_theme import available_font_families, apply_appearance, resolved_font_family
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QScrollArea, QFrame, QAbstractSpinBox, QLayout,
+    QScrollArea, QFrame, QAbstractSpinBox, QLayout, QAbstractItemView,
     QMessageBox, QPushButton, QTimeEdit, QSpinBox, QSplitter, QTabWidget, QTableWidget,
     QTextBrowser, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -34,7 +35,7 @@ def codex_mcp_config(data_dir):
 class PlanDialog(FormDialog):
     """A dated plan editor with visible candidates and preserved existing blocks."""
     def __init__(self, bridge, parent=None, on_saved=None, date=None):
-        super().__init__("手动安排一天", parent, 940)
+        super().__init__("安排一天", parent, 1040)
         self.bridge, self.on_saved = bridge, on_saved
         self.epoch = bridge.epoch
         self.context_generation = self.candidate_generation = 0
@@ -43,8 +44,25 @@ class PlanDialog(FormDialog):
         self.plan_loading = True
         self.context_ready = False
         self.closed = self.dirty = self.loading_fields = False
+        self.saving = False
+        self.checked_candidates = {}
+        self.candidate_history = []
+        self.candidate_next = None
+        self.candidate_loading = False
+        self.dialogs = []
+        self.draft_token = None
+        self.draft_ready = False
+        self.draft_blocked = False
+        from .gui_plan_drafts import PlanDrafts
+        if not hasattr(bridge, '_plan_drafts'):
+            bridge._plan_drafts = PlanDrafts(getattr(bridge, 'data_dir', getattr(getattr(bridge, 'core', None), 'root', None)))
+        self.drafts = bridge._plan_drafts
+        self.draft_timer = QTimer(self)
+        self.draft_timer.setSingleShot(True)
+        self.draft_timer.setInterval(400)
+        self.draft_timer.timeout.connect(self.persist_draft)
         self.finished.connect(lambda *_: setattr(self, "closed", True))
-        self.resize(940, 790)
+        self.resize(1040, 850)
         top = QHBoxLayout()
         self.date = QDateEdit(date or QDate.currentDate())
         install_calendar(self.date)
@@ -64,34 +82,63 @@ class PlanDialog(FormDialog):
         self.unknowns = QLabel();self.unknowns.setTextFormat(Qt.TextFormat.PlainText);self.unknowns.setWordWrap(True);self.unknowns.hide()
         self.unknown_toggle.toggled.connect(self.unknowns.setVisible)
         self.body_layout.addWidget(self.unknown_toggle);self.body_layout.addWidget(self.unknowns)
-        self.body_layout.addWidget(QLabel("从当天候选中选任务 · 按课程 / 项目分类，较早的事项在前"))
-        self.candidates = QTreeWidget();self.candidates.setHeaderLabels(["课程 / 项目与任务", "安排或截止日期"])
-        self.candidates.setColumnWidth(0, 630);self.candidates.setMinimumHeight(150);self.candidates.setMaximumHeight(230)
+        self.body_layout.addWidget(QLabel("从任务池勾选，可跨页选择；未定日期的任务也可以安排。"))
+        filters = QHBoxLayout()
+        self.candidate_search = QLineEdit();self.candidate_search.setPlaceholderText('搜索任务标题')
+        self.candidate_group = QComboBox()
+        for label, key in [('全部待办','open'),('未定日期','undated'),('到期与逾期','due'),('未来截止','future'),('未归属','unowned')]:
+            self.candidate_group.addItem(label,key)
+        filters.addWidget(self.candidate_search,1);filters.addWidget(self.candidate_group)
+        self.new_task_button = QPushButton('新建任务');self.new_task_button.clicked.connect(self.new_task);filters.addWidget(self.new_task_button)
+        self.body_layout.addLayout(filters)
+        self.search_timer = QTimer(self);self.search_timer.setSingleShot(True);self.search_timer.setInterval(200)
+        self.search_timer.timeout.connect(lambda:self.load_candidates(0))
+        self.candidate_search.textChanged.connect(lambda:self.search_timer.start())
+        self.candidate_group.currentIndexChanged.connect(lambda:self.load_candidates(0))
+        self.candidates = QTreeWidget();self.candidates.setHeaderLabels(["课程 / 项目与任务", "日期与安排状态", "完成标准与前置任务"])
+        self.candidates.setColumnWidth(0, 350);self.candidates.setColumnWidth(1,180);self.candidates.setMinimumHeight(150);self.candidates.setMaximumHeight(230)
         self.candidates.itemDoubleClicked.connect(self.add_candidate)
+        self.candidates.itemChanged.connect(self.candidate_checked)
         self.body_layout.addWidget(self.candidates)
         row = QHBoxLayout()
         self.add_candidate_button = QPushButton("加入勾选任务");self.add_candidate_button.setObjectName("Primary");self.add_candidate_button.clicked.connect(self.add_checked)
         row.addWidget(self.add_candidate_button)
-        self.candidate_previous = QPushButton("上一页");self.candidate_previous.clicked.connect(lambda: self.load_candidates(max(0,self.candidate_offset-100)));row.addWidget(self.candidate_previous)
-        self.candidate_more = QPushButton("下一页");self.candidate_more.clicked.connect(lambda: self.load_candidates(self.candidate_next));row.addWidget(self.candidate_more)
+        self.candidate_previous = QPushButton("上一页");self.candidate_previous.clicked.connect(self.previous_candidates);row.addWidget(self.candidate_previous)
+        self.candidate_more = QPushButton("下一页");self.candidate_more.clicked.connect(self.next_candidates);row.addWidget(self.candidate_more)
         row.addStretch();self.candidate_count = QLabel("正在读取…");row.addWidget(self.candidate_count)
         self.body_layout.addLayout(row)
         self.plan_note = QLabel("下面是这一天的计划，可调整顺序和时间。")
         self.plan_note.setWordWrap(True);self.body_layout.addWidget(self.plan_note)
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["任务与归属", "开始", "结束", "分钟", "本次完成标准"])
+        self.table.setHorizontalHeaderLabels(["任务与归属", "开始", "结束", "分钟", "任务完成标准（只读）"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
         for column,width in [(0,290),(1,85),(2,85),(3,75)]:self.table.setColumnWidth(column,width)
         self.table.setMinimumHeight(180);self.body_layout.addWidget(self.table)
         actions = QHBoxLayout()
         add = QPushButton("搜索其他任务…");add.clicked.connect(self.add_block);actions.addWidget(add)
+        edit = QPushButton('编辑源任务');edit.clicked.connect(self.edit_task);actions.addWidget(edit)
         remove = QPushButton("移除选中安排");remove.clicked.connect(self.remove_block);actions.addWidget(remove)
+        self.edit_actions=[add,edit,remove]
         for title,step in [("上移",-1),("下移",1)]:
             button=QPushButton(title);button.clicked.connect(lambda _,step=step:self.move_block(step));actions.addWidget(button)
+            self.edit_actions.append(button)
         actions.addStretch();self.body_layout.addLayout(actions)
+        for keys, step in [('Alt+Up',-1),('Alt+Down',1)]:
+            shortcut = QShortcut(QKeySequence(keys), self.table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda step=step:self.move_block(step))
         self.source = QTextEdit();self.source.setPlaceholderText("安排依据或说明（可留空）");self.source.setMaximumHeight(65);self.source.textChanged.connect(self.mark_dirty);self.body_layout.addWidget(self.source)
-        hint = QLabel("时间和分钟数都可留空，只安排先后。已经记录完成情况的原计划事项会保留，复盘仍可继续。")
+        hint = QLabel("时间和分钟数可留空，只排先后。选中一行后按 Alt+↑ / Alt+↓ 调序。完成标准请在源任务中编辑；已保存的原计划标准与反馈保留。前置任务须已完成或排在同日之前。")
         hint.setWordWrap(True);hint.setObjectName("Hint");self.body_layout.addWidget(hint)
+        draft_row = QHBoxLayout()
+        self.draft_note = QLabel('草稿仅保留编辑内容；点击“保存计划”后才成为正式计划。');self.draft_note.setWordWrap(True)
+        draft_row.addWidget(self.draft_note,1)
+        self.discard_draft_button = QPushButton('放弃草稿，重读计划');self.discard_draft_button.clicked.connect(self.discard_draft);draft_row.addWidget(self.discard_draft_button)
+        self.body_layout.addLayout(draft_row)
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('保存计划')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('保留草稿并关闭')
         self.date.dateChanged.connect(self.load_context)
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.buttons.accepted.connect(self.save)
@@ -100,30 +147,43 @@ class PlanDialog(FormDialog):
         install_dialog_tutorial(self, 'plan')
 
     def mark_dirty(self,*_):
-        if not self.loading_fields:self.dirty=True
+        if not self.loading_fields and not self.closed:
+            self.dirty=True
+            self.draft_note.setText('编辑尚未保存为正式计划。正在保留草稿…')
+            if self.draft_ready:self.draft_timer.start()
 
     def mode_changed(self,*_):
         self.mark_dirty();self.load_context()
 
     def update_save_state(self):
-        self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self.context_ready and not self.plan_loading)
-        self.mode.setEnabled(not self.plan_loading)
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self.context_ready and not self.plan_loading and not self.saving and not self.draft_blocked)
+        for widget in (self.mode,self.table,self.source,self.new_task_button,self.candidates,*self.edit_actions):widget.setEnabled(self.can_edit())
+        self.add_candidate_button.setEnabled(self.can_edit() and bool(self.checked_candidates))
+
+    def can_edit(self):
+        return self.draft_ready and not self.plan_loading and not self.saving
 
     def load_context(self,*_):
         day=self.date.date().toString("yyyy-MM-dd")
         new_day=day!=self.context_day
         if new_day and self.context_day and self.dirty:
-            if QMessageBox.question(self,"尚未保存","切换日期会放弃当前尚未保存的安排。继续？",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:
+            if not self.persist_draft():
                 self.date.blockSignals(True);self.date.setDate(QDate.fromString(self.context_day,"yyyy-MM-dd"));self.date.blockSignals(False);return
         self.context_generation+=1;generation=self.context_generation
         self.context_ready=False;self.error_label.hide()
         if new_day:
             self.context_day=day;self.plan=None;self.plan_loading=True;self.table.setRowCount(0);self.loading_fields=True;self.source.clear();self.loading_fields=False;self.dirty=False
+            self.checked_candidates.clear();self.draft_token=None;self.draft_ready=False;self.draft_blocked=False
+            self.mode.blockSignals(True);self.mode.setCurrentIndex(0);self.mode.blockSignals(False)
             self.load_candidates(0)
             self.load_existing_plan(generation,day)
         self.update_save_state()
         def loaded(result):
             if self.closed or generation!=self.context_generation:return
+            if self.draft_ready and result.get('epoch',self.epoch)!=self.epoch:
+                self.draft_blocked=True
+                self.error('数据空间已经切换。当前草稿仍保留在原数据空间，请关闭后重新打开安排。')
+                self.update_save_state();return
             self.context_revision=result.get("revision");self.epoch=result.get("epoch",self.epoch)
             lines=[]
             for event in sorted(result.get("hard_events",result.get("events",[])),key=lambda e:(e.get("start_minute") is None,e.get("start_minute") or 0,e.get("title",""))):
@@ -143,39 +203,73 @@ class PlanDialog(FormDialog):
             self.unknowns.setText("这些安排的时间尚未确认，不代表它们就在这一天：\n"+"\n".join("• "+str(e.get("title") or "未命名安排")+"："+str(e.get("reason") or "时间待确认") for e in unknowns))
             self.unknown_toggle.setText(f"时间待确认的安排（{len(unknowns)}）")
             self.unknown_toggle.setVisible(bool(unknowns));self.unknowns.setVisible(bool(unknowns) and self.unknown_toggle.isChecked())
-            self.context_ready=True;self.update_save_state()
-        self.bridge.query("plan_context",loaded,self.error,date=day,mode=self.mode.currentData())
+            self.context_ready=True;self.restore_draft();self.update_save_state()
+        def failed(error):
+            if not self.closed and generation==self.context_generation:self.error(error)
+        self.bridge.query("plan_context",loaded,failed,date=day,mode=self.mode.currentData())
+
+    def next_candidates(self):
+        if self.candidate_loading or self.candidate_next is None:return
+        self.candidate_history.append(self.candidate_offset)
+        self.load_candidates(self.candidate_next)
+
+    def previous_candidates(self):
+        if self.candidate_loading or not self.candidate_history:return
+        self.load_candidates(self.candidate_history.pop())
 
     def load_candidates(self,offset=0):
         if offset is None:return
+        if offset==0:self.candidate_history.clear()
+        self.candidate_loading=True;self.candidate_next=None
+        self.candidate_previous.setEnabled(False);self.candidate_more.setEnabled(False)
         self.candidate_generation+=1;generation=self.candidate_generation
         self.candidate_offset=offset;day=self.context_day or self.date.date().toString("yyyy-MM-dd")
         self.candidates.clear();self.add_candidate_button.setEnabled(False)
         def loaded(result):
             if self.closed or generation!=self.candidate_generation or day!=self.context_day:return
+            self.candidates.blockSignals(True)
             groups=result.get("groups")
             if groups is None:
                 grouped={}
-                for e in result.get("items",[]):grouped.setdefault(e.get("owner_label") or "未归属课程 / 项目",[]).append(e)
-                groups=[{"owner_label":label,"items":items} for label,items in grouped.items()]
+                for e in result.get("items",[]):grouped.setdefault(e.get("owner_id") or "unowned",[]).append(e)
+                groups=[{"owner_label":items[0].get('owner_label') or '未归属课程 / 项目',"items":items} for items in grouped.values()]
             for group in groups:
                 parent=QTreeWidgetItem([group.get("owner_label") or "未归属课程 / 项目",""]);self.candidates.addTopLevelItem(parent)
                 for entity in group["items"]:
-                    item=QTreeWidgetItem([entity.get("title", "任务"),str(entity.get("candidate_date") or entity.get("data",{}).get("scheduled_date") or entity.get("data",{}).get("due_date") or "日期待确认")])
-                    item.setData(0,Qt.ItemDataRole.UserRole,entity);item.setCheckState(0,Qt.CheckState.Unchecked);parent.addChild(item)
+                    in_plan=any(self.table.cellWidget(row,0).property('target_id')==entity['id'] for row in range(self.table.rowCount()))
+                    date_label=str(entity.get("candidate_date") or entity.get("data",{}).get("scheduled_date") or entity.get("data",{}).get("due_date") or "未定日期")
+                    if in_plan:date_label+=' · 已在下方安排'
+                    elif entity.get('in_plan'):date_label+=' · 已在当天正式计划'
+                    detail=str(entity.get('data',{}).get('completion_gate') or entity.get('data',{}).get('acceptance') or '完成标准未填写')
+                    predecessors=self.predecessor_text(entity)
+                    if predecessors:detail+=' · '+predecessors
+                    item=QTreeWidgetItem([entity.get("title", "任务"),date_label,detail])
+                    item.setData(0,Qt.ItemDataRole.UserRole,entity)
+                    item.setCheckState(0,Qt.CheckState.Checked if entity['id'] in self.checked_candidates else Qt.CheckState.Unchecked)
+                    item.setToolTip(0,detail);item.setToolTip(2,detail)
+                    if in_plan:item.setDisabled(True)
+                    parent.addChild(item)
                 parent.setExpanded(True)
             self.candidate_next=result.get("next_offset")
-            self.candidate_previous.setVisible(offset>0);self.candidate_more.setVisible(self.candidate_next is not None)
-            self.candidate_count.setText(f"共 {result.get('total',len(result.get('items',[])))} 项候选" if result.get('items') else "这一天暂无候选；可搜索其他任务")
-            self.add_candidate_button.setEnabled(bool(result.get("items")))
-        self.bridge.query("daily_tasks",loaded,self.error,date=day,limit=100,offset=offset)
+            self.candidate_loading=False
+            self.candidate_previous.setEnabled(bool(self.candidate_history));self.candidate_more.setEnabled(self.candidate_next is not None)
+            self.candidate_previous.setVisible(bool(self.candidate_history));self.candidate_more.setVisible(self.candidate_next is not None)
+            self.candidate_total=result.get('total',len(result.get('items',[])))
+            self.candidates.blockSignals(False);self.update_candidate_count()
+        def failed(error):
+            if not self.closed and generation==self.candidate_generation:
+                self.candidate_loading=False
+                self.candidate_previous.setEnabled(bool(self.candidate_history))
+                self.candidate_previous.setVisible(bool(self.candidate_history))
+                self.error(error)
+        self.bridge.query("task_pool",loaded,failed,date=day,group=self.candidate_group.currentData(),search=self.candidate_search.text().strip(),limit=100,offset=offset)
 
     def load_existing_plan(self,generation,day):
         def loaded(review):
             if self.closed or generation!=self.context_generation:return
             snapshot=review.get("plan")
             if not snapshot:
-                self.plan_loading=False;self.plan_note.setText("尚无计划。勾选上面的任务，加入后保存即可。");self.update_save_state();return
+                self.plan_loading=False;self.plan_note.setText("尚无计划。勾选上面的任务，加入后保存即可。");self.restore_draft();self.update_save_state();return
             def plan_loaded(value):
                 if self.closed or generation!=self.context_generation:return
                 plan=value['entity']
@@ -190,22 +284,79 @@ class PlanDialog(FormDialog):
                 self.mode.blockSignals(True);self.mode.setCurrentIndex(max(0,index));self.mode.blockSignals(False)
                 self.source.setPlainText(plan['data'].get('source_text') or '')
                 self.loading_fields=False;self.dirty=False;self.plan_loading=False
-                self.plan_note.setText('已载入这一天的现有计划。保存会生成修订版，原计划与反馈保留。');self.update_save_state()
-            self.bridge.query('get',plan_loaded,self.error,id=snapshot['id'])
-        self.bridge.query('daily_review',loaded,self.error,date=day)
+                self.plan_note.setText('已载入这一天的现有计划。保存会生成修订版，原计划与反馈保留。');self.restore_draft();self.update_save_state()
+                # The saved mode affects capacity and protected-time projections.
+                self.load_context()
+            def failed(error):
+                if not self.closed and generation==self.context_generation:self.error(error)
+            self.bridge.query('get',plan_loaded,failed,id=snapshot['id'])
+        def failed(error):
+            if not self.closed and generation==self.context_generation:self.error(error)
+        self.bridge.query('daily_review',loaded,failed,date=day)
+
+    def candidate_checked(self,item,*_):
+        entity=item.data(0,Qt.ItemDataRole.UserRole)
+        if not entity:return
+        if item.checkState(0)==Qt.CheckState.Checked:self.checked_candidates[entity['id']]=entity
+        else:self.checked_candidates.pop(entity['id'],None)
+        self.update_candidate_count()
+
+    def update_candidate_count(self):
+        self.candidate_count.setText(f"共 {getattr(self,'candidate_total',0)} 项 · 已勾选 {len(self.checked_candidates)} 项")
+        self.add_candidate_button.setEnabled(self.can_edit() and bool(self.checked_candidates))
 
     def add_candidate(self,item,*_):
+        if not self.can_edit():return
         entity=item.data(0,Qt.ItemDataRole.UserRole)
-        if entity:self.insert_block(entity);item.setCheckState(0,Qt.CheckState.Unchecked)
+        if entity:
+            self.insert_block(entity);item.setCheckState(0,Qt.CheckState.Unchecked)
+            self.load_candidates(self.candidate_offset)
 
     def add_checked(self):
-        for root in range(self.candidates.topLevelItemCount()):
-            parent=self.candidates.topLevelItem(root)
-            for index in range(parent.childCount()):
-                item=parent.child(index)
-                if item.checkState(0)==Qt.CheckState.Checked:self.add_candidate(item)
+        if not self.can_edit():return
+        for entity in list(self.checked_candidates.values()):self.insert_block(entity)
+        self.checked_candidates.clear();self.load_candidates(self.candidate_offset)
+
+    def new_task(self):
+        if not self.can_edit():return
+        self.open_task_editor()
+
+    def edit_task(self):
+        if not self.can_edit():return
+        row=self.table.currentRow()
+        if row<0:self.error('请先选中要编辑的任务。');return
+        identifier=self.table.cellWidget(row,0).property('target_id')
+        self.bridge.query('get',lambda result:self.open_task_editor(result['entity']) if not self.closed else None,self.error,id=identifier)
+
+    def open_task_editor(self,entity=None):
+        if not self.can_edit():return
+        day=self.context_day
+        def ready(capabilities):
+            if self.closed:return
+            def saved(receipt):
+                if self.closed:return
+                updated=(receipt.get('result') or {}).get('entity')
+                if updated and day==self.context_day:
+                    if entity is None:self.insert_block(updated)
+                    else:
+                        for row in range(self.table.rowCount()):
+                            target=self.table.cellWidget(row,0)
+                            if target.property('target_id')!=updated['id']:continue
+                            target.setProperty('entity',updated)
+                            target.setText(updated.get('display_title') or updated['title'])
+                            if not target.property('original_block'):
+                                self.table.cellWidget(row,4).setText(updated.get('data',{}).get('completion_gate') or updated.get('data',{}).get('acceptance') or '')
+                        self.mark_dirty()
+                    self.load_candidates(0);self.load_context()
+                if self.on_saved:self.on_saved(receipt)
+            dialog=EntityForm(self.bridge,capabilities,self,entity=entity,default_type='task',on_saved=saved)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,True)
+            self.dialogs.append(dialog);dialog.finished.connect(lambda *_:self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+            dialog.show()
+        self.bridge.query('capabilities',ready,self.error)
 
     def add_block(self):
+        if not self.can_edit():return
         picker=EntityPicker(self.bridge,self,allowed_types=['task'])
         if picker.exec()!=QDialog.DialogCode.Accepted:return
         day=self.context_day
@@ -218,51 +369,150 @@ class PlanDialog(FormDialog):
         row=self.table.rowCount();self.table.insertRow(row)
         title=entity.get('display_title') or entity['title']
         if entity.get('owner_label') and entity['owner_label'] not in title:title=entity['owner_label']+' · '+title
-        target=QLabel(title);target.setTextFormat(Qt.TextFormat.PlainText);target.setProperty('target_id',entity['id']);target.setProperty('original_block',dict(original or {}));target.setWordWrap(True);self.table.setCellWidget(row,0,target)
+        predecessors=self.predecessor_text(entity)
+        if predecessors:title+='\n'+predecessors
+        target=QLabel(title);target.setTextFormat(Qt.TextFormat.PlainText);target.setProperty('target_id',entity['id']);target.setProperty('entity',entity);target.setProperty('original_block',dict(original or {}));target.setWordWrap(True);self.table.setCellWidget(row,0,target)
         for column,key in [(1,'start'),(2,'end')]:
             entry=QLineEdit((original or {}).get(key) or '');entry.setPlaceholderText('可留空');entry.textChanged.connect(self.mark_dirty);self.table.setCellWidget(row,column,entry)
-        minutes=QSpinBox();minutes.setRange(0,1440);minutes.setSpecialValueText('待确认');minutes.setValue((original or {}).get('minutes') or entity.get('data',{}).get('estimated_minutes') or 0);minutes.valueChanged.connect(self.mark_dirty);self.table.setCellWidget(row,3,minutes)
-        gate=QLineEdit((original or {}).get('completion_gate') or entity.get('data',{}).get('completion_gate') or '');gate.setPlaceholderText('做到什么才算完成');gate.textChanged.connect(self.mark_dirty);self.table.setCellWidget(row,4,gate)
+        planned_minutes=(original.get('minutes') or 0) if original is not None else (entity.get('data',{}).get('estimated_minutes') or 0)
+        minutes=QSpinBox();minutes.setRange(0,1440);minutes.setSpecialValueText('待确认');minutes.setValue(planned_minutes);minutes.valueChanged.connect(self.mark_dirty);self.table.setCellWidget(row,3,minutes)
+        standard=(original.get('completion_gate') or '') if original is not None else (entity.get('data',{}).get('completion_gate') or entity.get('data',{}).get('acceptance') or '')
+        gate=QLineEdit(standard);gate.setReadOnly(True);gate.setPlaceholderText('请编辑源任务填写完成标准');self.table.setCellWidget(row,4,gate)
         self.table.setRowHeight(row,60);self.mark_dirty()
 
+    @staticmethod
+    def predecessor_text(entity):
+        values=[str(dep.get('title') or '未命名任务')+('（已完成）' if dep.get('completed') else '（未完成）') for dep in entity.get('dependencies',[])]
+        if entity.get('dependencies_truncated'):values.append('另有前置任务，请查看源任务')
+        return '前置：'+'、'.join(values) if values else ''
+
     def remove_block(self):
+        if not self.can_edit():return
         row=self.table.currentRow()
-        if row>=0:self.table.removeRow(row);self.mark_dirty()
+        if row>=0:self.table.removeRow(row);self.mark_dirty();self.load_candidates(self.candidate_offset)
 
     def move_block(self,step):
+        if not self.can_edit():return
         row=self.table.currentRow();other=row+step
         if row<0 or not 0<=other<self.table.rowCount():return
         def snapshot(index):
             target=self.table.cellWidget(index,0)
-            return {'text':target.text(),'id':target.property('target_id'),'original':target.property('original_block'),'start':self.table.cellWidget(index,1).text(),'end':self.table.cellWidget(index,2).text(),'minutes':self.table.cellWidget(index,3).value(),'gate':self.table.cellWidget(index,4).text()}
+            return {'text':target.text(),'id':target.property('target_id'),'entity':target.property('entity'),'original':target.property('original_block'),'start':self.table.cellWidget(index,1).text(),'end':self.table.cellWidget(index,2).text(),'minutes':self.table.cellWidget(index,3).value(),'gate':self.table.cellWidget(index,4).text()}
         left,right=snapshot(row),snapshot(other)
         for index,value in [(row,right),(other,left)]:
-            target=self.table.cellWidget(index,0);target.setText(value['text']);target.setProperty('target_id',value['id']);target.setProperty('original_block',value['original'])
+            target=self.table.cellWidget(index,0);target.setText(value['text']);target.setProperty('target_id',value['id']);target.setProperty('entity',value['entity']);target.setProperty('original_block',value['original'])
             for column,key in [(1,'start'),(2,'end'),(4,'gate')]:self.table.cellWidget(index,column).setText(value[key])
             self.table.cellWidget(index,3).setValue(value['minutes'])
         self.table.setCurrentCell(other,0);self.mark_dirty()
 
-    def save(self):
-        if self.plan_loading or not self.context_ready:return
+    def block_values(self):
         blocks=[]
         for row in range(self.table.rowCount()):
             target=self.table.cellWidget(row,0);block=dict(target.property('original_block') or {});block['target_id']=target.property('target_id')
+            if not target.property('original_block') and (target.property('entity') or {}).get('version') is not None:
+                block['target_version']=target.property('entity')['version']
             for column,key in [(1,'start'),(2,'end'),(4,'completion_gate')]:
                 value=self.table.cellWidget(row,column).text().strip()
                 if value:block[key]=value
-                else:block.pop(key,None)
+                elif key!='completion_gate' or key not in (target.property('original_block') or {}):block.pop(key,None)
             minutes=self.table.cellWidget(row,3).value()
             if minutes:block['minutes']=minutes
             else:block.pop('minutes',None)
             blocks.append(block)
+        return blocks
+
+    def draft_payload(self):
+        return {'plan':{'id':self.plan['id'],'version':self.plan['version']} if self.plan else None,
+                'mode':self.mode.currentData(),'source_text':self.source.toPlainText(),
+                'rows':[{'entity':self.table.cellWidget(row,0).property('entity'),
+                         'original':self.table.cellWidget(row,0).property('original_block'),
+                         'block':block} for row,block in enumerate(self.block_values())]}
+
+    def persist_draft(self):
+        self.draft_timer.stop()
+        if not self.dirty:return True
+        if not self.draft_ready:
+            self.error('尚未完成读取，请稍等再切换日期或关闭。');return False
+        try:
+            self.draft_token=self.drafts.write(self.epoch,self.context_day,self.draft_payload(),self.draft_token)
+        except (OSError,ValueError,RuntimeError) as exc:
+            self.draft_note.setText('草稿未能保留：'+str(exc));return False
+        self.draft_note.setText('草稿已保留；切换日期或关闭后可继续。尚未保存为正式计划。')
+        return True
+
+    def restore_draft(self):
+        if self.draft_ready or self.plan_loading or not self.context_ready:return
+        self.draft_ready=True
+        try:
+            stored=self.drafts.read(self.epoch,self.context_day)
+        except (OSError,ValueError,RuntimeError) as exc:
+            self.draft_note.setText('草稿读取失败：'+str(exc));self.draft_blocked=True;return
+        self.draft_token=(stored or {}).get('token')
+        draft=(stored or {}).get('payload')
+        if not draft:
+            self.draft_note.setText('编辑会保留为草稿；点击“保存计划”后才成为正式计划。');return
+        current={'id':self.plan['id'],'version':self.plan['version']} if self.plan else None
+        self.draft_blocked=draft.get('plan')!=current
+        if self.draft_blocked:self.plan=draft.get('plan')
+        self.loading_fields=True;self.table.setRowCount(0)
+        for row in draft.get('rows',[]):
+            self.insert_block(row['entity'],row['block'])
+            self.table.cellWidget(self.table.rowCount()-1,0).setProperty('original_block',row.get('original') or {})
+        self.mode.blockSignals(True);self.mode.setCurrentIndex(max(0,self.mode.findData(draft.get('mode'))));self.mode.blockSignals(False)
+        self.source.setPlainText(draft.get('source_text') or '')
+        self.loading_fields=False;self.dirty=True
+        self.draft_note.setText('草稿对应的正式计划已在另一处更新。草稿仍保留，请核对后放弃草稿并重读当前计划。' if self.draft_blocked else '已恢复这一天尚未保存的草稿。点击“保存计划”后才生效。')
+        # Re-read mode-specific constraints after restoring a mode from the draft.
+        QTimer.singleShot(0,lambda:self.load_context() if not self.closed else None)
+
+    def discard_draft(self):
+        if self.saving:return
+        if QMessageBox.question(self,'放弃当前草稿','放弃此窗口的编辑并重新读取？已保存的计划和反馈不变。',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        try:
+            current=self.drafts.read(self.epoch,self.context_day)
+            if (current or {}).get('token')==self.draft_token:
+                self.drafts.clear(self.epoch,self.context_day,self.draft_token)
+        except (OSError,ValueError,RuntimeError) as exc:
+            self.error(str(exc));return
+        self.draft_timer.stop();self.dirty=False;self.context_day=None;self.load_context()
+
+    def error(self,error):
+        if self.closed:return
+        if self.saving:
+            self.error_label.setText(error.get('message',str(error)) if isinstance(error,dict) else str(error));self.error_label.show();return
+        super().error(error)
+        self.update_save_state()
+
+    def reject(self):
+        if self.saving:
+            self.error_label.setText('正在保存计划，请等待结果后关闭。');self.error_label.show();return
+        if self.persist_draft():super().reject()
+
+    def closeEvent(self,event):
+        if self.saving or not self.persist_draft():event.ignore();return
+        super().closeEvent(event)
+
+    def save(self):
+        if self.plan_loading or not self.context_ready or self.saving or self.draft_blocked:return
+        if not self.persist_draft():return
+        blocks=self.block_values()
+        self.saving=True
         self.busy()
         def saved(result):
+            self.saving=False
+            if self.closed:return
             self.dirty=False
+            self.draft_timer.stop()
+            try:self.drafts.clear(self.epoch,self.context_day,self.draft_token)
+            except (OSError,ValueError,RuntimeError):pass  # Preserve any newer window's draft.
             if self.on_saved:self.on_saved(result)
             self.accept()
         payload={'date':self.context_day,'mode':self.mode.currentData(),'blocks':blocks,'source_text':self.source.toPlainText().strip()}
         if self.plan:payload.update(plan_id=self.plan['id'],plan_version=self.plan['version'])
-        self.bridge.command('revise_plan' if self.plan else 'create_plan',payload,saved,self.error,epoch=self.epoch,expected_revision=getattr(self,'context_revision',None))
+        def failed(error):
+            self.saving=False
+            self.error(error)
+        self.bridge.command('revise_plan' if self.plan else 'create_plan',payload,saved,failed,epoch=self.epoch,expected_revision=getattr(self,'context_revision',None))
 
 
 from .gui_assistant import AssistanceDialog
@@ -583,7 +833,7 @@ class SettingsDialog(QDialog):
         read_reminders = self.read_reminders = QPushButton('重新读取已保存的时间')
         read_reminders.clicked.connect(self.load_review_times)
         reminder_layout.addWidget(read_reminders)
-        hint = QLabel('有每日计划：到复盘页逐项选择完成或未完成。没有每日计划：提示到 Codex 梳理实际情况。电脑关闭期间不会执行提醒。')
+        hint = QLabel('到复盘页记录实际结果；没有每日计划也可选择事项反馈或写下小结。电脑关闭期间不会执行提醒。')
         hint.setWordWrap(True)
         hint.setObjectName('Hint')
         reminder_layout.addWidget(hint)
@@ -612,6 +862,10 @@ class SettingsDialog(QDialog):
         appearance_form.addRow('字体样式',self.font_picker)
         appearance_form.addRow('字号',self.font_size)
         display_layout.addLayout(appearance_form)
+        self.show_assistants = QCheckBox('显示可选助手入口')
+        self.show_assistants.setToolTip('隐藏后仍可查看正在处理或等待核对的结果，不会取消已有任务。')
+        self.show_assistants.toggled.connect(self.display_edited)
+        display_layout.addWidget(self.show_assistants)
         self.font_preview=QLabel('字体预览：安排、记录与回顾 · Notes 123')
         self.font_preview.setObjectName('FontPreview')
         self.font_preview.setWordWrap(True)
@@ -969,6 +1223,9 @@ class SettingsDialog(QDialog):
             index=self.font_picker.count()-1
         self.font_picker.setCurrentIndex(index)
         self.font_size.setValue(value['font_size'])
+        from .appearance import assistants_visible
+        self.show_assistants.setChecked(assistants_visible(settings))
+        self.habits.set_assistants_visible(assistants_visible(settings))
         self.weekly_chart_style.setCurrentIndex(max(0,self.weekly_chart_style.findData(settings.get('charts',{}).get('weekly_style','columns'))))
         self.display_dirty=False
         self._display_loading=False
@@ -1002,7 +1259,7 @@ class SettingsDialog(QDialog):
         self.chart_save.setEnabled(False)
         self.display_reload.setEnabled(False)
         edit_version=self._display_edit_version
-        appearance={'theme':self.theme_picker.currentData(),'font_family':self.font_picker.currentData() or '', 'font_size':self.font_size.value()}
+        appearance={'theme':self.theme_picker.currentData(),'font_family':self.font_picker.currentData() or '', 'font_size':self.font_size.value(), 'show_assistants':self.show_assistants.isChecked()}
         payload={'settings':{'charts':{'weekly_style':self.weekly_chart_style.currentData()},'appearance':appearance}}
         def saved(result):
             self.chart_epoch,self.chart_revision=result.get('epoch'),result.get('revision')
@@ -1010,6 +1267,7 @@ class SettingsDialog(QDialog):
             confirmed=result.get('result',{}).get('settings',{}).get('appearance') or normalize_appearance(appearance,self._display_snapshot)
             self._display_snapshot=normalize_appearance(confirmed)
             apply_appearance(QApplication.instance(),self._display_snapshot)
+            self.habits.set_assistants_visible(self._display_snapshot['show_assistants'])
             self.display_dirty=edit_version!=self._display_edit_version
             self.display_edited(update_dirty=False)
             self.saved(result)

@@ -85,7 +85,7 @@ def test_guides_cover_main_panels_without_changing_business_data(app_v2, shell, 
     assert evidence['passed'] and evidence['progress_saved'] and evidence['steps'] == 7
     assert Path(evidence['screenshot']).is_file()
     for section, key in [('dashboard', 'dashboard'), ('today', 'today'),
-                         ('projects', 'projects'), ('reviews', 'review.daily')]:
+                         ('tasks', 'tasks'), ('projects', 'projects'), ('reviews', 'review.daily')]:
         shell.navigate(section)
         wait(app_v2, lambda: not shell.bridge.callbacks)
         assert manager.show_current()
@@ -195,9 +195,9 @@ def test_first_visits_offer_guides_after_loading_and_direct_review_entry(app_v2,
     QTest.qWait(500)
     assert manager.overlay is None
 
-def test_three_sections_six_creation_types_and_removed_toolbar(app_v2, shell):
-    assert list(shell.nav_buttons) == ["dashboard", "today", "projects", "reviews"]
-    assert [widget.text().split("  ")[0] for widget in shell.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
+def test_five_sections_six_creation_types_and_removed_toolbar(app_v2, shell):
+    assert list(shell.nav_buttons) == ["dashboard", "today", "tasks", "projects", "reviews"]
+    assert [widget.text().split("  ")[0] for widget in shell.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert shell.section == "dashboard" and not shell.review_pending
     assert [action.text() for action in shell.create_menu.actions()] == ["任务", "项目", "课程", "活动", "分类", "目标"]
     buttons = {button.text() for button in shell.findChildren(QPushButton)}
@@ -212,13 +212,72 @@ def test_today_ignores_unscheduled_backlog_and_page_reads_never_create_reviews(a
     assert task["title"] not in text_in(shell.today_page)
     assert not shell.today_page.has_plan
     before = client.query("state")["counts"]
-    for section in ("reviews", "today", "projects", "reviews"):
+    for section in ("reviews", "today", "tasks", "projects", "reviews"):
         shell.navigate(section)
         wait(app_v2, lambda: not shell.bridge.callbacks)
     after = client.query("state")["counts"]
     assert before == after
     assert after.get("checkin", 0) == 0
     assert after.get("review", 0) == 0
+
+
+def test_manual_workspace_has_no_assistant_requirement_and_preserves_active_jobs(app_v2, shell, monkeypatch):
+    from management.gui_theme import apply_appearance
+    client = Client(shell.data_dir, autostart=False)
+    shell.navigate('tasks')
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert shell.today_page.plan_button.isHidden()
+    assert shell.codex_connection_panel.isHidden()
+    assert shell.jobs_button.isHidden()
+    shell.tasks_page.quick_input.setText('合成：先记录，再安排')
+    shell.tasks_page.quick_button.click()
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert shell.tasks_page.items.topLevelItemCount() == 1
+    shell.tasks_page.plan_button.click()
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert not shell.tasks_page.plan_button.isEnabled()
+    assert shell.tasks_page.selected()['in_plan']
+    assert client.query('jobs')['total'] == 0
+    folder = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(shell.data_dir)))
+    try:
+        for theme, size in [('light', 13), ('dark', 20)]:
+            apply_appearance(app_v2, {'theme': theme, 'font_size': size})
+            app_v2.processEvents()
+            assert shell.grab().save(str(folder / f'manual-tasks-{theme}.png'))
+    finally:
+        apply_appearance(app_v2, shell._saved_appearance)
+    # Hide optional entrances without concealing queued/awaiting work.
+    original_query = shell.bridge.query
+    def query(name, callback=None, error=None, **params):
+        if name == 'assistant_activity':
+            callback({'active': 1, 'awaiting_review': 2})
+        else:
+            return original_query(name, callback, error, **params)
+    monkeypatch.setattr(shell.bridge, 'query', query)
+    shell.refresh_assistant_activity()
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert not shell.jobs_button.isHidden()
+    assert '处理中' in shell.jobs_button.text()
+    assert '2 项待核对' in shell.jobs_button.text()
+    assert client.query('jobs')['total'] == 0
+
+
+def test_close_during_quick_capture_failure_preserves_input(app_v2, shell, monkeypatch):
+    pending = []
+    def command(name, payload, callback=None, error=None, **options):
+        pending.append((name, callback, error))
+    monkeypatch.setattr(shell.bridge, 'command', command)
+    shell.tasks_page.quick_input.setText('合成：保存失败也要留下')
+    shell.tasks_page.save_quick()
+    assert shell.tasks_page.quick_pending
+    shell.close()
+    assert not shell.closed and shell.isVisible()
+    pending[-1][2]({'message': 'Synthetic failed save'})
+    app_v2.processEvents()
+    assert shell.isVisible() and not shell.closed
+    assert shell.tasks_page.quick_input.text() == '合成：保存失败也要留下'
+    shell.tasks_page.quick_input.clear()
+
 
 def test_today_plan_to_review_has_two_choices_and_no_duplicate_questionnaires(app_v2, shell):
     client = Client(shell.data_dir, autostart=False)

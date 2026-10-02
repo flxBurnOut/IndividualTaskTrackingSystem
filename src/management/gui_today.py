@@ -24,6 +24,7 @@ class TodayPage(QWidget):
         self.pending_targets = set()
         self.generation = 0
         self.has_plan = False
+        self.assistants_visible = False
         self.review_result = None
         self.today_result = None
         self.warning_result = None
@@ -52,11 +53,11 @@ class TodayPage(QWidget):
         self.timetable_button = make_button("每周课表", lambda: on_timetable(self.date_iso()) if on_timetable else None)
         row.addWidget(self.timetable_button)
         row.addStretch()
-        self.manual_button = make_button("手动安排", lambda: self.on_manual(self.date_iso()) if self.on_manual else None)
-        self.manual_button.setObjectName("Prominent")
+        self.manual_button = make_button("安排这一天", lambda: self.on_manual(self.date_iso()) if self.on_manual else None, True)
         self.manual_button.setMinimumHeight(44)
         row.addWidget(self.manual_button)
-        self.plan_button = make_button("生成计划", self.request_plan, True)
+        self.plan_button = make_button("请助手给建议", self.request_plan)
+        self.plan_button.hide()
         row.addWidget(self.plan_button)
         outer.addLayout(row)
         self.habits_button=make_button('日常习惯 · 查看提醒、自动待办与安排偏好',lambda:on_habits() if on_habits else None)
@@ -100,6 +101,11 @@ class TodayPage(QWidget):
     def date_iso(self):
         return self.date.date().toString("yyyy-MM-dd")
 
+    def set_assistants_visible(self,visible):
+        self.assistants_visible=bool(visible)
+        self.plan_button.setVisible(self.assistants_visible)
+        self.render_plan(self.review_result)
+
     def set_date(self, date):
         parsed = QDate.fromString(date, "yyyy-MM-dd") if isinstance(date, str) else date
         if parsed != self.date.date():
@@ -129,8 +135,9 @@ class TodayPage(QWidget):
             self.has_plan = bool(result.get("has_plan"))
             needs_review = not result.get("can_review", self.has_plan) or (result.get("summary") or {}).get("pending_review", (result.get("summary") or {}).get("unreported", 0)) > 0
             self.review_attention.emit(needs_review and self.date.date() <= QDate.currentDate())
-            self.plan_button.setText("调整计划" if self.has_plan else "生成计划")
-            self.plan_button.setVisible(self.has_plan or result.get("has_fixed_schedule",False))
+            self.manual_button.setText("编辑安排" if self.has_plan else "安排这一天")
+            self.plan_button.setText("请助手调整" if self.has_plan else "请助手给建议")
+            self.plan_button.setVisible(self.assistants_visible)
             self.render_plan(result)
             if self.today_result:self.render_events(self.today_result.get("events",[]))
         def today_loaded(result):
@@ -175,9 +182,10 @@ class TodayPage(QWidget):
             return
         if not result.get("can_review", result.get("has_plan")):
             self.plan_layout.addWidget(plain_label("还没有这一天的计划", "CardTitle"))
-            self.plan_layout.addWidget(plain_label("先说明今天能投入的时间，以及最需要完成的事情。\nCodex 会结合已登记的固定安排，给出可以核对的计划。", "Body"))
+            self.plan_layout.addWidget(plain_label("从任务池选择要做的事情，按先后排好再保存。\n未定日期的任务也可以加入；没有确定的钟点可以留空。", "Body"))
             self.plan_layout.addSpacing(5)
-            self.plan_layout.addWidget(make_button("让 Codex 安排", self.request_plan, True), alignment=Qt.AlignmentFlag.AlignLeft)
+            self.plan_layout.addWidget(make_button("安排这一天", lambda:self.on_manual(self.date_iso()) if self.on_manual else None, True), alignment=Qt.AlignmentFlag.AlignLeft)
+            if self.assistants_visible:self.plan_layout.addWidget(make_button("请助手给建议",self.request_plan),alignment=Qt.AlignmentFlag.AlignLeft)
             return
         plan = result.get("plan") or {}
         header = QHBoxLayout()
@@ -297,7 +305,7 @@ class TodayPage(QWidget):
         self.tasks_layout.addWidget(plain_label("当天候选待办", "SectionHeading"))
         self.tasks_layout.addWidget(plain_label("这里只列已安排到这天、到期或逾期的未完成任务。是否今天处理由你决定；加入日计划后，才进入当天复盘。", "Quiet"))
         if not result.get("items"):
-            self.tasks_layout.addWidget(plain_label("没有尚未排入当天计划的日期相关任务。其他课程任务仍可从项目与课程查看。", "Quiet"))
+            self.tasks_layout.addWidget(plain_label("没有尚未排入当天计划的日期相关任务。点击“安排这一天”可从全部任务中选择，包括未定日期的事项。", "Quiet"))
         day = result.get("date") or self.date_iso()
         snapshot = result.get("plan")
         group_label = None
