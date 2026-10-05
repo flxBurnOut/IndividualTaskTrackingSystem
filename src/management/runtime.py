@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from .data_space import default_beta_dir, require_beta_dir
 
 
 class OwnerLock:
@@ -41,13 +42,8 @@ class OwnerLock:
 
 
 def default_data_dir():
-    if os.environ.get('PERSONAL_MANAGEMENT_DATA'):
-        return Path(os.environ['PERSONAL_MANAGEMENT_DATA']).resolve()
-    from .installation_state import installed_data_dir
-    installed = installed_data_dir()
-    if installed is not None:
-        return installed
-    return Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'PersonalManagement' / 'data'
+    # Never inherit the stable installation's environment or registry defaults.
+    return require_beta_dir(default_beta_dir())
 
 
 class DataSpaceMismatch(ValueError):
@@ -56,15 +52,16 @@ class DataSpaceMismatch(ValueError):
 
 class UpdatePending(RuntimeError):
     code = 'update_pending'
-    message = '此数据空间已暂停后台以准备更新。请完成安装后打开个人事务管理；若取消更新，也请主动打开软件恢复使用。'
+    message = '此 Beta 数据空间已暂停后台以准备更新。请更新 Beta 源码后打开个人事务管理 Beta 测试版；若取消更新，也请主动打开 Beta 软件恢复使用。'
 
     def __init__(self, reason='update'):
         if reason == 'exit':
-            self.message = '后台已由用户退出。请主动打开个人事务管理恢复使用；Codex 不会自动重新启动已退出的后台。'
+            self.message = 'Beta 后台已由用户退出。请主动打开个人事务管理 Beta 测试版恢复使用；Codex 不会自动重新启动已退出的 Beta 后台。'
         super().__init__(self.message)
 
 
 def require_no_pending_update(root, resume_token=None):
+    root = require_beta_dir(root)
     # A malformed marker is still a maintenance fence, never permission to
     # silently restart an old MCP-owned binary during file replacement.
     marker = Path(root) / 'update_pending.json'
@@ -140,6 +137,7 @@ def require_data_dir(value, expected):
 
 
 def discovery(root):
+    root = require_beta_dir(root)
     try:
         value = json.loads((Path(root) / 'runtime.json').read_text('utf-8'))
     except (OSError, ValueError):
@@ -153,6 +151,7 @@ def discovery(root):
 
 
 def _service_args(root, bootstrap=False, resume_token=None):
+    root = require_beta_dir(root)
     executable = Path(sys.executable)
     if getattr(sys, 'frozen', False):
         sibling = executable.with_name('PersonalManagementService.exe')
@@ -199,9 +198,9 @@ def _windows_broker_start(root, resume_token=None):
         allowed = {'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP',
                    'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA',
                    'PROGRAMFILES', 'PROGRAMFILES(X86)', 'HOMEDRIVE', 'HOMEPATH',
-                   'USERNAME', 'USERDOMAIN', 'CODEX_HOME', 'PYTHONPATH', 'PERSONAL_MANAGEMENT_NO_TRAY'}
+                   'USERNAME', 'USERDOMAIN', 'CODEX_HOME', 'PERSONAL_MANAGEMENT_NO_TRAY'}
         startup.EnvironmentVariables = [key + '=' + value for key, value in os.environ.items()
-                                        if key.upper() in allowed] + ['PYTHONUTF8=1']
+                                        if key.upper() in allowed] + ['PYTHONUTF8=1', 'PYTHONPATH=' + str(Path(__file__).resolve().parents[1])]
         process_class = provider.Get('Win32_Process')
         params = process_class.Methods_('Create').InParameters.SpawnInstance_()
         params.CommandLine = subprocess.list2cmdline(_service_args(root, resume_token=resume_token))
@@ -217,11 +216,12 @@ def _windows_broker_start(root, resume_token=None):
 
 
 def start_service(root, resume_token=None):
-    root = Path(root).resolve()
+    root = require_beta_dir(root)
     require_no_pending_update(root, resume_token)
     root.mkdir(parents=True, exist_ok=True)
     options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,
-               'stderr': subprocess.DEVNULL, 'close_fds': True}
+               'stderr': subprocess.DEVNULL, 'close_fds': True,
+               'env': dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))}
     if os.name == 'nt':
         options['creationflags'] = subprocess.CREATE_NO_WINDOW
     try:

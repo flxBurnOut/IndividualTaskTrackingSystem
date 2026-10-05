@@ -70,6 +70,9 @@ def online(jobs=None):
 
 def test_status_shows_real_running_queued_and_pending_review_counts(tray):
     item, bridge = tray
+    assert 'Beta 测试版' in item.open_action.text()
+    assert 'Beta' in item.exit_action.text() and 'Beta' in item.version.text()
+    assert 'Beta 测试版' in item.icon.tooltip
     assert bridge.reads[0][0] == 'runtime_status'
     bridge.reads[-1][1](online({'running': 2, 'queued': 3, 'awaiting_review': 4}))
     assert '2 项执行中，3 项排队' in item.status.text()

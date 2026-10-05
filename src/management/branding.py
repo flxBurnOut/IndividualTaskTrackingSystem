@@ -3,8 +3,8 @@ from pathlib import Path
 import ctypes
 import os
 
-APP_NAME = '个人事务管理'
-APP_USER_MODEL_ID = 'PersonalManagement.Desktop'
+APP_NAME = '个人事务管理 · Beta 测试版'
+APP_USER_MODEL_ID = 'PersonalManagement.Beta.Desktop'
 
 
 def icon_path():

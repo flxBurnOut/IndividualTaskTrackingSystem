@@ -113,6 +113,7 @@ def test_child_owns_only_discussion_mcp_and_only_exact_child_trust_is_written(in
     assert rpc.file.read_bytes() == before  # Mock RPC never mutates even synthetic user configuration.
     assert not any(method.startswith(('thread/', 'project/')) for method, _ in rpc.calls)
     agents = Path(result['agents_path']).read_text(encoding='utf-8')
+    assert 'Beta 测试版' in agents and '独立 Beta 数据空间' in agents
     assert '覆盖父工作区' in agents and 'submit_candidate' in agents and '等待用户在管理软件核对确认' in agents
 
 

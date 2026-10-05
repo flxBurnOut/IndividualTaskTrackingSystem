@@ -246,3 +246,112 @@ def test_mcp_error_preserves_readable_identity_failure_and_sends_no_business_wri
     assert (business.epoch, business.revision) == before
     assert other.paths == []
     assert a.query('list')['total'] == b.query('list')['total'] == 0
+
+
+def test_beta_default_ignores_formal_environment_and_installation(tmp_path, monkeypatch):
+    from management import data_space, installation_state, runtime
+    workspace = tmp_path / 'Beta'
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    monkeypatch.setenv('PERSONAL_MANAGEMENT_DATA', str(tmp_path / 'formal'))
+    monkeypatch.setattr(installation_state, 'installed_data_dir', lambda: pytest.fail('Read formal installation'))
+    assert runtime.default_data_dir() == workspace / '.beta-data' / 'default'
+    assert not workspace.exists()
+
+
+@pytest.mark.parametrize('entrance', ['client', 'store', 'service', 'bootstrap', 'resume', 'resources', 'restore', 'tray'])
+def test_beta_rejects_formal_directory_before_open_connect_or_write(tmp_path, monkeypatch, entrance):
+    from management import data_space, runtime
+    from management.installation_state import resume_after_update
+    from management.resources import ResourceManager
+    from management.service import run_service
+    from management.storage import Store
+    from management.tray_runtime import gui_args
+    formal = tmp_path / 'formal'
+    formal.mkdir()
+    (formal / 'database.sqlite3').write_bytes(b'Synthetic formal database; must never be opened')
+    (formal / 'runtime.json').write_text('{"preserve":"formal discovery"}', encoding='utf-8')
+    before = {p.name: p.read_bytes() for p in formal.iterdir()}
+    workspace = tmp_path / 'Beta'
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    monkeypatch.setattr(client_module, 'discovery', lambda *_: pytest.fail('Contacted formal service'))
+    monkeypatch.setattr(runtime.subprocess, 'run', lambda *a, **k: pytest.fail('Started a process'))
+    own = workspace / '.beta-data' / 'default'
+    operations = {
+        'client': lambda: Client(formal), 'store': lambda: Store(formal),
+        'service': lambda: run_service(formal), 'bootstrap': lambda: runtime.start_service(formal),
+        'resume': lambda: resume_after_update(formal), 'resources': lambda: ResourceManager(formal),
+        'restore': lambda: ResourceManager(own).restore_backup(formal, formal / 'restore'),
+        'tray': lambda: gui_args(formal),
+    }
+    with pytest.raises((data_space.BetaIsolationError, ClientError), match='Beta'):
+        operations[entrance]()
+    assert {p.name: p.read_bytes() for p in formal.iterdir()} == before
+
+
+def test_beta_cli_rejects_formal_directory_without_starting_it(tmp_path, monkeypatch, capsys):
+    from management import data_space, __main__
+    formal = tmp_path / 'formal-not-created'
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: tmp_path / 'Beta')
+    monkeypatch.setattr('sys.argv', ['management', '--service', '--data-dir', str(formal)])
+    with pytest.raises(SystemExit) as error:
+        __main__.main()
+    assert error.value.code == 2 and 'Beta' in capsys.readouterr().err
+    assert not formal.exists()
+
+
+def test_beta_rejects_linked_database_before_sqlite_open(tmp_path, monkeypatch):
+    from management import data_space
+    from management.storage import Store
+    workspace = tmp_path / 'Beta'
+    own = workspace / '.beta-data' / 'default'
+    own.mkdir(parents=True)
+    formal = tmp_path / 'formal.sqlite3'
+    formal.write_bytes(b'Synthetic formal database')
+    (own / 'database.sqlite3').hardlink_to(formal)
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    with pytest.raises(data_space.BetaIsolationError):
+        Store(own)
+    assert formal.read_bytes() == b'Synthetic formal database'
+
+
+def test_beta_rejects_directory_junction(tmp_path, monkeypatch):
+    from management import data_space
+    import subprocess
+    if os.name != 'nt':
+        pytest.skip('Windows junction')
+    workspace, formal = tmp_path / 'Beta', tmp_path / 'formal'
+    workspace.mkdir()
+    formal.mkdir()
+    junction = workspace / '.beta-data'
+    # A synthetic junction only; unlink the junction without traversing target.
+    subprocess.run(['cmd', '/c', 'mklink', '/J', str(junction), str(formal)],
+                   check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    try:
+        with pytest.raises(data_space.BetaIsolationError):
+            data_space.require_beta_dir(junction / 'default')
+        assert list(formal.iterdir()) == []
+    finally:
+        junction.rmdir()
+
+
+def test_beta_test_directory_requires_owned_check_marker(tmp_path, monkeypatch):
+    from management import data_space
+    workspace = tmp_path / 'Beta'
+    work = workspace / '.build' / 'checks' / 'focused' / 'work'
+    work.mkdir(parents=True)
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    with pytest.raises(data_space.BetaIsolationError):
+        data_space.require_beta_dir(work / 'fixture')
+    marker = work / '.disposable-test-work.json'
+    marker.write_text('[]')
+    with pytest.raises(data_space.BetaIsolationError):
+        data_space.require_beta_dir(work / 'fixture')
+    marker.write_text(json.dumps({'format': 'personal-management-test-work/1', 'path': str(work)}))
+    assert data_space.require_beta_dir(work / 'fixture') == work / 'fixture'
+
+
+def test_beta_does_not_change_formal_installation_selection(monkeypatch):
+    from management import installation_state
+    monkeypatch.setattr(installation_state, 'installed_data_dir', lambda *_: pytest.fail('Touched formal registry'))
+    installation_state.remember_installed_data_dir('unused', 'unused')

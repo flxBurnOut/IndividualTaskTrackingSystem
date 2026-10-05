@@ -317,6 +317,7 @@ class Core:
         if name == "diagnostics":
             return {"database_bytes": self.store.path.stat().st_size, "wal_bytes": Path(str(self.store.path) + "-wal").stat().st_size if Path(str(self.store.path) + "-wal").exists() else 0,
                     "disk_free_bytes": shutil.disk_usage(self.root).free, "sqlite_version": sqlite3.sqlite_version,
+                    "unfinished_file_operations": c.execute("SELECT count(*) FROM io_operations WHERE status != 'committed'").fetchone()[0],
                     "pending_jobs": c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0], "schema_version": 1}
         raise BusinessError("unknown_query", "未注册的查询。", {"name": name})
 

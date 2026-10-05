@@ -48,6 +48,10 @@ def test_user_upgrade_state_is_rejected_before_installer_compilation(tmp_path, m
 def test_check_cannot_remove_existing_release_installer(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace
+    from management import data_space
+    # Exercise the legacy compiler path on a synthetic package only. Actual
+    # Beta invocation is separately checked to stop before reaching this path.
+    monkeypatch.setattr(data_space, 'require_packaged_channel', lambda: None)
     monkeypatch.setattr(BUILD, 'ROOT', tmp_path)
     monkeypatch.setattr(BUILD, 'source_version', lambda: '1.1.1')
     monkeypatch.setattr(BUILD, 'compiler_path', lambda *args: (tmp_path / 'ISCC.exe', '7.1.0'))
@@ -66,3 +70,16 @@ def test_check_cannot_remove_existing_release_installer(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['build_installer.py', '--check'])
     BUILD.main()
     assert output.read_bytes() == b'verified installer'
+
+
+@pytest.mark.parametrize('module_name', ['build', 'build_installer', 'publish'])
+def test_beta_blocks_formal_packaging_before_any_external_action(monkeypatch, module_name):
+    import importlib
+    import sys
+    from management.data_space import BetaIsolationError
+    monkeypatch.syspath_prepend(str(ROOT / 'packaging'))
+    module = importlib.import_module(module_name)
+    monkeypatch.setattr(module.subprocess, 'run', lambda *a, **k: pytest.fail('Executed formal packaging'))
+    monkeypatch.setattr(sys, 'argv', [module_name + '.py'])
+    with pytest.raises(BetaIsolationError, match='Beta'):
+        module.main()

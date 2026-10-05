@@ -83,6 +83,32 @@ def test_http_body_limits_and_valid_headers(service):
         assert status == 400 and value['error']['code'] == 'validation'
 
 
+def test_two_backends_keep_process_database_receipt_and_exit_independent(tmp_path):
+    roots = [tmp_path / 'isolated-one', tmp_path / 'isolated-two']
+    clients = []
+    try:
+        clients = [Client(root) for root in roots]
+        a, b = clients
+        assert a.runtime['pid'] != b.runtime['pid']
+        assert a.runtime['port'] != b.runtime['port']
+        assert a.runtime['token'] != b.runtime['token']
+        assert a.epoch != b.epoch
+        before_b = b.state()
+        receipt = a.command('create', {'type': 'task', 'title': 'Synthetic isolated record'}, request_id='isolated-shared-request-01')
+        assert receipt['revision'] == 1 and b.state() == before_b
+        assert b.query('list', type='task')['total'] == 0
+        a.stop_service()
+        deadline = time.monotonic() + 10
+        while psutil.pid_exists(a.runtime['pid']) and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert not psutil.pid_exists(a.runtime['pid'])
+        assert b.state() == before_b
+        assert b.command('create', {'type': 'task', 'title': 'Still available'}, request_id='isolated-shared-request-01')['revision'] == 1
+    finally:
+        for root in roots:
+            stop_owned_service(root)
+
+
 def wait_job(client, id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

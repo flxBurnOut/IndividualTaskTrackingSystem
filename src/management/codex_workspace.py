@@ -25,9 +25,9 @@ _INSTRUCTIONS_END = "# <<< personal-management managed instructions"
 _LEGACY_CONFIG_MARKER = "# Managed local business connection; regenerate after selecting a new installed release."
 _OLD_CONNECTION = "项目级 `.codex/config.toml` 已提供MCP配置，直接连接明确安装的发布版本，使用本工作区上一级的数据空间。软件升级或迁移后，通过项目根tools/prepare_codex_workspace.py更新连接配置；不要自行挑选发布目录中看起来版本最高的程序。未连接时先报告接口状态并检查配置，不绕过接口改库。不要读取或输出runtime.json中的令牌。"
 _NEW_CONNECTION = "项目级 `.codex/config.toml` 由个人事务管理的 Codex 设置自动准备，连接同一数据空间的业务服务。软件升级或迁移后，在个人事务管理中重新保存 Codex 设置即可修复连接，再新建或重新打开普通任务以加载配置。未连接时先报告接口状态并检查配置，不绕过接口改库。不要读取或输出runtime.json中的令牌。"
-_README = """# Codex 事务助手
+_README = """# Codex 事务助手 · Beta 测试版
 
-这里是个人事务管理的普通对话工作区；项目是否已在 Codex 中登记，以软件的连接状态提示为准。
+这里是个人事务管理 Beta 测试版的普通对话工作区，仅连接本工作区所属的独立 Beta 数据空间；项目是否已在 Codex 中登记，以软件的连接状态提示为准。
 
 在这个项目中可以为不同事件分别新建普通任务，粘贴群聊、邮件正文、截图或文件，直接说明需要记录、更新或安排什么。Agent 会先读取最新业务数据，再通过本地 MCP 接口更新同一份软件数据；不同任务不必共享完整聊天记录。
 
@@ -70,6 +70,8 @@ def _json(value) -> str:
 
 def mcp_config(data_dir) -> str:
     """Return portable stdio MCP configuration for this installed runtime."""
+    from .data_space import require_beta_dir
+    data_dir = require_beta_dir(data_dir)
     executable = Path(sys.executable).resolve()
     frozen = bool(getattr(sys, "frozen", False))
     if frozen:
@@ -273,7 +275,8 @@ def prepare_workspace(data_dir) -> dict:
     replaced atomically. The result intentionally says nothing about desktop
     project registration or trust: those are separate operations.
     """
-    data = Path(data_dir).resolve()
+    from .data_space import require_beta_dir
+    data = require_beta_dir(data_dir)
     workspace = data / WORKSPACE_NAME
     config_dir = workspace / ".codex"
     for directory in (workspace, config_dir):

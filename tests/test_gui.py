@@ -92,6 +92,8 @@ def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, win
     assert calls == ['connect_codex']
 
 def test_empty_five_navigation_and_form_create(app, window):
+    assert '个人事务管理 · Beta 测试版' in window.windowTitle()
+    assert any(label.text() == 'Beta 测试版' for label in window.findChildren(QLabel))
     assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert not window.today_page.has_plan
     assert Client(window.data_dir, autostart=False).query("state")["counts"] == {}

@@ -136,6 +136,25 @@ def test_changed_service_version_does_not_send_cached_write(live):
     assert live.core.query('list')['total'] == 0
 
 
+@pytest.mark.parametrize('channel', [None, 'stable'])
+def test_same_version_wrong_channel_service_rejects_beta_client(live, channel):
+    live.transform['state'] = lambda value: {**value, 'service_contract': {**service_contract(), 'channel': channel}}
+    with pytest.raises(ClientError) as error:
+        Client(live.core.root, autostart=False)
+    assert error.value.code == 'service_version_mismatch'
+    assert live.paths == ['/v1/query/state'] and not live.starts
+
+
+@pytest.mark.parametrize('channel', ['', 'stable'])
+@pytest.mark.parametrize('route', ['commands/create', 'maintenance/shutdown-if-idle'])
+def test_same_version_non_beta_entrance_cannot_write_or_stop_beta(live, channel, route):
+    from management.runtime_contract import CHANNEL_HEADER
+    before = live.core.query('state')
+    status, value = raw(live, route, headers=client_headers() | {CHANNEL_HEADER: channel})
+    assert status == 400 and value['error']['code'] == 'client_version_mismatch'
+    assert live.core.query('state') == before and not live.server.stopping.is_set()
+
+
 def test_shutdown_is_authenticated_and_has_no_business_payload(live):
     for options, payload, code in [({'token': 'wrong'}, {}, 'unauthorized'),
                                     ({'headers': client_headers()}, {'erase': True}, 'validation')]:

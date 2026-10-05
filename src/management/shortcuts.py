@@ -25,6 +25,8 @@ def read_shortcut(path):
 
 
 def write_shortcut(path, executable, data_dir):
+    from .data_space import require_beta_dir
+    data_dir = require_beta_dir(data_dir)
     if os.name!='nt':raise OSError('快捷方式创建仅用于 Windows。')
     path=Path(path).absolute();executable=Path(executable).resolve();data_dir=Path(data_dir).resolve()
     if path.suffix.lower()!='.lnk' or not executable.is_file():
@@ -44,7 +46,7 @@ def write_shortcut(path, executable, data_dir):
         link.SetPath(str(executable))
         link.SetArguments(subprocess.list2cmdline(['--data-dir',str(data_dir)]))
         link.SetWorkingDirectory(str(executable.parent))
-        link.SetDescription(APP_NAME+' · 打开已选择的数据空间')
+        link.SetDescription(APP_NAME+' · 打开已选择的 Beta 数据空间')
         link.SetIconLocation(str(executable),0)
         link.SetShowCmd(1)
         properties=link.QueryInterface(propsys.IID_IPropertyStore)

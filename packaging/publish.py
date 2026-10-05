@@ -100,6 +100,8 @@ def target_commit(env):
 
 
 def main():
+    from management.data_space import require_packaged_channel
+    require_packaged_channel()
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['inspect','prepare','publish','verify'])
     parser.add_argument('--version', default=source_version())

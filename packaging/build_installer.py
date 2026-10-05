@@ -162,6 +162,8 @@ def compiler_path(explicit: Path | None, bootstrap: bool) -> tuple[Path, str]:
 
 
 def main() -> None:
+    from management.data_space import require_packaged_channel
+    require_packaged_channel()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", default=None, help="Must match source and all release executable versions")
     parser.add_argument("--iscc", type=Path)

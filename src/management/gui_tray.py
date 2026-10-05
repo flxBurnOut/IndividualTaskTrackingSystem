@@ -37,19 +37,19 @@ class ServiceTray(QObject):
         self.menu = QMenu()
         self.status = self.menu.addAction('正在检查后台…')
         self.status.setEnabled(False)
-        self.version = self.menu.addAction('软件版本：' + __version__)
+        self.version = self.menu.addAction('Beta 测试版：' + __version__)
         self.version.setEnabled(False)
-        self.location = self.menu.addAction('数据位置：' + str(self.data_dir))
+        self.location = self.menu.addAction('Beta 数据位置：' + str(self.data_dir))
         self.location.setEnabled(False)
         self.menu.addSeparator()
-        self.open_action = self.menu.addAction('打开个人事务管理')
+        self.open_action = self.menu.addAction('打开' + APP_NAME)
         self.open_action.triggered.connect(self.open_window)
-        self.update_action = self.menu.addAction('版本与更新')
+        self.update_action = self.menu.addAction('Beta 版本与更新')
         self.update_action.triggered.connect(lambda: self.open_window(show_update=True))
         self.check_action = self.menu.addAction('检查后台状态')
         self.check_action.triggered.connect(self.check)
         self.menu.addSeparator()
-        self.exit_action = self.menu.addAction('退出软件与后台')
+        self.exit_action = self.menu.addAction('退出 Beta 软件与后台')
         self.exit_action.triggered.connect(self.exit_requested)
         self.icon.setContextMenu(self.menu)
         self.icon.activated.connect(self.activated)
@@ -214,7 +214,8 @@ class ServiceTray(QObject):
 
 
 def run(data_dir):
-    root = Path(data_dir).resolve()
+    from .data_space import require_beta_dir
+    root = require_beta_dir(data_dir)
     lock = OwnerLock(root / 'tray.lock')
     if not lock.acquire():
         return 0

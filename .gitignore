@@ -4,7 +4,7 @@
 !/README.md
 !/AGENTS.md
 !/pyproject.toml
-!/启动个人事务管理.vbs
+!/启动个人事务管理Beta.vbs
 !/src/
 !/tests/
 !/packaging/
@@ -47,6 +47,8 @@
 !/packaging/license_notices.py
 
 # Private data, credentials, local settings and generated files anywhere.
+/.beta-data/
+/data/
 .venv/
 __pycache__/
 *.py[cod]
@@ -58,10 +60,13 @@ __pycache__/
 .env.*
 *.db
 *.db-*
+*.db.*
 *.sqlite
 *.sqlite-*
+*.sqlite.*
 *.sqlite3
 *.sqlite3-*
+*.sqlite3.*
 *.log
 *.tmp
 *.bak

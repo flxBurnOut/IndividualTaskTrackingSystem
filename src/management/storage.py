@@ -35,7 +35,8 @@ DEFAULT_SETTINGS = {
 
 class Store:
     def __init__(self, data_dir, *, allow_pending_restore=False):
-        self.root = Path(data_dir).resolve()
+        from .data_space import require_beta_dir
+        self.root = require_beta_dir(data_dir)
         if (self.root / 'restore_pending.json').exists() and not allow_pending_restore:
             raise BusinessError('restore_pending', '恢复协调尚未完成；此目录不能启动。请从原数据空间重新恢复到新的目录。')
         self.root.mkdir(parents=True, exist_ok=True)
@@ -110,6 +111,8 @@ class Store:
 
     @contextlib.contextmanager
     def connect(self):
+        from .data_space import require_beta_dir
+        require_beta_dir(self.root)
         c = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")

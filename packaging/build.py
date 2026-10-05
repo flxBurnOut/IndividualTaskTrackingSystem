@@ -10,6 +10,8 @@ from workflow import version_directory, scoped_processes
 ROOT = Path(__file__).resolve().parents[1]
 
 def main():
+    from management.data_space import require_packaged_channel
+    require_packaged_channel()
     from build_installer import source_version
     version=source_version()
     parser=argparse.ArgumentParser()

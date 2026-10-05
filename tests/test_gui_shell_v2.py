@@ -52,18 +52,23 @@ def shell(app_v2, tmp_path):
         wait(app_v2, lambda: window.type_map and not window.bridge.callbacks)
         yield window
     finally:
-        if window:
-            window.review_pending = False
-            window.close()
-            wait(app_v2, lambda: not window.isVisible() and not window.bridge.thread.isRunning() and not window.bridge.mutation_thread.isRunning())
-            # Retire this fixture on the Qt owner thread before the next case;
-            # don't leave closed windows and their signal cycles for later GC.
-            window.deleteLater()
-            app_v2.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-            app_v2.processEvents()
-        if process.poll() is None:
-            process.terminate()
-        process.wait(timeout=10)
+        try:
+            if window:
+                window.review_pending = False
+                # These inputs belong to this disposable fixture. A failed
+                # assertion must not leave teardown waiting in a modal prompt.
+                window.tasks_page.quick_input.clear()
+                window.close()
+                wait(app_v2, lambda: not window.isVisible() and not window.bridge.thread.isRunning() and not window.bridge.mutation_thread.isRunning())
+                # Retire this fixture on the Qt owner thread before the next case;
+                # don't leave closed windows and their signal cycles for later GC.
+                window.deleteLater()
+                app_v2.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app_v2.processEvents()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)
 
 def create(client, kind, title, data=None, parent_id=None):
     client.state()
@@ -268,15 +273,24 @@ def test_close_during_quick_capture_failure_preserves_input(app_v2, shell, monke
         pending.append((name, callback, error))
     monkeypatch.setattr(shell.bridge, 'command', command)
     shell.tasks_page.quick_input.setText('合成：保存失败也要留下')
-    shell.tasks_page.save_quick()
-    assert shell.tasks_page.quick_pending
-    shell.close()
-    assert not shell.closed and shell.isVisible()
-    pending[-1][2]({'message': 'Synthetic failed save'})
-    app_v2.processEvents()
-    assert shell.isVisible() and not shell.closed
-    assert shell.tasks_page.quick_input.text() == '合成：保存失败也要留下'
-    shell.tasks_page.quick_input.clear()
+    try:
+        shell.tasks_page.save_quick()
+        assert shell.tasks_page.quick_pending
+        assert len(pending) == 1 and pending[0][0] == 'create'
+        failed = pending[0][2]
+        shell.close()
+        assert not shell.closed and shell.isVisible()
+        failed({'message': 'Synthetic failed save'})
+        assert not shell.tasks_page.quick_pending
+        app_v2.processEvents()
+        assert shell.isVisible() and not shell.closed
+        assert shell.tasks_page.quick_input.text() == '合成：保存失败也要留下'
+    finally:
+        # The command above is a captured synthetic callback, never a real
+        # outstanding write. Restore its transient state even if an assertion
+        # fails before the callback runs, then let the original failure surface.
+        shell.tasks_page.quick_pending = False
+        shell.tasks_page.quick_input.clear()
 
 
 def test_today_plan_to_review_has_two_choices_and_no_duplicate_questionnaires(app_v2, shell):

@@ -10,6 +10,7 @@ import uuid
 
 from .runtime import DataSpaceMismatch, UpdatePending, default_data_dir, discovery, read_startup_failure, require_data_dir, start_service
 from .runtime_contract import client_headers, matches_contract, mismatch_details, service_mismatch_message
+from .data_space import BetaIsolationError, require_beta_dir
 
 
 class ClientError(Exception):
@@ -23,7 +24,10 @@ class Client:
         if entrance not in {'gui', 'mcp', 'installer', 'tray'}:
             raise ValueError('Unknown client entrance')
         self.entrance = entrance
-        self.data_dir = Path(data_dir or default_data_dir()).resolve()
+        try:
+            self.data_dir = require_beta_dir(data_dir if data_dir is not None else default_data_dir())
+        except BetaIsolationError as error:
+            raise ClientError('beta_data_isolation', str(error)) from error
         self.autostart = autostart
         self.epoch, self.revision = None, None
         self.runtime = None
@@ -45,7 +49,7 @@ class Client:
                 if runtime is not None:
                     self._require_data_dir(runtime.get('data_dir') if isinstance(runtime, dict) else None)
                 self.runtime = runtime
-            except DataSpaceMismatch as error:
+            except (DataSpaceMismatch, BetaIsolationError) as error:
                 self.runtime = None
                 raise ClientError('data_space_mismatch', str(error)) from error
             if self.runtime:
@@ -89,8 +93,9 @@ class Client:
 
     def _require_data_dir(self, value):
         try:
+            require_beta_dir(self.data_dir)
             require_data_dir(value, self.data_dir)
-        except DataSpaceMismatch as error:
+        except (DataSpaceMismatch, BetaIsolationError) as error:
             self.runtime = None
             raise ClientError('data_space_mismatch', str(error)) from error
 

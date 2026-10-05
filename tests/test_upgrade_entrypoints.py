@@ -55,6 +55,10 @@ def test_version_summary_distinguishes_mcp_observation_from_configuration():
     from management.gui_update import version_summary
     state = {'service_contract': {'app_version': __version__}}
     assert '尚未核验' in version_summary(state)
+    assert '个人事务管理 · Beta 测试版' in version_summary(state)
+    assert '未核验为 Beta' in version_summary(state)
+    state['service_contract']['channel'] = 'beta'
+    assert f'后台版本：{__version__}（Beta 测试版）' in version_summary(state)
     state['client_entrances'] = {'mcp': {'app_version': __version__, 'verified': True}}
     assert '其他已打开会话仍可能需要刷新' in version_summary(state)
     state['client_entrances']['mcp']['app_version'] = '1.0.2'
@@ -62,7 +66,7 @@ def test_version_summary_distinguishes_mcp_observation_from_configuration():
 
 
 def test_update_dialog_does_not_stop_backend_with_unsaved_editor(tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QApplication, QWidget, QDialog
+    from PySide6.QtWidgets import QApplication, QWidget, QDialog, QLabel
     from management.gui_update import UpdateDialog
     app = QApplication.instance() or QApplication([])
     parent = QWidget()
@@ -73,6 +77,11 @@ def test_update_dialog_does_not_stop_backend_with_unsaved_editor(tmp_path, monke
         query=lambda name, done, failed: done({'service_contract': {'app_version': __version__}}),
         prepare_update=lambda *args: calls.append('stop'))
     dialog = UpdateDialog(parent)
+    assert 'Beta' in dialog.windowTitle()
+    instructions = '\n'.join(label.text() for label in dialog.findChildren(QLabel))
+    assert '尚未提供独立 Beta 安装包' in instructions
+    assert '启动个人事务管理Beta.vbs' in instructions
+    assert '请运行新版安装包' not in instructions
     editor = QDialog(parent)
     editor.show()
     try:

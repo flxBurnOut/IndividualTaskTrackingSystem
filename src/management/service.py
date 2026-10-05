@@ -16,7 +16,7 @@ import time
 
 from .core import Core
 from .runtime import OwnerLock, require_no_pending_update
-from .runtime_contract import ENTRANCE_HEADER, PROTOCOL_HEADER, VERSION_HEADER, service_contract
+from .runtime_contract import CHANNEL_HEADER, ENTRANCE_HEADER, PROTOCOL_HEADER, VERSION_HEADER, service_contract
 from . import __version__
 from .schemas import BusinessError
 from .storage import encode, now
@@ -58,12 +58,15 @@ class Server(ThreadingHTTPServer):
         version, protocol = headers.get(VERSION_HEADER), headers.get(PROTOCOL_HEADER)
         entrance = headers.get(ENTRANCE_HEADER)
         entrance = entrance if entrance in {'gui', 'mcp', 'installer', 'tray'} else 'unknown'
-        verified = version == self.contract['app_version'] and protocol == str(self.contract['protocol_version'])
+        channel = headers.get(CHANNEL_HEADER)
+        verified = (version == self.contract['app_version'] and protocol == str(self.contract['protocol_version'])
+                    and channel == self.contract['channel'])
         # Diagnostics only: caller-declared role is not an authorization claim.
         with self._activity_lock:
             self.client_entrances[entrance] = {
                 'app_version': version[:64] if isinstance(version, str) else None,
                 'protocol_version': protocol[:16] if isinstance(protocol, str) else None,
+                'channel': channel[:16] if isinstance(channel, str) else None,
                 'verified': verified, 'checked_at': now()}
         return verified
 
@@ -270,7 +273,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_service(data_dir, resume_token=None):
-    root = Path(data_dir).resolve()
+    from .data_space import require_beta_dir
+    root = require_beta_dir(data_dir)
     require_no_pending_update(root, resume_token)
     lock = OwnerLock(root / 'service.lock')
     if not lock.acquire():

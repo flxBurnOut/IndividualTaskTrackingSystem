@@ -20,6 +20,7 @@ from .gui_dashboard import DashboardPage
 from .gui_workspace import BASE_TYPES, TREE_TYPES, WorkspacePage, TaskDetailDialog, make_button, plain_label
 from .gui_review import ReviewPage
 from .gui_calendar import install_calendar
+from .branding import APP_NAME
 
 NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("tasks", "任务"), ("projects", "项目与课程"), ("reviews", "复盘")]
 from .appearance import normalize_appearance, assistants_visible
@@ -104,7 +105,7 @@ class MainWindow(QMainWindow):
         configure_palette(QApplication.instance())
         self.data_dir = Path(data_dir)
         from . import __version__
-        self.setWindowTitle(f"个人事务管理 · {__version__}")
+        self.setWindowTitle(f"{APP_NAME} · {__version__}")
         self.resize(1290, 850)
         self.setMinimumSize(1050, 720)
         self.bridge = ServiceBridge(data_dir, self, client_factory=client_factory)
@@ -160,7 +161,7 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(15, 25, 15, 19)
         side.setSpacing(8)
         side.addWidget(plain_label("个人事务", "Brand"))
-        side.addWidget(plain_label("安排与回顾", "BrandSub"))
+        side.addWidget(plain_label("Beta 测试版", "BrandSub"))
         self.nav_buttons = {}
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
@@ -650,6 +651,8 @@ class MainWindow(QMainWindow):
 
 def run(data_dir, argv=None, *, show_update=False):
     from .branding import set_windows_identity, configure_application
+    from .data_space import require_beta_dir
+    data_dir = require_beta_dir(data_dir)
     set_windows_identity()
     app = QApplication.instance() or QApplication(argv or [])
     configure_application(app)
@@ -657,11 +660,9 @@ def run(data_dir, argv=None, *, show_update=False):
     instance = WindowInstance(data_dir, app)
     if not instance.acquire():
         if not notify_window(data_dir, 'update' if show_update else 'show'):
-            QMessageBox.information(None, '个人事务管理', '已有窗口正在启动或退出，请稍后重试。')
+            QMessageBox.information(None, APP_NAME, '已有 Beta 窗口正在启动或退出，请稍后重试。')
         return 0
     manager = install_gui_gc(app)
-    app.setApplicationName("个人事务管理")
-    app.setOrganizationName("PersonalManagement")
     app.setStyle("Fusion")
     configure_palette(app)
     window = MainWindow(data_dir)

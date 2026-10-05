@@ -14,7 +14,7 @@ def install_main_tutorials(window):
     ready = lambda: bool(window.type_map) and not window.bridge.callbacks and not window.closed
     page = window.dashboard_page
     manager.watch('dashboard', page, lambda: [
-        TourStep(page.date, '欢迎使用个人事务管理', '总览汇总今天、本周安排和当前需要留意的事项。接下来用几步认识常用入口；也可以随时跳过。'),
+        TourStep(page.date, '欢迎使用个人事务管理 Beta 测试版', '总览汇总今天、本周安排和当前需要留意的事项。接下来用几步认识常用入口；也可以随时跳过。'),
         TourStep(window.navigation_sidebar, '从这里切换面板', '“任务”快速记录与整理待办；“今天”按日期安排与执行；“项目与课程”整理任务和资料；“复盘”记录实际结果。'),
         TourStep(window.new_button, '先记录需要做的事', '从“＋ 新建”创建任务、项目、课程、活动、分类或目标。任务可以归属到项目或课程，方便后续安排。'),
         TourStep(window.search_button, '按名称找回记录', '输入任务、项目或课程名称，快速打开已有记录。'),

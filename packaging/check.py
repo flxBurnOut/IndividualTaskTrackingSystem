@@ -118,6 +118,11 @@ def run_checked(args, run):
         for path in [*run.folder.glob('*.xml'), run.folder / 'result.json']:
             path.unlink(missing_ok=True)
         environment = dict(os.environ, PERSONAL_MANAGEMENT_NO_TRAY='1', PERSONAL_MANAGEMENT_NO_ONBOARDING='1', PYTHONUTF8='1')
+        # unittest and helper processes also use tempfile outside pytest's
+        # --basetemp unless all platform temp variables point into our work tree.
+        temporary = run.work / 'temp'
+        temporary.mkdir()
+        environment.update(TEMP=str(temporary), TMP=str(temporary), TMPDIR=str(temporary))
         environment['PERSONAL_MANAGEMENT_CHECK_REPORT_DIR'] = str(run.folder)
         if args.profile == 'installer':
             environment['PERSONAL_MANAGEMENT_INSTALLER_TEST'] = '1'

@@ -89,6 +89,23 @@ def test_identical_pass_is_reused_but_changed_inputs_and_failures_rerun(tmp_path
     assert json.loads((folder / 'latest.json').read_text())['passed'] is True
 
 
+def test_stdlib_and_child_tempfiles_are_owned_and_reclaimed(tmp_path, monkeypatch):
+    (tmp_path / 'tests').mkdir()
+    (tmp_path / 'tests/test_example.py').write_text('')
+    monkeypatch.setattr(check, 'ROOT', tmp_path)
+    monkeypatch.setattr(check, 'fingerprint', lambda *a: 'synthetic-temp-environment')
+    script = ('from pathlib import Path; import sys,tempfile; '
+              'root=Path(sys.argv[1]); '
+              'assert Path(tempfile.gettempdir()).is_relative_to(root); '
+              'space=tempfile.TemporaryDirectory(); '
+              'assert Path(space.name).is_relative_to(root); '
+              'Path(space.name,"synthetic.txt").write_text("fixture"); space.cleanup()')
+    monkeypatch.setattr(check, 'commands', lambda profile, paths, run: [
+        [sys.executable, '-X', 'utf8', '-c', script, str(run.work)]])
+    assert check.main(['focused', 'tests/test_example.py', '--force']) == 0
+    assert not (tmp_path / '.build/checks/focused/work').exists()
+
+
 def test_prune_preserves_business_data_and_upgrade_backups(tmp_path):
     fixture = tmp_path / '.build/old-pytest/test_example0'
     fixture.mkdir(parents=True)
