@@ -30,6 +30,8 @@ def test_import_has_only_source_name_and_range_visible(app,cleanup):
     assert dialog.start.text()=='选择起始周' and dialog.end.text()=='选择结束日期'
     assert not any(w.isVisible() for cls in (QComboBox,QCheckBox,QTabWidget) for w in dialog.findChildren(cls))
     assert dialog.organize_button.text()=='整理课表'
+    assert '课表专用文件夹的根目录' in dialog.archive_hint.text()
+    assert not any(query['name']=='library_destinations' for query in bridge.queries)
     dialog.title.setText('课表'); dialog.organize()
     assert '请选择课表的起始周' in dialog.status.text() and not bridge.commands
 
@@ -60,25 +62,36 @@ def test_single_action_owns_source_then_opens_scoped_review(app,cleanup,monkeypa
     bridge.commands[-1]['callback']({'result':{'entity':entity}})
     upload=bridge.commands[-1]
     assert upload['name']=='add_source' and upload['payload']['owner_id']=='table-a'
+    assert upload['payload']['library_subdir']==''
+    assert not any(query['name']=='library_destinations' for query in bridge.queries)
     assert len(bridge.commands)==2 and not dialog.editor.isEnabled()
     upload['callback']({'result':{'entity':{'id':'source-a','title':'课表截图'}}})
     assert len(captured)==1
+    assert dialog.capture.completed and dialog.capture.result()==QDialog.DialogCode.Accepted
     assert captured[0]['scope']=={'kind':'timetable','entity_id':'table-a'}
     assert captured[0]['source_ids']==['source-a'] and captured[0]['auto_send'] is True
     assert 'Recess' in captured[0]['prompt']
     cleanup.extend(parent.dialogs)
 
 
-def test_uncertain_source_retry_does_not_duplicate_container(app,cleanup):
+@pytest.mark.parametrize('first_error',['connection_lost','protocol_error'])
+def test_uncertain_source_retry_does_not_duplicate_container(app,cleanup,first_error):
     bridge=ControlledBridge(); dialog=TimetableImportDialog(bridge,business_date='2030-01-07'); cleanup.append(dialog)
     bridge.deliver('settings',settings()); fill(dialog); dialog.organize()
     create=bridge.commands[-1]; create['callback']({'result':{'entity':dict(table(),data=create['payload']['data'])}})
-    original=bridge.commands[-1]['payload']; bridge.commands[-1]['error']({'code':'connection_lost','message':'连接中断'})
+    original=bridge.commands[-1]['payload']; options=bridge.commands[-1]['options']
+    bridge.commands[-1]['error']({'code':first_error,'message':'保存结果未确认'})
     assert dialog.uncertain_stage=='source' and not dialog.editor.isEnabled()
     dialog.organize()
     assert [w['name'] for w in bridge.commands]==['create','add_source','add_source']
-    assert bridge.commands[-1]['payload']==original
-    dialog.capture.pending=False; dialog.capture.uncertain=False
+    assert bridge.commands[-1]['payload']==original and bridge.commands[-1]['options']==options
+    bridge.commands[-1]['error']({'code':'unauthorized','message':'后续连接需要重新认证'})
+    assert dialog.uncertain_stage=='source' and not dialog.editor.isEnabled() and not dialog.close()
+    dialog.title.setText('Changed title while disabled'); dialog.organize()
+    assert [w['name'] for w in bridge.commands]==['create','add_source','add_source','add_source']
+    assert bridge.commands[-1]['payload']==original and bridge.commands[-1]['options']==options
+    assert original['owner_id']=='table-a' and original['library_subdir']==''
+    dialog.capture.pending=False; dialog.capture.uncertain=False; dialog.uncertain_stage=None
 
 
 def test_failed_upload_keeps_container_for_retry(app,cleanup):
@@ -126,6 +139,10 @@ def test_real_import_owned_image_and_handoff_without_plan(app,cleanup,tmp_path,m
     table_id=handoffs[0]['scope']['entity_id']; source_id=handoffs[0]['source_ids'][0]
     assert core.query('timetables',id=table_id)['items'][0]['data']['week_numbering']=='teaching'
     source=core.query('get',id=source_id)['entity']; assert source['data']['source_owner_id']==table_id
+    assert source['data']['library_subdir']==''
+    destination=core.query('library_destinations',id=source_id)
+    assert destination['current']['library_subdir']==''
+    assert source['data']['library_relative_path']==destination['root_relative_path']+'/schedule.png'
     assert core.query('list',type='plan')['total']==0
     assert [w[0] for w in bridge.commands]==['create','add_source']
     cleanup.extend(parent.dialogs)

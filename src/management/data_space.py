@@ -7,6 +7,7 @@ fixtures created by packaging/check.py. A separate packaged channel is pending.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 
@@ -58,8 +59,15 @@ def require_beta_dir(data_dir):
                 raise ValueError('linked data directory')
         if root.exists():
             for path in root.iterdir():
-                if (path.is_symlink() or path.is_junction()
-                        or path.is_file() and path.stat().st_nlink > 1):
+                try:
+                    metadata = path.lstat()
+                except FileNotFoundError:
+                    # SQLite may remove WAL/SHM files while a client checks the
+                    # directory. A vanished entry cannot redirect this access.
+                    continue
+                if (stat.S_ISLNK(metadata.st_mode)
+                        or getattr(metadata, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                        or stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1):
                     raise ValueError('linked data file')
         return root
     except (OSError, ValueError, TypeError, RuntimeError) as error:

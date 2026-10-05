@@ -114,6 +114,29 @@ def test_generic_registered_command_unknown_rejection_and_typed_tool(business):
     assert core.query("list", type="task")["total"] == 2
 
 
+def test_library_destinations_and_refile_are_available_through_actual_mcp(business,tmp_path):
+    core=business.core
+    owner=command(core,'create',{'type':'course','title':'Synthetic MCP archive course'})['entity']
+    source=tmp_path/'material.txt';source.write_text('Synthetic MCP material','utf-8')
+    asset=command(core,'import_asset',{'path':str(source),'owner_id':owner['id'],'library_subdir':''})['entity']
+    async def scenario():
+        async with MCPClient(create_server(core.root,client=business)) as client:
+            query=await client.call_tool('query_business',{'name':'library_destinations','params':{'id':asset['id']}})
+            assert not query.is_error,text(query)
+            assert query.structured_content['current']['id']==asset['id']
+            assert query.structured_content['owner_id']==owner['id']
+            args={'name':'refile_source','payload':{'id':asset['id'],'version':asset['version'],'library_subdir':'课件'},**guards(core)}
+            saved=await client.call_tool('execute_command',args)
+            assert not saved.is_error,text(saved)
+            assert saved.structured_content['result']['entity']['data']['library_subdir']=='课件'
+            again=await client.call_tool('execute_command',args)
+            assert not again.is_error and again.structured_content['replayed']
+            assert again.structured_content['result']==saved.structured_content['result']
+    asyncio.run(scenario())
+    assert business.commands==['refile_source','refile_source']
+    assert 'library_destinations' in business.queries
+
+
 def test_dynamic_extensions_remain_discoverable_and_executable_beyond_first_page(business):
     core = business.core
     schema = {"type": "object", "additionalProperties": False}
@@ -261,6 +284,9 @@ def test_managed_catalog_and_direct_write_guard_use_actual_metadata_and_core(bus
             assert value["direct_business_writes"] is False and "revise_plan" in value["allowed_commands"]
             denied = await client.session.call_tool("execute_command", {"name": "revise_plan", "payload": {}, **guards(core)}, meta={"threadId": THREAD})
             error(denied, "discussion_confirmation_required")
+            refile = await client.session.call_tool("execute_command", {"name": "refile_source", "payload": {
+                "id": "synthetic-source", "version": 1, "library_subdir": "课件"}, **guards(core)}, meta={"threadId": THREAD})
+            error(refile, "discussion_confirmation_required")
             typed = await client.session.call_tool("create_entity", {"type": "task", "title": "Must not write", **guards(core)}, meta={"threadId": THREAD})
             error(typed, "discussion_confirmation_required")
             extension = await client.session.call_tool("query_business", {"name": "synthetic.private_query"}, meta={"threadId": THREAD})

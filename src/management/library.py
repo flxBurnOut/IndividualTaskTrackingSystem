@@ -6,14 +6,126 @@ No query rewrites course/task facts or silently imports edits made in Explorer.
 from __future__ import annotations
 import json
 import os
+import copy
+from functools import wraps
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import uuid
 from .schemas import BusinessError
+from .storage import now
 from .resources import _plain_path, _digest, _publish_new, ResourceError, RESERVED
 
 ROOT_NAME = '原文件'
+
+
+def serialized(function):
+    @wraps(function)
+    def run(core, *args, **kwargs):
+        with core.library_lock:
+            return function(core, *args, **kwargs)
+    return run
+
+
+def subdirectory(value):
+    if value == '': return ''
+    value = relative(value)
+    if any(part.startswith('.') for part in value.split('/')):
+        raise BusinessError('library_path', '新归档目录不能使用隐藏或内部管理目录。')
+    return value
+
+
+def owner_id(c, entity):
+    value = entity['data'].get('source_owner_id') or entity.get('parent_id')
+    if value is None:
+        row = c.execute("SELECT source_id FROM links WHERE target_id=? AND kind IN ('uses','contributes') ORDER BY id LIMIT 1", (entity['id'],)).fetchone()
+        if row: value = row[0]
+    return value
+
+
+def _subdirs(core, c, folder):
+    """Bounded choices from saved paths and existing folders, never from titles."""
+    found = set(); truncated = False
+    prefix = folder + '/'
+    for row in c.execute("SELECT data FROM entities WHERE type='asset'"):
+        data = json.loads(row[0]); path = data.get('library_relative_path')
+        if not path and str(data.get('source_identity', '')).startswith('y2s1:') and data.get('source_relative_path'):
+            path = 'Y2S1/' + data['source_relative_path']
+        if not isinstance(path, str) or not path.casefold().startswith(prefix.casefold()): continue
+        parts = path[len(prefix):].split('/')[:-1]
+        for index in range(1, min(len(parts), 8) + 1):
+            candidate = '/'.join(parts[:index])
+            try: subdirectory(candidate)
+            except BusinessError: continue
+            found.add(candidate)
+        if len(found) >= 500: truncated = True; break
+    base = _plain_path(root(core) / relative(folder)); queue = [('', base, 0)]; scanned = 0
+    while queue and len(found) < 500 and scanned < 5000:
+        parent, path, depth = queue.pop(0)
+        if not path.exists(): continue
+        with os.scandir(path) as entries:
+            for entry in entries:
+                scanned += 1
+                if scanned >= 5000: truncated = True; break
+                if not entry.is_dir(follow_symlinks=False): continue
+                candidate = (parent + '/' if parent else '') + entry.name
+                try:
+                    subdirectory(candidate); child = _plain_path(entry.path)
+                except (BusinessError, ResourceError): continue
+                found.add(candidate)
+                if depth < 7: queue.append((candidate, child, depth + 1))
+                else: truncated = True
+                if len(found) >= 500: truncated = True; break
+    if queue: truncated = True
+    return sorted(found, key=str.casefold)[:500], truncated
+
+
+def _selected_subdir(core, c, folder, value):
+    if value is not None: return subdirectory(value)
+    choices, truncated = _subdirs(core, c, folder)
+    if choices or truncated:
+        raise BusinessError('library_destination_required', '此归属已有分类目录，请先核对并选择归档文件夹；明确保存到根目录时传入空字符串。',
+                            {'query': 'library_destinations', 'subdirs': choices[:20]})
+    return ''
+
+
+def location(core, c, entity):
+    data = entity['data']; owner = owner_id(c, entity)
+    folder = _folder(core, c, owner)
+    cached = c.execute('SELECT * FROM library_files WHERE entity_id=?', (entity['id'],)).fetchone()
+    rel = data.get('library_relative_path')
+    if not rel and cached and cached['sha256'] == data.get('sha256'): rel = cached['relative_path']
+    rel = relative(rel or _preferred(core, c, data, data.get('original_name') or entity['title'], owner))
+    parent = posixpath.dirname(rel)
+    subdir = '' if parent.casefold() == folder.casefold() else parent[len(folder)+1:] if parent.casefold().startswith(folder.casefold()+'/') else None
+    path = _plain_path(root(core) / rel)
+    return {'path': str(path), 'relative_path': rel, 'subdir': subdir, 'owner_id': owner,
+            'exists': path.is_file(), 'sha256': data.get('sha256'), 'size': data.get('size'), 'read_only_copy': True}
+
+
+@serialized
+def destinations(core, p):
+    limit, offset = p.get('limit', 100), p.get('offset', 0)
+    if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+        raise BusinessError('validation', '归档目录每页需要 1 至 100 项。')
+    with core.store.lock, core.store.connect() as c:
+        current = None; owner = p.get('owner_id')
+        if p.get('id'):
+            entity = core.store.get(c, p['id'])
+            if entity['type'] != 'asset' or not entity['data'].get('sha256'):
+                raise BusinessError('not_file', '此记录不是已保存的原文件。')
+            actual_owner = owner_id(c, entity)
+            if owner is not None and owner != actual_owner: raise BusinessError('source_owner', '归属与资料不一致。')
+            owner = actual_owner; current = {**location(core,c,entity), 'id':entity['id'], 'version':entity['version']}
+            current['library_subdir'] = current['subdir']
+        from .sources import _owner
+        _owner(core,c,owner)
+        folder = _folder(core,c,owner); choices, truncated = _subdirs(core,c,folder)
+        rows = [{'subdir':'', 'label':'归属根目录'}] + [{'subdir':value, 'label':value} for value in choices]
+    return {'owner_id':owner, 'path':str(root(core)/folder), 'root_relative_path':folder,
+            'items':rows[offset:offset+limit], 'total':len(rows),
+            'next_offset':offset+limit if offset+limit < len(rows) else None,
+            'requires_choice':bool(choices) or truncated, 'truncated':truncated, 'current':current}
 
 
 def initialize(c):
@@ -115,12 +227,19 @@ def _publish(core,data,rel,stamp=None):
     return {'relative_path':rel,'size':stat.st_size,'mtime_ns':stat.st_mtime_ns,'created':True}
 
 
-def prepare(core,data,name,owner_id=None):
+@serialized
+def prepare(core,data,name,owner_id=None,*,library_subdir=None):
     """Publish a newly imported original outside the business transaction."""
     with core.store.lock,core.store.connect() as c:
-        c.execute('BEGIN IMMEDIATE');rel=_preferred(core,c,data,name,owner_id);c.commit()
+        c.execute('BEGIN IMMEDIATE')
+        from .sources import _owner
+        _owner(core,c,owner_id)
+        folder = _folder(core,c,owner_id)
+        subdir = _selected_subdir(core,c,folder,library_subdir)
+        rel = relative(folder + ('/'+subdir if subdir else '') + '/' + safe_name(Path(name).name))
+        c.commit()
     for attempt in range(3):
-        try:return _publish(core,data,rel)
+        try:return {**_publish(core,data,rel), 'subdir':subdir, 'path':str(root(core)/rel), 'owner_id':owner_id}
         except (BusinessError,ResourceError) as error:
             if error.code not in {'edited_copy','OUTPUT_EXISTS','ALREADY_EXISTS'}:raise
             # A different version/name collision never replaces an existing file.
@@ -137,7 +256,10 @@ def register(c,entity,published):
         (entity['id'],entity['data']['sha256'],published['relative_path'],published['size'],published['mtime_ns']))
 
 
+@serialized
 def materialize(core,entity):
+    # Callers may hold an entity snapshot from before a completed refile.
+    with core.store.connect() as c: entity=core.store.get(c,entity['id'])
     data=entity['data']
     if entity['type']!='asset' or not data.get('sha256'):
         raise BusinessError('not_file','此记录不是已保存的原文件。')
@@ -145,11 +267,9 @@ def materialize(core,entity):
         c.execute('BEGIN IMMEDIATE')
         cached=c.execute('SELECT * FROM library_files WHERE entity_id=?',(entity['id'],)).fetchone()
         stamp=dict(cached) if cached and cached['sha256']==data['sha256'] else None
-        owner_id=data.get('source_owner_id') or entity.get('parent_id')
-        if owner_id is None:
-            owner=c.execute("SELECT source_id FROM links WHERE target_id=? AND kind IN ('uses','contributes') LIMIT 1",(entity['id'],)).fetchone()
-            if owner:owner_id=owner[0]
-        rel=stamp['relative_path'] if stamp else _preferred(core,c,data,data.get('original_name') or entity['title'],owner_id)
+        owner=owner_id(c,entity)
+        rel=data.get('library_relative_path') or (stamp['relative_path'] if stamp else _preferred(core,c,data,data.get('original_name') or entity['title'],owner))
+        if stamp and stamp['relative_path'] != rel: stamp=None
         c.commit()
     published=_publish(core,data,rel,stamp)
     if not stamp or any(stamp.get(k)!=published[k] for k in ('relative_path','size','mtime_ns')):
@@ -160,6 +280,133 @@ def materialize(core,entity):
         'exists':True,'reference_only':False,'read_only_copy':True,'library_original':True,**published}
 
 
+def ensure_same_destination(core, c, entity, requested):
+    actual = location(core,c,entity)
+    if requested is not None:
+        requested = subdirectory(requested)
+        if actual['subdir'] != requested:
+            raise BusinessError('library_location_conflict', '这份资料已经保存于其他位置；未重复导入或自动移动，请用“移动原件”核对归档位置。',
+                                {'entity_id':entity['id'], 'current_relative_path':actual['relative_path'], 'command':'refile_source'})
+    return actual
+
+
+@serialized
+def prepare_refile(core, p):
+    if set(p) - {'id','version','library_subdir','_operation_id'} or 'library_subdir' not in p:
+        raise BusinessError('validation', '移动原件需要资料编号、版本和明确的归属内目录。')
+    subdir = subdirectory(p['library_subdir'])
+    if type(p.get('version')) is not int or p['version'] < 1:
+        raise BusinessError('validation', '请重新读取资料版本后再移动。')
+    with core.store.lock, core.store.connect() as c:
+        entity = core._versioned(c,p)
+        if entity['type'] != 'asset' or entity['archived'] or not entity['data'].get('sha256'):
+            raise BusinessError('not_file', '只能移动仍在使用的已保存原文件。')
+        old = location(core,c,entity); owner = old['owner_id']
+        from .sources import _owner
+        _owner(core,c,owner)
+        folder = _folder(core,c,owner)
+        filename = PurePosixPath(old['relative_path']).name
+        target = relative(folder + ('/'+subdir if subdir else '') + '/' + filename)
+        plan = {'id':entity['id'], 'version':entity['version'], 'owner_id':owner,
+                'sha256':entity['data']['sha256'], 'size':entity['data']['size'],
+                'old_relative_path':old['relative_path'], 'new_relative_path':target, 'subdir':subdir}
+    path = _plain_path(root(core)/old['relative_path'])
+    if path.exists() and _digest(path) != (plan['sha256'],plan['size']):
+        raise BusinessError('edited_copy', '原位置的文件已被外部修改，已保留；请先作为新版本导入再整理。')
+    try: published = _publish(core,entity['data'],target)
+    except (BusinessError,ResourceError) as error:
+        if error.code in {'edited_copy','OUTPUT_EXISTS','ALREADY_EXISTS'}:
+            raise BusinessError('library_conflict', '目标位置已存在不同内容的同名文件，未覆盖；请先核对目标目录。') from error
+        raise
+    plan['published'] = published
+    return plan
+
+
+def apply_refile(core, c, p, rid, prepared):
+    old = core._versioned(c,p)
+    if old['type'] != 'asset' or old['archived']: raise BusinessError('not_file', '此资料当前不可移动。')
+    actual = location(core,c,old)
+    if (old['id'],old['version'],actual['owner_id'],old['data'].get('sha256'),old['data'].get('size'),actual['relative_path']) != (
+            prepared['id'],prepared['version'],prepared['owner_id'],prepared['sha256'],prepared['size'],prepared['old_relative_path']):
+        raise BusinessError('entity_conflict', '资料或归属已变化，原文件保留，请重新核对。')
+    from .sources import _owner
+    _owner(core,c,actual['owner_id'])
+    target = _plain_path(root(core)/relative(prepared['new_relative_path']))
+    if _digest(target) != (prepared['sha256'],prepared['size']):
+        raise BusinessError('edited_copy', '准备好的目标副本发生变化，尚未更新资料位置。')
+    new = copy.deepcopy(old)
+    new['data'].update(library_relative_path=prepared['new_relative_path'], library_subdir=prepared['subdir'])
+    entity = core._save(c,old,new,rid,'refile_source')
+    register(c,entity,prepared['published'])
+    return {'entity':entity, 'library':location(core,c,entity), 'previous_relative_path':prepared['old_relative_path']}
+
+
+def _other_reference(core,c,identifier,rel):
+    # Multiple asset records may intentionally share independent readable bytes.
+    # Unindexed imports and legacy originals also need to retain their copies.
+    for row in c.execute("SELECT * FROM entities WHERE type='asset' AND id!=?", (identifier,)):
+        entity = core.store.entity(row)
+        if not entity['data'].get('sha256'): continue
+        try: other = location(core,c,entity)
+        except (BusinessError,ResourceError):
+            # An unreadable reference is not evidence that deletion is safe.
+            return True
+        if other['relative_path'].casefold() == rel.casefold(): return True
+    return False
+
+
+def _remove_old(path, digest, size):
+    path = _plain_path(path,file=True)
+    if _digest(path) != (digest,size):
+        raise BusinessError('edited_copy', '旧位置已有外部修改，保留该副本。')
+    path = _plain_path(path,file=True)
+    path.chmod(0o600)
+    path.unlink()
+
+
+@serialized
+def finish_refile(core, request_id):
+    """Post-commit cleanup never changes the stable business receipt or record."""
+    with core.store.connect() as c:
+        row = c.execute("SELECT * FROM io_operations WHERE request_id=? AND command='refile_source'", (request_id,)).fetchone()
+        if not row or row['status'] != 'committed':
+            return {'status':'pending','message':'归档尚未确认提交，旧位置保留。'}
+        plan = json.loads(row['result'])
+    cleanup = plan.get('cleanup') or {}
+    if cleanup.get('status') in {'removed','not_needed','retained_shared','retained_modified'}: return cleanup
+    oldrel = plan['old_relative_path']; newrel = plan['new_relative_path']
+    try:
+        with core.store.lock, core.store.connect() as c:
+            current = core.store.get(c,plan['id']); actual = location(core,c,current)
+            if actual['relative_path'].casefold() == oldrel.casefold() or oldrel.casefold() == newrel.casefold():
+                cleanup = {'status':'not_needed','message':'当前资料仍使用该位置，无需清理。'}
+            elif _other_reference(core,c,plan['id'],oldrel):
+                cleanup = {'status':'retained_shared','message':'归档已更新；旧位置仍被其他资料引用，已保留共用副本。'}
+            else:
+                current_path = _plain_path(actual['path'],file=True)
+                if _digest(current_path) != (plan['sha256'],plan['size']):
+                    raise BusinessError('library_target_changed', '当前归档文件已变化，暂不清理旧副本。')
+                path = _plain_path(root(core)/relative(oldrel))
+                if path.exists(): _remove_old(path,plan['sha256'],plan['size'])
+                cleanup = {'status':'removed','message':'新位置已保存并核验，旧位置已清理。'}
+    except (BusinessError,ResourceError,OSError) as error:
+        modified = getattr(error,'code',None) == 'edited_copy'
+        cleanup = {'status':'retained_modified' if modified else 'pending',
+                   'message':'新位置已保存；旧副本'+('发生变化，已保留。' if modified else '暂未清理，请按原请求编号重试。'),
+                   'reason':str(error)[:300]}
+    plan['cleanup'] = cleanup
+    try:
+        with core.store.connect() as c:
+            c.execute('UPDATE io_operations SET result=?,updated_at=? WHERE request_id=?',
+                      (json.dumps(plan,ensure_ascii=False,sort_keys=True),now(),request_id))
+    except Exception:
+        # The asset and original business receipt already committed. A replay
+        # rechecks the filesystem and completes this bookkeeping safely.
+        return {**cleanup,'status':'pending','message':'资料位置已保存；清理状态暂未记录，请按原请求编号重试核对。'}
+    return cleanup
+
+
+@serialized
 def browse(core,p):
     owner_id=p.get('owner_id');limit=p.get('limit',20);offset=p.get('offset',0)
     if type(limit) is not int or not 1<=limit<=100 or type(offset) is not int or offset<0:
@@ -179,7 +426,8 @@ def browse(core,p):
     for entity in items:
         try:
             stamp=stamps.get(entity['id'])
-            if stamp and stamp['sha256']==entity['data']['sha256']:
+            canonical=entity['data'].get('library_relative_path')
+            if stamp and stamp['sha256']==entity['data']['sha256'] and (not canonical or canonical==stamp['relative_path']):
                 candidate=_plain_path(root(core)/relative(stamp['relative_path']))
                 if candidate.is_file():
                     stat=candidate.stat()

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from .gui_calendar import install_calendar
-from .gui_sources import AddSourceDialog, SourcePickerDialog, SourceContentDialog, extraction_label, label, button
+from .gui_sources import AddSourceDialog, SourcePickerDialog, SourceContentDialog, extraction_label, label, button, UNCONFIRMED_CLOSE_MESSAGE
 from .gui_theme import bind_theme, color
 
 WEEKDAYS = ('周一', '周二', '周三', '周四', '周五', '周六', '周日')
@@ -366,6 +366,14 @@ class RequiredDateEdit(QDateEdit):
 
 class TimetableSourceCapture(AddSourceDialog):
     """Reuse the owned-source capture protocol without a second visible form."""
+    def __init__(self,bridge,parent=None,on_saved=None):
+        super().__init__(bridge,parent=parent,on_saved=on_saved,fixed_archive_root=True)
+
+    def batch_finished(self):
+        # The surrounding one-step timetable form owns review/handoff. This
+        # capture stays hidden and has no visible "Done" button to click.
+        self.accept()
+
     def error(self, value):
         super().error(value)
         parent = self.parentWidget()
@@ -389,6 +397,7 @@ class TimetableImportDialog(QDialog):
         self.source_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup); self.source_button.clicked.connect(self.choose_source)
         source_menu = QMenu(self.source_button); source_menu.addAction('粘贴剪贴板截图', self.paste_source); self.source_button.setMenu(source_menu)
         source_layout.addWidget(self.source_button); self.source_summary = label('也可以点击右侧箭头粘贴截图。', 'Quiet'); source_layout.addWidget(self.source_summary)
+        self.archive_hint = label('原件会保存到这份课表专用文件夹的根目录。', 'Quiet'); source_layout.addWidget(self.archive_hint)
         form.addRow('课表', source_box)
         self.title = QLineEdit(); self.title.setPlaceholderText('例如：本学期课表'); form.addRow('名称', self.title)
         dates = QWidget(); row = QHBoxLayout(dates); row.setContentsMargins(0, 0, 0, 0)
@@ -501,7 +510,7 @@ class TimetableImportDialog(QDialog):
 
     def capture_failed(self, value):
         self._capture_error = True
-        self.uncertain_stage = 'source' if isinstance(value, dict) and value.get('code') == 'connection_lost' else None
+        self.uncertain_stage = 'source' if self.capture.uncertain else None
         self.error(value)
 
     def capture_finished(self):
@@ -530,6 +539,8 @@ class TimetableImportDialog(QDialog):
 
     def closeEvent(self, event):
         if self.pending: event.ignore(); return
+        if self.uncertain_stage:
+            self.error(UNCONFIRMED_CLOSE_MESSAGE); event.ignore(); return
         self.capture.cleanup_temp(); event.accept()
 
     def reject(self): self.close()

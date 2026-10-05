@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from .gui_forms import label_type, label_status, DeleteTaskDialog, EntityPicker, EntityForm
 from .gui_calendar import install_calendar
 from .gui_theme import color, bind_theme
-from .gui_sources import AddSourceDialog, SourceContentDialog, extraction_label, source_origin, file_kind
+from .gui_sources import AddSourceDialog, RefileSourceDialog, SourceContentDialog, extraction_label, source_origin
 
 BASE_TYPES = ("task", "project", "course", "activity", "domain", "goal")
 TREE_TYPES = (*BASE_TYPES, "phase", "milestone", "topic", "note")
@@ -967,6 +967,8 @@ class WorkspacePage(QWidget):
             missing = file.get("missing", False) or file.get("exists") is False
             is_reference = file.get("reference_only") or file.get("type") == "file_reference"
             name.addWidget(plain_label(("原文件位置需要核对" if missing else "旧本地引用 · 原文件移动后可能无法打开") if is_reference else source_origin(file) + " · " + extraction_label(file), "Quiet"))
+            if data.get('library_relative_path'):
+                name.addWidget(plain_label('归档位置：'+data['library_relative_path'], 'Quiet'))
             inner.addLayout(name, 1)
             if is_reference and data.get("local_path") and not missing:
                 inner.addWidget(make_button("保存到软件", lambda _, path=data["local_path"]: self.attach_paths([path])))
@@ -979,6 +981,8 @@ class WorkspacePage(QWidget):
                 if kind in self.type_map:
                     create_menu.addAction(title, lambda checked=False, k=kind, item=file: self.create_from_source(item, k))
             create.setMenu(create_menu); inner.addWidget(create)
+            if file.get('type')=='asset' and data.get('sha256') and not is_reference:
+                inner.addWidget(make_button('移动原件…', lambda _, item=file: self.refile_source(item)))
             self.content_layout.addWidget(row)
         file_next = result.get("files_next_offset")
         if self.files_offset or file_next is not None:
@@ -1116,6 +1120,10 @@ class WorkspacePage(QWidget):
         dialog = AddSourceDialog(self.bridge, self.current_entity["id"], self, self.saved)
         self.dialogs.add(dialog); dialog.finished.connect(lambda _: self.dialogs.discard(dialog)); dialog.open()
 
+    def refile_source(self,entity):
+        dialog = RefileSourceDialog(self.bridge,entity,self,self.saved)
+        self.dialogs.add(dialog); dialog.finished.connect(lambda _: self.dialogs.discard(dialog)); dialog.open()
+
     def dragEnterEvent(self, event):
         if self.current_entity and event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
             event.acceptProposedAction()
@@ -1141,22 +1149,8 @@ class WorkspacePage(QWidget):
         if len(paths) > 50:
             self.show_error({"message": "一次最多加入 50 个文件，请分批选择。"})
             return
-        receipts, failures = [], []
-        def next_file(index=0):
-            if index >= len(paths):
-                self.saved(receipts[-1] if receipts else None)
-                if failures:
-                    self.show_error({"message": "部分文件没有加入：" + "；".join(failures[:3])})
-                return
-            path = paths[index]
-            def saved(receipt):
-                receipts.append(receipt)
-                next_file(index + 1)
-            def failed(error):
-                failures.append(Path(path).name + "：" + error.get("message", str(error)))
-                next_file(index + 1)
-            self.bridge.command("add_source", {"kind": file_kind(path), "path": path, "owner_id": owner_id, "title": Path(path).name}, saved, failed)
-        next_file()
+        dialog = AddSourceDialog(self.bridge,owner_id,self,self.saved,paths=paths)
+        self.dialogs.add(dialog); dialog.finished.connect(lambda _: self.dialogs.discard(dialog)); dialog.open()
 
     def open_file(self, identifier):
         def loaded(result):

@@ -355,3 +355,61 @@ def test_beta_does_not_change_formal_installation_selection(monkeypatch):
     from management import installation_state
     monkeypatch.setattr(installation_state, 'installed_data_dir', lambda *_: pytest.fail('Touched formal registry'))
     installation_state.remember_installed_data_dir('unused', 'unused')
+
+
+def test_beta_directory_check_tolerates_removed_sqlite_wal(tmp_path, monkeypatch):
+    from management import data_space
+    workspace = tmp_path / 'Beta'
+    own = workspace / '.beta-data' / 'default'
+    own.mkdir(parents=True)
+    wal = own / 'database.sqlite3-wal'
+    wal.write_bytes(b'Synthetic transient WAL')
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    original_stat, original_is_file = Path.stat, Path.is_file
+    def removed_stat(path, *args, **kwargs):
+        if path == wal:
+            raise FileNotFoundError('SQLite reclaimed the WAL after it was listed')
+        return original_stat(path, *args, **kwargs)
+    # Simulate a prior file-type observation becoming stale before metadata is read.
+    monkeypatch.setattr(Path, 'is_file', lambda path: True if path == wal else original_is_file(path))
+    monkeypatch.setattr(Path, 'stat', removed_stat)
+    assert data_space.require_beta_dir(own) == own
+
+
+@pytest.mark.parametrize('failure', [PermissionError, OSError])
+def test_beta_directory_check_still_rejects_unreadable_entries(tmp_path, monkeypatch, failure):
+    from management import data_space
+    workspace = tmp_path / 'Beta'
+    own = workspace / '.beta-data' / 'default'
+    own.mkdir(parents=True)
+    entry = own / 'database.sqlite3-wal'
+    entry.write_bytes(b'Synthetic WAL')
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    original = Path.lstat
+    def denied(path, *args, **kwargs):
+        if path == entry: raise failure('Synthetic metadata read error')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', denied)
+    with pytest.raises(data_space.BetaIsolationError): data_space.require_beta_dir(own)
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'reparse', 'hardlink'])
+def test_beta_entry_snapshot_rejects_redirected_or_shared_files(tmp_path, monkeypatch, kind):
+    import stat
+    from types import SimpleNamespace
+    from management import data_space
+    workspace = tmp_path / 'Beta'
+    own = workspace / '.beta-data' / 'default'
+    own.mkdir(parents=True)
+    entry = own / 'synthetic-link'
+    entry.write_bytes(b'Synthetic entry')
+    monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
+    original = Path.lstat
+    def metadata(path, *args, **kwargs):
+        if path == entry:
+            return SimpleNamespace(st_mode=stat.S_IFLNK if kind == 'symlink' else stat.S_IFREG,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT if kind == 'reparse' else 0,
+                st_nlink=2 if kind == 'hardlink' else 1)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', metadata)
+    with pytest.raises(data_space.BetaIsolationError): data_space.require_beta_dir(own)

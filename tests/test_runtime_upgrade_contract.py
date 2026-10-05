@@ -316,7 +316,7 @@ def test_client_reports_update_pending_without_bootstrap_loop(tmp_path):
     (tmp_path / 'update_pending.json').write_text('{}', encoding='utf-8')
     with pytest.raises(ClientError) as error:
         Client(tmp_path)
-    assert error.value.code == 'update_pending' and '主动打开软件' in error.value.message
+    assert error.value.code == 'update_pending' and '主动打开 Beta 软件' in error.value.message
 
 
 def test_resume_token_is_bound_to_marker_and_data_space(tmp_path):

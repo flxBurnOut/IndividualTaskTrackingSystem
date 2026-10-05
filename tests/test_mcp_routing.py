@@ -106,6 +106,7 @@ WRITE_CASES = [
     ('execute_command', {'name': 'apply_proposal', 'payload': {}}),
     ('execute_command', {'name': 'create_task_batch', 'payload': {}}),
     ('execute_command', {'name': 'split_task', 'payload': {}}),
+    ('execute_command', {'name': 'refile_source', 'payload': {'id': 'synthetic-source', 'version': 1, 'library_subdir': '课件'}}),
 ]
 
 

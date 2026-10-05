@@ -358,6 +358,17 @@ def test_file_drop_saves_copy_and_original_removal_does_not_break_open(app_v2, s
     event = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
     shell.workspace_page.dropEvent(event)
     wait(app_v2, lambda: not shell.bridge.callbacks)
+    from management.gui_sources import AddSourceDialog
+    captures = [dialog for dialog in shell.workspace_page.dialogs if isinstance(dialog, AddSourceDialog) and dialog.isVisible()]
+    assert len(captures) == 1
+    capture = captures[0]
+    assert capture.destination.ready
+    assert client.query("object_workspace", id=course["id"])["files"] == []
+    capture.destination.combo.setEditText('课件')
+    capture.save()
+    wait(app_v2, lambda: capture.completed and not shell.bridge.callbacks)
+    assert '课件' in capture.locations.toPlainText()
+    capture.accept()
     result = client.query("object_workspace", id=course["id"])
     assert len(result["files"]) == 1
     file = result["files"][0]
