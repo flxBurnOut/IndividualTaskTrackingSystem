@@ -162,7 +162,7 @@ class Client:
                     'expected_revision': expected_revision if expected_revision is not None else prior_revision if prior_revision is not None else current.get('revision', self.revision),
                     'payload': payload}
         try:
-            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'configure_codex', 'connect_codex', 'add_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
+            return self._remember(self._request('commands', name, envelope, timeout=300 if name in {'configure_codex', 'connect_codex', 'add_source', 'refile_source', 'backup', 'restore_backup', 'import_asset', 'export_asset'} else 35))
         except ClientError as error:
             error.details['request_id'] = envelope['request_id']
             # Never silently retry a write or discard the caller's old version.

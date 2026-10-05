@@ -2,14 +2,19 @@
 from __future__ import annotations
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QPixmap, QDesktopServices
 from PySide6.QtWidgets import (QApplication,QDialog,QVBoxLayout,QHBoxLayout,QLabel,QLineEdit,QTextEdit,QTextBrowser,QPushButton,QTabWidget,QWidget,QComboBox,QFileDialog,QListWidget,QListWidgetItem,QDialogButtonBox,QFrame)
+from shiboken6 import isValid
 
 SOURCE_KINDS={'file':'文件','notice':'通知','email':'邮件','image':'截图 / 图片','web':'网页'}
 EXTRACTION_LABELS={'readable':'已提取文字，内容待核对','vision_ready':'图片已保存，需视觉核对','partial':'部分内容已提取','unsupported':'已保存，暂不支持文字提取','failed':'已保存，文字提取未成功'}
+UNCONFIRMED_WRITE_ERRORS=frozenset({'connection_lost','operation_pending','connection_error',
+    'protocol_error','response_limit','internal_error','storage_error'})
+UNCONFIRMED_CLOSE_MESSAGE='这次操作的结果仍未确认，原请求和保存位置已保留。请恢复连接后点击“核对并重试”；核对完成前不能关闭此窗口或改换资料。'
 
 def extraction_label(entity):
     data=entity.get('data',entity)
@@ -36,26 +41,107 @@ def file_kind(path):
     suffix=Path(path).suffix.lower()
     return 'email' if suffix in {'.eml','.msg'} else 'image' if suffix in {'.png','.jpg','.jpeg','.webp','.bmp'} else 'file'
 
+
+class LibraryDestination(QWidget):
+    """Choose a service-owned folder without opening or changing local paths."""
+    def __init__(self,bridge,parent=None,*,owner_id=None,entity_id=None,fixed_root=False):
+        super().__init__(parent)
+        self.bridge,self.owner_id,self.entity_id=bridge,owner_id,entity_id
+        self.ready=False;self.loading=False;self.offset=0;self.current=None;self.fixed_root=fixed_root
+        layout=QVBoxLayout(self);layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(label('保存到归属文件夹内'))
+        self.combo=QComboBox();self.combo.setEditable(True);self.combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.combo.addItem('归属文件夹根目录','');self.combo.setCurrentIndex(-1)
+        self.combo.lineEdit().setPlaceholderText('选择已有文件夹，或输入如 课件/补充资料')
+        layout.addWidget(self.combo)
+        self.status=label('正在读取可用文件夹…','Quiet');layout.addWidget(self.status)
+        self.more=button('加载更多文件夹',self.load);self.more.hide();layout.addWidget(self.more)
+        if fixed_root:
+            # A caller creating a dedicated container can explicitly reserve its
+            # root before the owner exists. Never query the unclassified folder.
+            self.ready=True;self.combo.setCurrentIndex(0);self.combo.setEnabled(False)
+            self.status.setText('原件保存到所属事项专用文件夹的根目录。')
+        else:self.load()
+
+    def load(self):
+        if self.loading or self.fixed_root:return
+        self.loading=True;self.more.setEnabled(False)
+        params={'id':self.entity_id} if self.entity_id else {'owner_id':self.owner_id}
+        self.bridge.query('library_destinations',self.loaded,self.failed,**params,offset=self.offset,limit=100)
+
+    def loaded(self,result):
+        if not isValid(self):return
+        self.loading=False;self.ready=True
+        selected=self.combo.currentIndex();text=self.combo.currentText()
+        known={self.combo.itemData(i) for i in range(self.combo.count())}
+        for item in result.get('items',[]):
+            subdir=item['subdir']
+            if subdir not in known:
+                self.combo.addItem(item.get('label') or subdir,subdir);known.add(subdir)
+        if self.entity_id and self.current is None and result.get('current'):
+            self.current=result['current'];subdir=self.current['library_subdir']
+            index=self.combo.findData(subdir)
+            if index<0:self.combo.addItem(subdir or '归属文件夹根目录',subdir);index=self.combo.count()-1
+            self.combo.setCurrentIndex(index)
+        elif selected<0:
+            self.combo.setCurrentIndex(-1);self.combo.setEditText(text)
+        current=('当前归档位置：'+self.current['path']+'\n') if self.current else ''
+        self.status.setText(current+'归属文件夹：'+result.get('path','')+'\n请选择具体文件夹；选择根目录会直接放在此处。')
+        following=result.get('next_offset');self.more.setVisible(following is not None);self.more.setEnabled(True)
+        self.more.setText('加载更多文件夹')
+        if following is not None:self.offset=following
+
+    def failed(self,error):
+        if not isValid(self):return
+        self.loading=False;self.status.setText(error.get('message',str(error)))
+        self.more.setText('重新读取文件夹');self.more.show();self.more.setEnabled(True)
+
+    def value(self):
+        if self.fixed_root:return ''
+        if not self.ready:raise ValueError('请先读取归属文件夹，再选择保存位置。')
+        index=self.combo.currentIndex();text=self.combo.currentText()
+        if index>=0 and text==self.combo.itemText(index):return self.combo.itemData(index)
+        value=text.strip()
+        if not value:raise ValueError('请选择具体文件夹，或明确选择归属文件夹根目录。')
+        return value
+
+
+def library_receipt_text(receipt):
+    result=receipt.get('result',receipt);entity=result.get('entity') or {};library=result.get('library') or {}
+    text=entity.get('title','资料')
+    if library.get('path') and library.get('exists') is True:
+        text+='\n实际归档位置：'+library['path']
+    else:text+='\n资料已登记；归档位置尚未确认，请重新读取文件位置。'
+    cleanup=receipt.get('archive_cleanup') or result.get('archive_cleanup') or {}
+    if cleanup.get('status') not in {None,'removed','not_needed'}:
+        text+='\n'+(cleanup.get('message') or '旧位置的副本仍需核对。')
+    return text
+
+
 class AddSourceDialog(QDialog):
     """One capture surface. Clipboard is read only on the user's explicit action."""
-    def __init__(self,bridge,owner_id=None,parent=None,on_saved=None,paths=None):
+    def __init__(self,bridge,owner_id=None,parent=None,on_saved=None,paths=None,*,fixed_archive_root=False):
         super().__init__(parent)
         self.bridge,self.owner_id,self.on_saved=bridge,owner_id,on_saved
         self.epoch=bridge.epoch;self.pending=False;self.uncertain=False;self.temp_path=None;self.payloads=[];self.saved_sources=[]
-        self.setWindowTitle('添加资料或通知');self.resize(650,565);self.setAcceptDrops(True)
+        self.saved_receipts=[];self.command_options=None;self.completed=False
+        self.setWindowTitle('添加资料或通知');self.resize(680,720);self.setAcceptDrops(True)
         layout=QVBoxLayout(self);layout.addWidget(label('添加资料或通知','DialogHeading'))
         layout.addWidget(label('保存一份到软件中，之后原文件移动也能继续查看。提取结果会单独标明。','Quiet'))
         self.title=QLineEdit();self.title.setPlaceholderText('标题（可选，留空使用文件名或内容摘要）');layout.addWidget(self.title)
+        self.destination=LibraryDestination(bridge,self,owner_id=owner_id,fixed_root=fixed_archive_root);layout.addWidget(self.destination)
         self.tabs=QTabWidget();layout.addWidget(self.tabs,1)
         files=QWidget();fl=QVBoxLayout(files);fl.addWidget(button('选择文件…',self.choose_files));self.files=QListWidget();fl.addWidget(self.files,1);fl.addWidget(label('也可把课件、文档或邮件文件拖到这里，软件会依次保存并分批读取。','Quiet'));self.tabs.addTab(files,'文件')
         words=QWidget();wl=QVBoxLayout(words);self.text_kind=QComboBox();self.text_kind.addItem('通知文字','notice');self.text_kind.addItem('邮件正文','email');wl.addWidget(self.text_kind);self.text=QTextEdit();self.text.setPlaceholderText('粘贴通知或邮件原文，保留日期、发送者和相关说明。');wl.addWidget(self.text);self.tabs.addTab(words,'文字')
         capture=QWidget();cl=QVBoxLayout(capture);cl.addWidget(button('粘贴剪贴板截图',self.paste_image));self.preview=label('先截图，然后点击上方按钮。','Quiet');self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setMinimumHeight(170);cl.addWidget(self.preview,1);self.tabs.addTab(capture,'截图')
         web=QWidget();web_layout=QVBoxLayout(web);web_layout.addWidget(label('网页地址'));self.url=QLineEdit();self.url.setPlaceholderText('https://…');web_layout.addWidget(self.url);web_layout.addWidget(label('将尝试保存网页内容。需要登录或无法读取的页面会明确提示，可改为粘贴文字或截图。','Quiet'));web_layout.addStretch();self.tabs.addTab(web,'网页')
         self.status=label('','Error');self.status.hide();layout.addWidget(self.status)
+        self.locations=QTextBrowser();self.locations.setOpenExternalLinks(False);self.locations.setMaximumHeight(140);self.locations.hide();layout.addWidget(self.locations)
         self.buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel);self.save_button=self.buttons.button(QDialogButtonBox.StandardButton.Save);self.save_button.setText('保存资料');self.save_button.setObjectName('Primary');self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消');self.buttons.accepted.connect(self.save);self.buttons.rejected.connect(self.reject);layout.addWidget(self.buttons)
         if paths:self.set_files(paths)
 
     def set_files(self,paths):
+        if self.pending or self.uncertain or self.completed:return
         current=[self.files.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.files.count())]
         all_paths=list(dict.fromkeys(current+[str(Path(p).resolve()) for p in paths]))
         self.files.clear()
@@ -64,16 +150,19 @@ class AddSourceDialog(QDialog):
         self.tabs.setCurrentIndex(0)
 
     def choose_files(self):
+        if self.pending or self.uncertain or self.completed:return
         paths,_=QFileDialog.getOpenFileNames(self,'选择资料或邮件文件');self.set_files(paths)
 
     def dragEnterEvent(self,event):
-        if not self.pending and event.mimeData().hasUrls() and all(u.isLocalFile() for u in event.mimeData().urls()):event.acceptProposedAction()
+        if not (self.pending or self.uncertain or self.completed) and event.mimeData().hasUrls() and all(u.isLocalFile() for u in event.mimeData().urls()):event.acceptProposedAction()
         else:event.ignore()
 
     def dropEvent(self,event):
-        if not self.pending:self.set_files([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]);event.acceptProposedAction()
+        if not (self.pending or self.uncertain or self.completed):self.set_files([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]);event.acceptProposedAction()
+        else:event.ignore()
 
     def paste_image(self):
+        if self.pending or self.uncertain or self.completed:return
         image=QApplication.clipboard().image()
         if image.isNull():self.error({'message':'剪贴板中没有图片。请先截图或复制一张图片。'});return
         if image.width()*image.height()>24_000_000:self.error({'message':'图片过大，请裁剪后再粘贴。'});return
@@ -83,7 +172,7 @@ class AddSourceDialog(QDialog):
         self.preview.setPixmap(QPixmap.fromImage(image).scaled(540,280,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation));self.status.hide()
 
     def build_payloads(self):
-        base={'owner_id':self.owner_id}
+        base={'owner_id':self.owner_id,'library_subdir':self.destination.value()}
         title=self.title.text().strip()
         if title:base['title']=title
         index=self.tabs.currentIndex()
@@ -104,30 +193,49 @@ class AddSourceDialog(QDialog):
 
     def save(self):
         if self.pending:return
+        if self.completed:self.accept();return
         if not self.uncertain:
             try:self.payloads=self.build_payloads()
             except ValueError as exc:self.error({'message':str(exc)});return
-        self.pending=True;self.tabs.setEnabled(False);self.title.setEnabled(False);self.save_button.setEnabled(False);self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        self.pending=True;self.tabs.setEnabled(False);self.title.setEnabled(False);self.destination.setEnabled(False);self.save_button.setEnabled(False);self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
         self.status.setText('正在保存并检查可读取内容…');self.status.show();self.next_source()
 
     def next_source(self):
         if not self.payloads:
-            self.pending=False;self.uncertain=False;self.cleanup_temp();self.accept();return
+            self.pending=False;self.uncertain=False;self.completed=True;self.cleanup_temp()
+            self.batch_finished()
+            return
         payload=self.payloads[0]
         self.status.setText(f'已保存 {len(self.saved_sources)} 份，正在依次处理剩余 {len(self.payloads)} 份…')
         def saved(receipt):
             result=receipt.get('result',receipt);entity=result.get('entity',{})
             if entity:self.saved_sources.append(entity)
-            self.payloads.pop(0);self.uncertain=False
+            self.saved_receipts.append(receipt);self.locations.setPlainText('\n\n'.join(library_receipt_text(value) for value in self.saved_receipts));self.locations.show()
+            self.payloads.pop(0);self.uncertain=False;self.command_options=None
             if self.on_saved:self.on_saved(receipt)
             self.next_source()
-        self.bridge.command('add_source',payload,saved,self.error,epoch=self.epoch)
+        if self.command_options is None:
+            self.command_options={'epoch':self.epoch,'expected_revision':self.bridge.revision,'request_id':str(uuid.uuid4())}
+        self.bridge.command('add_source',payload,saved,self.error,**self.command_options)
+
+    def batch_finished(self):
+        """Visible capture reviews receipts; embedded workflows may continue."""
+        self.status.setText(f'已登记 {len(self.saved_sources)} 份资料。实际归档位置如下，内容提取范围仍需单独核对。')
+        self.save_button.setText('完成');self.save_button.setEnabled(True)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('关闭');self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
 
     def error(self,error):
-        self.pending=False;self.uncertain=error.get('code')=='connection_lost'
-        self.status.setText(error.get('message',str(error)));self.status.show();self.save_button.setEnabled(True)
+        self.pending=False
+        # A later authentication/version failure cannot disprove an earlier
+        # unknown write. Only the successful original receipt resolves it.
+        self.uncertain=self.uncertain or (self.command_options is not None and error.get('code') in UNCONFIRMED_WRITE_ERRORS)
+        if not self.uncertain:self.command_options=None
+        message=error.get('message',str(error));details=error.get('details') or {}
+        if error.get('code')=='library_location_conflict':message+='\n当前归档位置：'+str(details.get('current_relative_path','待核对'))+'。请对已有资料使用“移动原件…”。'
+        if self.uncertain:message+='\n'+UNCONFIRMED_CLOSE_MESSAGE
+        self.status.setText(message);self.status.show();self.save_button.setEnabled(True)
         self.save_button.setText('核对并重试' if self.uncertain else '保存资料')
-        self.tabs.setEnabled(not self.uncertain);self.title.setEnabled(not self.uncertain);self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+        self.tabs.setEnabled(not self.uncertain);self.title.setEnabled(not self.uncertain);self.destination.setEnabled(not self.uncertain);self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(not self.uncertain)
         # Successful earlier files stay in the receipt list; retries use only remaining payloads.
         if self.payloads and not self.uncertain:
             remaining={p.get('path') for p in self.payloads}
@@ -140,11 +248,81 @@ class AddSourceDialog(QDialog):
 
     def reject(self):
         if self.pending:return
+        if self.uncertain:self.status.setText(UNCONFIRMED_CLOSE_MESSAGE);self.status.show();return
         self.cleanup_temp();super().reject()
 
     def closeEvent(self,event):
         if self.pending:event.ignore();return
+        if self.uncertain:self.status.setText(UNCONFIRMED_CLOSE_MESSAGE);self.status.show();event.ignore();return
         self.cleanup_temp();super().closeEvent(event)
+
+
+class RefileSourceDialog(QDialog):
+    def __init__(self,bridge,entity,parent=None,on_saved=None):
+        super().__init__(parent)
+        self.bridge,self.entity,self.on_saved=bridge,entity,on_saved
+        self.epoch=bridge.epoch;self.pending=False;self.uncertain=False;self.completed=False
+        self.payload=None;self.command_options=None;self.cleanup_pending=False;self.saved_notified=False
+        self.setWindowTitle('移动原件');self.resize(650,440)
+        layout=QVBoxLayout(self);layout.addWidget(label(entity.get('title','资料'),'DialogHeading'))
+        layout.addWidget(label('选择归属文件夹内的新位置。资料的内容、关联和提取记录会保留。','Quiet'))
+        self.destination=LibraryDestination(bridge,self,entity_id=entity['id']);layout.addWidget(self.destination)
+        self.status=label('','Error');layout.addWidget(self.status)
+        self.locations=QTextBrowser();self.locations.setOpenExternalLinks(False);self.locations.hide();layout.addWidget(self.locations)
+        self.buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel)
+        self.save_button=self.buttons.button(QDialogButtonBox.StandardButton.Save);self.save_button.setText('移动原件')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        self.buttons.accepted.connect(self.save);self.buttons.rejected.connect(self.reject);layout.addWidget(self.buttons)
+
+    def save(self):
+        if self.pending:return
+        if self.completed and not (self.cleanup_pending or self.uncertain):self.accept();return
+        if not (self.uncertain or self.cleanup_pending):
+            try:
+                subdir=self.destination.value();current=self.destination.current
+                if not current:raise ValueError('尚未确认当前原件位置，请重新读取文件夹。')
+                self.payload={'id':current['id'],'version':current['version'],'library_subdir':subdir}
+            except ValueError as exc:self.error({'message':str(exc)});return
+            self.command_options={'epoch':self.epoch,'expected_revision':self.bridge.revision,'request_id':str(uuid.uuid4())}
+        self.pending=True;self.destination.setEnabled(False);self.save_button.setEnabled(False)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        self.status.setText('正在按原请求重试旧副本清理…' if self.cleanup_pending else '正在移动原件并核对位置…')
+        self.bridge.command('refile_source',self.payload,self.saved,self.error,**self.command_options)
+
+    def saved(self,receipt):
+        self.pending=False;self.uncertain=False;self.completed=True
+        result=receipt.get('result',receipt);cleanup=receipt.get('archive_cleanup') or result.get('archive_cleanup') or {}
+        # A recovered durable business receipt can omit post-commit cleanup.
+        # Missing/unknown status must keep the original request available.
+        self.cleanup_pending=cleanup.get('status') not in {'removed','not_needed','retained_shared','retained_modified'}
+        self.locations.setPlainText(library_receipt_text(receipt));self.locations.show()
+        self.status.setText('移动已登记，旧副本清理尚未确认完成。可按原请求重试清理。' if self.cleanup_pending else '移动操作已登记，请核对实际位置与旧副本处理结果。')
+        self.save_button.setText('重试旧副本清理' if self.cleanup_pending else '完成');self.save_button.setEnabled(True)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('关闭');self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+        if not self.saved_notified:
+            self.saved_notified=True
+            if self.on_saved:self.on_saved(receipt)
+
+    def error(self,error):
+        self.pending=False
+        self.uncertain=self.uncertain or (self.command_options is not None and error.get('code') in UNCONFIRMED_WRITE_ERRORS)
+        message=error.get('message',str(error))
+        if self.completed:message='移动已登记；旧副本清理仍待核对。\n'+message
+        if self.uncertain:message+='\n'+UNCONFIRMED_CLOSE_MESSAGE
+        self.status.setText(message);self.destination.setEnabled(not (self.uncertain or self.completed))
+        self.save_button.setText('核对并重试' if self.uncertain else '重试旧副本清理' if self.cleanup_pending else '移动原件');self.save_button.setEnabled(True)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(not self.uncertain)
+
+    def reject(self):
+        if self.pending:return
+        if self.uncertain:self.status.setText(UNCONFIRMED_CLOSE_MESSAGE);return
+        super().reject()
+
+    def closeEvent(self,event):
+        if self.pending:event.ignore();return
+        if self.uncertain:self.status.setText(UNCONFIRMED_CLOSE_MESSAGE);event.ignore();return
+        super().closeEvent(event)
+
 
 class SourceContentDialog(QDialog):
     def __init__(self,bridge,entity,parent=None):

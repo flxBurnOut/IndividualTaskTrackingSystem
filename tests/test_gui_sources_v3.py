@@ -13,42 +13,57 @@ from test_ux_workflows_v2 import ControlledBridge,QueuedCoreBridge,Core,cmd,wait
 @pytest.fixture(scope='session')
 def app():return QApplication.instance() or QApplication([])
 
+def choose_destination(bridge,dialog,subdir=''):
+    bridge.deliver('library_destinations',{'owner_id':dialog.owner_id,'path':'D:/Synthetic originals',
+        'root_relative_path':'课程/Synthetic','items':[{'subdir':subdir,'label':subdir or '根目录'}],
+        'total':1,'next_offset':None,'requires_choice':bool(subdir)})
+    dialog.destination.combo.setCurrentIndex(dialog.destination.combo.findData(subdir))
+
+
 def test_notice_email_and_url_payloads_keep_owner_and_original_text(app):
     bridge=ControlledBridge();dialog=AddSourceDialog(bridge,'course-a')
     try:
+        choose_destination(bridge,dialog,'通知')
         dialog.tabs.setCurrentIndex(1);dialog.text_kind.setCurrentIndex(1);dialog.text.setPlainText('From: synthetic\nExam date pending');dialog.title.setText('Course mail')
-        assert dialog.build_payloads()==[{'owner_id':'course-a','kind':'email','text':'From: synthetic\nExam date pending','title':'Course mail'}]
+        assert dialog.build_payloads()==[{'owner_id':'course-a','library_subdir':'通知','kind':'email','text':'From: synthetic\nExam date pending','title':'Course mail'}]
         dialog.tabs.setCurrentIndex(3);dialog.url.setText('file:///C:/private')
         with pytest.raises(ValueError):dialog.build_payloads()
         dialog.url.setText('https://example.org/course')
-        assert dialog.build_payloads()[0]['kind']=='web'
+        assert dialog.build_payloads()[0]['kind']=='web' and dialog.build_payloads()[0]['library_subdir']=='通知'
     finally:dialog.close()
 
 def test_clipboard_is_only_read_on_click_and_png_survives_uncertain_save(app):
     bridge=ControlledBridge();image=QImage(32,24,QImage.Format.Format_RGB32);image.fill(QColor('green'));old=app.clipboard().image();app.clipboard().setImage(image)
     dialog=AddSourceDialog(bridge)
     try:
+        choose_destination(bridge,dialog,'截图')
         assert dialog.temp_path is None
         dialog.tabs.setCurrentIndex(2);dialog.paste_image();path=Path(dialog.temp_path);assert path.exists()
         dialog.save();assert bridge.commands[0]['payload']['kind']=='image'
         bridge.commands[0]['error']({'code':'connection_lost','message':'Checking receipt'})
-        assert path.exists() and not dialog.tabs.isEnabled()
+        assert path.exists() and not dialog.tabs.isEnabled() and not dialog.destination.isEnabled()
         dialog.save();assert bridge.commands[-1]['payload']==bridge.commands[0]['payload']
+        assert bridge.commands[-1]['options']==bridge.commands[0]['options']
+        assert bridge.commands[-1]['payload']['library_subdir']=='截图'
         bridge.commands[-1]['callback']({'result':{'entity':{'id':'image-source','title':'Screenshot'}}})
-        assert not path.exists() and dialog.result()==QDialog.DialogCode.Accepted
+        assert not path.exists() and dialog.completed and '归档位置尚未确认' in dialog.locations.toPlainText()
+        dialog.save();assert dialog.result()==QDialog.DialogCode.Accepted
     finally:
-        app.clipboard().setImage(old);dialog.close()
+        app.clipboard().setImage(old);dialog.pending=False;dialog.uncertain=False;dialog.close()
 
 def test_mixed_file_batch_infers_email_and_retains_success_on_later_failure(app,tmp_path):
     bridge=ControlledBridge();a=tmp_path/'one.txt';b=tmp_path/'two.eml';a.write_text('one');b.write_text('Subject: two')
     saved=[];dialog=AddSourceDialog(bridge,'owner',on_saved=saved.append,paths=[str(a),str(b)])
     try:
+        choose_destination(bridge,dialog,'课件')
         dialog.save();assert bridge.commands[0]['payload']['kind']=='file'
-        bridge.commands[0]['callback']({'result':{'entity':{'id':'one'}}})
+        bridge.commands[0]['callback']({'result':{'entity':{'id':'one'},'library':{'path':'D:/Synthetic originals/课件/one.txt','exists':True}}})
         assert bridge.commands[-1]['payload']['kind']=='email'
         bridge.commands[-1]['error']({'code':'source_error','message':'Retry second file'})
         assert len(saved)==1 and dialog.files.count()==1
         dialog.save();assert bridge.commands[-1]['payload']['path']==str(b)
+        assert bridge.commands[-1]['payload']['library_subdir']=='课件'
+        assert '课件/one.txt' in dialog.locations.toPlainText()
     finally:
         dialog.pending=False;dialog.close()
 
@@ -97,16 +112,64 @@ def test_real_saved_notice_content_and_source_kind_roundtrip(app,tmp_path):
     core=Core(tmp_path/'source-ui');course=cmd(core,'create',{'type':'course','title':'Synthetic course','data':{}})['result']['entity'];bridge=QueuedCoreBridge(core)
     dialog=AddSourceDialog(bridge,course['id']);viewer=None
     try:
+        wait(app,lambda:bridge.pending==0);dialog.destination.combo.setCurrentIndex(dialog.destination.combo.findData(''))
         dialog.tabs.setCurrentIndex(1);dialog.text.setPlainText('Synthetic announcement: deadline remains unknown.');dialog.save();wait(app,lambda:bridge.pending==0)
-        assert dialog.result()==QDialog.DialogCode.Accepted
+        assert dialog.completed and dialog.save_button.text()=='完成'
         source=core.query('sources',owner_id=course['id'])['items'][0]
         assert source['data']['managed_copy'] and source['data']['source_kind']=='notice'
+        assert str(core.root/'原文件') in dialog.locations.toPlainText()
         assert '待核对' in extraction_label(source)
         viewer=SourceContentDialog(bridge,source);wait(app,lambda:bridge.pending==0)
         assert 'deadline remains unknown' in viewer.output.toPlainText()
     finally:
         dialog.close()
         if viewer:viewer.close()
+
+
+def test_import_requires_explicit_destination_and_preserves_location_conflict(app,tmp_path):
+    source=tmp_path/'lesson.txt';source.write_text('Synthetic lesson')
+    bridge=ControlledBridge();dialog=AddSourceDialog(bridge,'course-a',paths=[str(source)])
+    try:
+        bridge.deliver('library_destinations',{'path':'D:/Synthetic','items':[{'subdir':'课件','label':'课件'}],
+            'total':1,'next_offset':None,'requires_choice':True})
+        dialog.save();assert not bridge.commands and '请选择具体文件夹' in dialog.status.text()
+        dialog.destination.combo.setEditText('课件/补充资料');dialog.save()
+        assert bridge.commands[-1]['payload']['library_subdir']=='课件/补充资料'
+        bridge.commands[-1]['error']({'code':'library_location_conflict','message':'资料已有归档位置',
+            'details':{'entity_id':'existing-source','current_relative_path':'课程/Synthetic/课件/lesson.txt'}})
+        assert not dialog.completed and not dialog.saved_sources
+        assert '课程/Synthetic/课件/lesson.txt' in dialog.status.text() and '移动原件' in dialog.status.text()
+    finally:dialog.close()
+
+
+@pytest.mark.parametrize('first_error',['connection_lost','operation_pending','connection_error',
+    'protocol_error','response_limit','internal_error','storage_error'])
+def test_unknown_import_preserves_identity_after_later_failures_and_blocks_close(app,first_error):
+    bridge=ControlledBridge();saved=[];dialog=AddSourceDialog(bridge,'original-owner',on_saved=saved.append)
+    dialog.show()
+    try:
+        choose_destination(bridge,dialog,'通知');dialog.tabs.setCurrentIndex(1);dialog.text.setPlainText('Original synthetic notice')
+        dialog.save();original=bridge.commands[-1]
+        original['error']({'code':first_error,'message':'Initial result unknown'})
+        assert dialog.uncertain and dialog.command_options==original['options']
+        assert not dialog.close() and dialog.isVisible()
+        dialog.reject();assert dialog.isVisible() and '不能关闭' in dialog.status.text()
+        # Later view/data-space changes must not become a new request while the
+        # previous write is still unresolved, even after a definite later error.
+        dialog.owner_id='changed-owner';dialog.epoch='changed-epoch';bridge.epoch='changed-epoch';bridge.revision=99
+        dialog.destination.combo.setEditText('Changed folder');dialog.text.setPlainText('Changed text')
+        for code in ('unauthorized','revision_conflict','epoch_conflict','service_version_mismatch'):
+            dialog.save();retry=bridge.commands[-1]
+            assert retry['payload']==original['payload'] and retry['options']==original['options']
+            retry['error']({'code':code,'message':'Later failure'})
+            assert dialog.uncertain and not dialog.tabs.isEnabled() and not dialog.destination.isEnabled()
+            assert not dialog.close() and not saved
+        dialog.save();bridge.commands[-1]['callback']({'result':{'entity':{'id':'saved-source','title':'Original synthetic notice'},
+            'library':{'path':'D:/Synthetic originals/通知/notice.txt','exists':True}}})
+        assert dialog.completed and not dialog.uncertain and len(saved)==1
+        dialog.save();assert dialog.result()==QDialog.DialogCode.Accepted
+    finally:
+        dialog.pending=False;dialog.uncertain=False;dialog.close()
 
 
 def test_history_window_is_bounded_and_old_pages_remain_reachable(app):

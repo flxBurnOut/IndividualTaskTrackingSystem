@@ -104,6 +104,7 @@ WRITE_CASES = [
     ('execute_command', {'name': 'settings', 'payload': {}}),
     ('execute_command', {'name': 'create_job', 'payload': {'kind': 'ai'}}),
     ('execute_command', {'name': 'apply_proposal', 'payload': {}}),
+    ('execute_command', {'name': 'refile_source', 'payload': {'id': 'synthetic-source', 'version': 1, 'library_subdir': '课件'}}),
 ]
 
 

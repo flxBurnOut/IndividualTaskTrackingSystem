@@ -35,7 +35,7 @@ QueryName = Literal[
     "skills", "habits_overview", "dashboard",
     "recovery_summary",
     "daily_tasks", "recurring_rules", "preview_recurring", "codex_models",
-    "sources", "source_content", "conversation", "library_folder",
+    "sources", "source_content", "conversation", "library_folder", "library_destinations",
     "daily_review", "weekly_review", "review_preferences", "object_workspace", "workspace_tasks", "open_resource", "operation",
     "state", "capabilities", "list", "get", "changes", "today", "plan_context",
     "review", "jobs", "job", "settings", "receipt", "diagnostics", "warnings",
@@ -49,7 +49,7 @@ CommandName = Literal[
     "apply_timetable",
     "set_recovery_task", "record_recovery_progress", "correct_recovery_scope",
     "add_to_plan", "set_recurring_rule", "materialize_recurring",
-    "add_source", "send_message",
+    "add_source", "refile_source", "send_message",
     "submit_daily_review", "set_review_preferences", "attach_local_file",
     "create", "update", "move", "archive", "link", "unlink", "record_feedback",
     "create_plan", "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex",
@@ -266,6 +266,10 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         continuation tool/arguments, concatenate json_fragment from offset zero,
         then parse the original response. Only then use its business next_offset.
         receipt(request_id) reconciles an interrupted write without repeating it.
+        library_destinations(owner_id, limit, offset) lists archive subfolders;
+        pass id instead of owner_id to include an existing file's current location
+        and version. Follow next_offset. Use these choices before add_source,
+        import_asset or refile_source; folder ownership alone is not a destination.
         settings excludes secrets. This does not execute SQL or arbitrary code.
         """
         if name not in get_args(QueryName):
@@ -422,6 +426,23 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         return command("save_review", payload, request_id, epoch, expected_revision)
 
     @server.tool(annotations=WRITE, structured_output=True)
+    def refile_source(id: str, version: int, library_subdir: str, request_id: str,
+                      epoch: str, expected_revision: int) -> dict[str, Any]:
+        """Move an existing original within its owner's archive folder.
+
+        Read library_destinations(id) first for the current version and choices.
+        library_subdir is owner-relative, using / between directory names; an
+        explicit empty string selects the owner folder root. Never pass absolute
+        paths or parent traversal. The receipt's result.library is the actual
+        location; archive_cleanup reports whether the prior copy was removed or
+        retained. Keep the same request_id and payload after an uncertain result.
+        This ordinary write is unavailable in a managed discussion; use the
+        management app's file controls there, never bypass candidate boundaries.
+        """
+        return command('refile_source',{'id':id,'version':version,'library_subdir':library_subdir},
+                       request_id,epoch,expected_revision)
+
+    @server.tool(annotations=WRITE, structured_output=True)
     def execute_command(name: str, payload: dict[str, Any], request_id: str,
                         epoch: str, expected_revision: int) -> dict[str, Any]:
         """Execute a named business command advertised by capabilities, never SQL/scripts.
@@ -432,6 +453,15 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         ordinary operations never do. Configuration/restore actions require the
         user's specific intent. A proposal must be reviewed before apply_proposal.
         Unavailable commands return a typed error, not a fabricated success.
+        For add_source/import_asset, read library_destinations(owner_id) first.
+        Set payload.library_subdir to the chosen owner-relative folder, using /;
+        an explicit empty string selects the root. Do not guess a category from
+        a filename. Existing classifications require an explicit destination.
+        library_location_conflict means identical content is already elsewhere:
+        read its current id/version, then use refile_source when authorized.
+        Report result.library.path as the actual archive location, not an intended
+        path or a web open_resource text-preview path. A registration receipt
+        alone does not prove categorization or complete source reading.
         """
         routing.guard_write()
         capabilities = raw_capabilities()

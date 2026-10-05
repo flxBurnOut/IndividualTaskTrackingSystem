@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "personal-management"
-version = "1.2.0"
+version = "1.2.1"
 description = "Local-first personal management with native desktop and Codex entrances"
 requires-python = ">=3.12"
 dependencies = ["websockets==17.1", "PySide6==6.11.2", "Pillow==12.3.0", "mcp==2.2.0", "psutil==7.2.2", "tzdata==2026.4", "python-docx==1.2.0", "reportlab==5.0.1", "pypdf==6.19.0", "openpyxl==3.1.5"]

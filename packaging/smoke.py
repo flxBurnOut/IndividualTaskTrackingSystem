@@ -22,9 +22,10 @@ GUI = EXE.with_name('PersonalManagement.exe')
 async def verify_frozen_mcp_plan_revision(client, params):
     """Exercise packaged MCP dispatch against this smoke run's isolated service.
 
-    All five business writes cross the frozen stdio entry and generic command
-    tool. The source Client only inspects the same synthetic service. No model
-    request, Codex session or production data root is involved.
+    Business writes cross the frozen stdio entry through generic commands and
+    the typed original-archive tool. The source Client only inspects the same
+    synthetic service. No model request, Codex session or production data root
+    is involved.
     """
     day, page_limit = '2038-05-01', 16 * 1024
     encoded_size = lambda value: len(json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -166,7 +167,53 @@ async def verify_frozen_mcp_plan_revision(client, params):
             assert client.state() == state_after
             assert client.query('jobs')['total'] == jobs_before
             evidence.update(dependency_reader_both_directions=True, planning_is_not_completion=True,
-                            business_revision_unchanged_by_reads=True, model_jobs_added=0, passed=True)
+                            business_revision_unchanged_by_reads=True, model_jobs_added=0)
+
+            archive_owner = (await execute('create', {'type': 'course',
+                'title': 'Synthetic frozen archive course'}))['result']['entity']
+            archive_bytes = b'Synthetic packaged original for archive verification.'
+            archive_input = checked_path(client.data_dir.parent / 'synthetic-frozen-archive.txt', ROOT / '.build' / 'checks')
+            archive_input.write_bytes(archive_bytes)
+            imported = (await execute('import_asset', {'owner_id': archive_owner['id'],
+                'path': str(archive_input), 'library_subdir': ''}))['result']
+            original = imported['entity']; old_path = Path(imported['library']['path'])
+            destinations = await call('query_business', {'name': 'library_destinations',
+                'params': {'id': original['id']}})
+            assert destinations['owner_id'] == archive_owner['id']
+            assert destinations['current']['id'] == original['id']
+            assert destinations['current']['library_subdir'] == ''
+            assert any(item['subdir'] == '' for item in destinations['items'])
+            assert old_path == Path(destinations['path']) / archive_input.name
+            assert old_path.read_bytes() == archive_bytes
+            guarded = await arguments('refile_source', {'id': original['id'],
+                'version': original['version'], 'library_subdir': 'Slides'})
+            typed_args = {**guarded['payload'], **{key: guarded[key]
+                for key in ('request_id', 'epoch', 'expected_revision')}}
+            archived = await call('refile_source', typed_args)
+            moved = archived['result']['entity']; new_path = Path(archived['result']['library']['path'])
+            assert moved['id'] == original['id'] and moved['data']['sha256'] == original['data']['sha256']
+            assert moved['version'] == original['version'] + 1
+            assert new_path == old_path.parent / 'Slides' / old_path.name
+            assert new_path.read_bytes() == archive_bytes and not old_path.exists()
+            assert archived['archive_cleanup']['status'] == 'removed'
+            archive_state = client.state()
+            replayed = await call('refile_source', typed_args)
+            assert replayed['replayed'] and replayed['result'] == archived['result']
+            assert client.state() == archive_state
+            current = await call('query_business', {'name': 'library_destinations', 'params': {'id': original['id']}})
+            reopened = await call('query_business', {'name': 'open_resource', 'params': {'id': original['id']}})
+            assert current['current']['version'] == moved['version']
+            assert current['current']['library_subdir'] == 'Slides'
+            assert current['current']['relative_path'] == moved['data']['library_relative_path']
+            assert Path(current['current']['path']) == Path(reopened['path']) == new_path
+            assert not old_path.exists() and client.state() == archive_state
+            assert client.query('jobs')['total'] == jobs_before
+            assert client.query('list', type='plan')['total'] == plans_before + 2
+            evidence['original_archive'] = {'typed_tool': 'refile_source', 'same_asset_id_and_hash': True,
+                'owner_relative_destination': 'Slides', 'previous_copy_removed': True,
+                'identical_request_replayed_without_duplicate': True, 'current_location_read_back': True,
+                'relative_path': moved['data']['library_relative_path'], 'passed': True}
+            evidence['passed'] = True
     return evidence
 
 

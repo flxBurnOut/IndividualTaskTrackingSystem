@@ -20,7 +20,7 @@ from .storage import Store, encode, new_id, now
 COMMANDS = ["attach_conversation", "correct_recovery_scope", "set_task_completion", "revise_plan", "delete_task", "restore_task", "apply_timetable", "set_recovery_task", "record_recovery_progress", "add_to_plan", "set_recurring_rule", "materialize_recurring", "add_source", "send_message", "submit_daily_review", "set_review_preferences", "attach_local_file", "create", "update", "move", "archive", "link", "unlink", "record_feedback", "create_plan",
             "create_checkin", "respond_checkin", "save_review", "settings", "configure_codex", "connect_codex", "install_module", "disable_module",
             "create_job", "cancel_job", "resume_context_operation", "apply_proposal", "promote_checklist", "run_workflow", "undo",
-            "import_asset", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
+            "import_asset", "refile_source", "create_notebook_from_pdf", "create_bundle", "create_artifact_job", "backup", "restore_backup", "export_asset", "adopt_artifact"]
 
 
 def date_value(value, label="日期"):
@@ -48,6 +48,7 @@ class Core:
         self._resources = None
         self._desktop_gateway = None
         self._desktop_gateway_lock = threading.Lock()
+        self.library_lock = threading.RLock()
         from .extensions import ExtensionRegistry
         self.extensions = ExtensionRegistry()
 
@@ -112,6 +113,12 @@ class Core:
             from .session_coordinator import candidate_threads
             return {**candidate_threads(self,p.get('conversation_id')),**self.query('state')}
 
+        if name == 'library_destinations':
+            from .library import destinations
+            with self.library_lock:
+                result = destinations(self, p)
+                with self.store.connect() as c:
+                    return {**result, **self.store.state(c)}
         if name == 'library_folder':
             from .library import browse
             result = browse(self,p)
@@ -312,6 +319,21 @@ class Core:
         return dt.datetime.now(ZoneInfo(self.store.meta(c, "settings")["timezone"])).date().isoformat()
 
     def command(self, name, payload, *, request_id, epoch, expected_revision):
+        # Library publication and path changes share a dedicated lock. Ordinary
+        # business writes stay responsive, while a late materialize cannot
+        # recreate a previous path during a refile operation.
+        if name in {'add_source', 'import_asset', 'refile_source'}:
+            with self.library_lock:
+                return self._command(name, payload, request_id=request_id, epoch=epoch, expected_revision=expected_revision)
+        return self._command(name, payload, request_id=request_id, epoch=epoch, expected_revision=expected_revision)
+
+    def _file_receipt(self, name, receipt):
+        if name == 'refile_source':
+            from .library import finish_refile
+            return {**receipt, 'archive_cleanup': finish_refile(self, receipt['request_id'])}
+        return receipt
+
+    def _command(self, name, payload, *, request_id, epoch, expected_revision):
         if name not in COMMANDS and name not in self.extensions.commands or not isinstance(payload, dict):
             raise BusinessError("unknown_command", "未注册的业务操作。")
         if not isinstance(request_id, str) or not 8 <= len(request_id) <= 128:
@@ -324,7 +346,7 @@ class Core:
             raise BusinessError("request_limit", "请求过大，请将大内容存为资料附件。")
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
 
-        io_command = name in {"add_source", "import_asset", "backup", "restore_backup", "export_asset"}
+        io_command = name in {"add_source", "import_asset", "refile_source", "backup", "restore_backup", "export_asset"}
 
         def check(c, *, check_revision=True):
             state = self.store.state(c)
@@ -346,15 +368,16 @@ class Core:
         prepared = None
         with self.store.lock, self.store.connect() as c:
             operation = c.execute('SELECT * FROM io_operations WHERE request_id=?', (request_id,)).fetchone() if io_command else None
-            previous = check(c, check_revision=not (operation and operation['status'] == 'ready'))
+            resumable_refile = bool(name == 'refile_source' and operation and operation['status'] in {'preparing', 'needs_reconciliation'})
+            previous = check(c, check_revision=not (operation and operation['status'] == 'ready') and not resumable_refile)
             if previous:
-                return previous
+                return self._file_receipt(name, previous)
             if operation:
                 if operation['fingerprint'] != fingerprint:
                     raise BusinessError('idempotency_conflict', '同一请求编号用于不同文件操作。')
                 if operation['status'] == 'ready':
                     prepared = json.loads(operation['result'])
-                else:
+                elif not resumable_refile:
                     raise BusinessError('operation_pending', '此文件操作已有执行记录，请先查询回执和操作状态；不会自动重复处理。', {'request_id': request_id, 'status': operation['status']})
             elif io_command:
                 stamp = now()
@@ -379,7 +402,7 @@ class Core:
                 previous = check(c, check_revision=not io_command)
                 if previous:
                     c.rollback()
-                    return previous
+                    return self._file_receipt(name, previous)
                 result = self._dispatch(c, name, payload, request_id, prepared)
                 revision = self.store.meta(c, "revision") + 1
                 self.store.set_meta(c, "revision", revision)
@@ -396,7 +419,8 @@ class Core:
             except sqlite3.Error as error:
                 c.rollback()
                 raise BusinessError("storage_error", "本次未确认保存成功。请检查磁盘或稍后按原请求编号查询回执。", {"reason": str(error)[:200]}) from error
-            return {"request_id": request_id, "result": result, "epoch": epoch, "revision": revision, "replayed": False}
+            receipt = {"request_id": request_id, "result": result, "epoch": epoch, "revision": revision, "replayed": False}
+        return self._file_receipt(name, receipt)
 
     def _prepare(self, name, p):
         if name == 'connect_codex':
@@ -443,6 +467,9 @@ class Core:
         if name == 'add_source':
             from .sources import prepare
             return prepare(self,p)
+        if name == 'refile_source':
+            from .library import prepare_refile
+            return prepare_refile(self, p)
         if name == 'send_message':
             from .sources import prepare_context
             return prepare_context(self,p)
@@ -451,10 +478,20 @@ class Core:
             return prepare_local_file(p)
         # Filesystem and long I/O happen before BEGIN, outside the application lock.
         if name == "import_asset":
-            from .library import prepare
+            from .library import prepare, subdirectory, ensure_same_destination, materialize
+            from .sources import _owner, existing_import
+            if p.get('library_subdir') is not None: subdirectory(p['library_subdir'])
+            with self.store.connect() as c: _owner(self,c,p.get('owner_id'))
             data = self.resources.import_file(p["path"])
-            published = prepare(self,data,Path(p['path']).name,p.get('owner_id'))
-            return {**data,'library_relative_path':published['relative_path']}
+            with self.store.connect() as c:
+                existing=existing_import(self,c,p,data['sha256'])
+                if existing:
+                    ensure_same_destination(self,c,existing,p.get('library_subdir'))
+                    materialize(self,existing)
+                    return {**data,'_existing_id':existing['id']}
+            published = prepare(self,data,Path(p['path']).name,p.get('owner_id'),library_subdir=p.get('library_subdir'))
+            return {**data,'library_relative_path':published['relative_path'], 'library_subdir':published['subdir'],
+                    'source_owner_id':p.get('owner_id'), '_library':published}
         if name == "backup":
             def select_assets(c):
                 found = {}
@@ -552,6 +589,9 @@ class Core:
         if name == 'add_source':
             from .sources import add
             return add(self,c,p,rid,prepared)
+        if name == 'refile_source':
+            from .library import apply_refile
+            return apply_refile(self, c, p, rid, prepared)
         if name == 'send_message':
             from .conversations import send
             return send(self,c,p,rid,prepared)
@@ -851,11 +891,20 @@ class Core:
             mark_applied(self,c,job)
             return {"results": results, "results_total":results_total, "job_id": p["id"], "details_query":{"name":"changes","request_id":rid}}
         if name == "import_asset":
-            data = {**prepared, "original_name": Path(p["path"]).name, "source_text": p.get("source_text", "")}
+            from .sources import _owner, existing_import
+            from .library import register, location, ensure_same_destination
+            _owner(self,c,p.get('owner_id'))
+            existing=existing_import(self,c,p,prepared['sha256'])
+            if existing:
+                return {'entity':existing,'reused':True,'library':ensure_same_destination(self,c,existing,p.get('library_subdir'))}
+            if prepared.get('_existing_id'):
+                raise BusinessError('entity_conflict','原资料已变化，请重新核对后导入。')
+            data = {**{key:value for key,value in prepared.items() if not key.startswith('_')}, "original_name": Path(p["path"]).name, "source_text": p.get("source_text", "")}
             entity = self._create(c, {"type": "asset", "title": p.get("title") or Path(p["path"]).name, "data": data}, rid)
             if p.get("owner_id"):
                 self._dispatch(c, "link", {"source_id": p["owner_id"], "target_id": entity["id"], "kind": "uses"}, rid)
-            return {"entity": entity}
+            if prepared.get('_library'): register(c, entity, prepared['_library'])
+            return {"entity": entity, 'reused':False, 'library':location(self,c,entity)}
         if name == "create_bundle":
             entries, paths = [], set()
             for item in p["entries"]:

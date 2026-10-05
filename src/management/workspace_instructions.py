@@ -48,6 +48,24 @@ stable request_id and the current epoch/revision. Follow the capability/action
 schemas actually returned by the service. Use the same request_id to investigate
 an uncertain receipt, never silently send a second business write.
 
+Before importing originals, query library_destinations(owner_id) and follow its
+directory pagination. add_source/import_asset accept library_subdir relative to
+that owner's archive folder, using / between directories. An explicit empty
+string selects the owner folder root. Course ownership is not a folder choice:
+use the user's instructions and source contents to select an existing category;
+if the destination is unclear, keep it unresolved instead of silently using root.
+library_destination_required requires a destination choice. A
+library_location_conflict identifies content already saved elsewhere; inspect
+that entity rather than importing a duplicate or silently moving it.
+
+For an authorized archive move, query library_destinations(id), then call
+refile_source with the current id/version and the chosen library_subdir. Preserve
+the original request_id and payload when reconciling an uncertain response. Use
+result.library.path/relative_path to report the actual archive location and
+archive_cleanup to disclose retained or pending prior copies. A web open_resource
+path may be a text preview, not its archived original. Never substitute direct
+filesystem operations or generic entity update/move for this service command.
+
 When the user explicitly asks to record or update information, carry out the
 authorized concrete change; do not ask for redundant general confirmation. If
 they ask only to discuss/analyze, do not save speculation. begin_discussion and
@@ -63,6 +81,13 @@ to personal-management business records must use its business service, never SQL
 direct database/filesystem modification, or a script that bypasses receipts.
 
 SHARED EVIDENCE RULES FOR BOTH SECTIONS
+Source registration, correct archive placement, and reading coverage are separate
+outcomes. Only report the location confirmed by the business receipt or current
+library_destinations result. In a managed matter, imports/refiling are outside
+the candidate command registry: use the management app's source/file controls,
+then continue the same matter with its saved materials. Never call ordinary file
+writes or fabricate update actions to bypass managed confirmation boundaries.
+
 Unknown information stays unknown. Completion, attendance, viewing, submission,
 mastery and actual time spent are separate facts. Never infer one from another.
 Keep course/project ownership and the exact learning-unit name from the evidence;

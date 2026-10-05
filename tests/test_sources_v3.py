@@ -124,3 +124,40 @@ def test_course_source_creation_reuses_same_facts_and_rejects_changed_duplicate(
         assert error.value.code=='source_conflict'
     details=c.query('object_workspace',id=owner['id'])['course_info']
     assert details['assessments_total']==1 and details['assessments'][0]['data']['weight']==60
+
+
+@pytest.mark.parametrize('name',['add_source','import_asset'])
+def test_import_with_existing_classifications_requires_choice_and_accepts_explicit_root(tmp_path,name):
+    c=Core(tmp_path/'data');owner=course(c)
+    folder=Path(c.query('library_folder',owner_id=owner['id'])['path'])
+    (folder/'课件').mkdir()
+    source=tmp_path/'classified.txt';source.write_text('Synthetic classified lesson','utf-8')
+    payload={'owner_id':owner['id'],'path':str(source)};before=c.query('state')
+    with pytest.raises(BusinessError) as caught:command(c,name,payload)
+    assert caught.value.code=='library_destination_required'
+    assert c.query('state')==before and c.query('list',type='asset')['total']==0
+    assert not (folder/source.name).exists()
+    saved=command(c,name,{**payload,'library_subdir':''})['entity']
+    assert saved['data']['library_subdir']==''
+    assert Path(c.query('open_resource',id=saved['id'])['path'])==folder/source.name
+
+
+@pytest.mark.parametrize('name',['add_source','import_asset'])
+def test_classified_import_and_duplicate_location_conflict_keep_one_asset(tmp_path,name):
+    c=Core(tmp_path/'data');owner=course(c)
+    source=tmp_path/'classified.txt';source.write_text('Synthetic classified lesson','utf-8')
+    payload={'owner_id':owner['id'],'path':str(source),'library_subdir':'课件/Week 3'}
+    saved=command(c,name,payload)['entity']
+    folder=Path(c.query('library_destinations',owner_id=owner['id'])['path'])
+    stored=folder/'课件'/'Week 3'/source.name
+    assert saved['data']['library_subdir']=='课件/Week 3'
+    assert Path(c.query('open_resource',id=saved['id'])['path'])==stored
+    before=c.query('state')
+    with pytest.raises(BusinessError) as caught:command(c,name,{**payload,'library_subdir':'其他'})
+    assert caught.value.code=='library_location_conflict'
+    assert caught.value.details['entity_id']==saved['id']
+    assert caught.value.details['current_relative_path']==saved['data']['library_relative_path']
+    assert c.query('state')==before and c.query('list',type='asset')['total']==1
+    assert c.query('get',id=saved['id'])['entity']==saved
+    assert stored.read_text('utf-8')=='Synthetic classified lesson'
+    assert not (folder/'其他'/source.name).exists()

@@ -135,6 +135,8 @@ def _legacy_extract(core,metadata,name,directory,*,layout_mode=None):
 
 
 def prepare(core,p):
+    from .library import subdirectory
+    if p.get('library_subdir') is not None: subdirectory(p['library_subdir'])
     if p.get('title') is not None and (not isinstance(p['title'],str) or len(p['title'])>300):
         raise BusinessError('source_title','资料名称应不超过300字符。')
     kind=p.get('kind','file')
@@ -171,7 +173,8 @@ def prepare(core,p):
             row=c.execute("SELECT * FROM entities WHERE type='asset' AND archived=0 AND json_extract(data,'$.source_kind')=? AND json_extract(data,'$.sha256')=? AND json_extract(data,'$.source_owner_id') IS ? AND json_extract(data,'$.source_identity')=? LIMIT 1",(kind,metadata['sha256'],p.get('owner_id'),identity)).fetchone()
             if row:
                 existing=core.store.entity(row)
-                from .library import materialize
+                from .library import materialize, ensure_same_destination
+                ensure_same_destination(core,c,existing,p.get('library_subdir'))
                 materialize(core,existing)
                 return {'existing_id':existing['id'],'data':existing['data'],'title':existing['title']}
         try:
@@ -180,21 +183,33 @@ def prepare(core,p):
             extraction={'status':'failed','coverage':{'complete':False},'warnings':['原件已保存，自动读取未完成：'+str(error)[:300]],'text_sha256':None,'images':[],'characters':0};derived=[]
         data={**metadata,'original_name':name,'source_kind':kind,'source_owner_id':p.get('owner_id'),'managed_copy':True,'source_identity':identity,'source_url':source_url,'original_path':source_path,'captured_at':now(),'extraction':extraction,'entries':[{'path':name,'sha256':metadata['sha256'],'size':metadata['size']},*derived]}
         from .library import prepare as prepare_original
-        published=prepare_original(core,data,name,p.get('owner_id'))
+        published=prepare_original(core,data,name,p.get('owner_id'),library_subdir=p.get('library_subdir'))
         data['library_relative_path']=published['relative_path']
+        data['library_subdir']=published['subdir']
         return {'data':data,'library':published,'title':p.get('title') or (source_url[:300] if kind=='web' else name)}
 
 
 def add(core,c,p,rid,prepared):
     owner=_owner(core,c,p.get('owner_id'));data=prepared['data']
     row=c.execute("SELECT * FROM entities WHERE type='asset' AND archived=0 AND json_extract(data,'$.source_kind')=? AND json_extract(data,'$.sha256')=? AND json_extract(data,'$.source_owner_id') IS ? AND json_extract(data,'$.source_identity')=? LIMIT 1",(data['source_kind'],data['sha256'],p.get('owner_id'),data['source_identity'])).fetchone()
-    if row:return {'entity':core.store.entity(row),'reused':True,'extraction':data['extraction']}
+    from .library import ensure_same_destination, location
+    if row:
+        existing=core.store.entity(row)
+        actual=ensure_same_destination(core,c,existing,p.get('library_subdir'))
+        return {'entity':existing,'reused':True,'extraction':existing['data']['extraction'],'library':actual}
     entity=core._create(c,{'type':'asset','title':prepared['title'],'data':data},rid)
     if owner:core._dispatch(c,'link',{'source_id':owner['id'],'target_id':entity['id'],'kind':'uses'},rid)
     if prepared.get('library'):
         from .library import register
         register(c,entity,prepared['library'])
-    return {'entity':entity,'reused':False,'extraction':data['extraction']}
+    return {'entity':entity,'reused':False,'extraction':data['extraction'],'library':location(core,c,entity)}
+
+
+def existing_import(core,c,p,digest):
+    """Generic imports reuse only the same original for the same owner."""
+    row=c.execute("SELECT * FROM entities WHERE type='asset' AND archived=0 AND json_extract(data,'$.source_kind') IS NULL AND json_extract(data,'$.sha256')=? AND json_extract(data,'$.source_owner_id') IS ? AND json_extract(data,'$.original_name')=? ORDER BY created_at LIMIT 1",
+                  (digest,p.get('owner_id'),Path(p['path']).name)).fetchone()
+    return core.store.entity(row) if row else None
 
 
 def list_sources(core,c,p):
