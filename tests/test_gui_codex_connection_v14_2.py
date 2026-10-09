@@ -190,7 +190,7 @@ def test_settings_save_and_explicit_connect_are_separate(app, tmp_path):
         dialog.ai_enabled.setChecked(True);dialog.save_ai()
         bridge.commands[-1]['callback']({'result': {'settings': SETTINGS}})
         bridge.deliver('codex_connection', {'ready': False, 'state': 'desktop_closed'})
-        assert dialog.ai_save.text() == '保存设置'
+        assert dialog.ai_save.text() == '保存 Codex 协助设置'
         assert '首次连接或发送' in dialog.codex_project_note.text()
         assert [item['name'] for item in bridge.commands] == ['configure_codex']
         dialog.codex_bridge_start.click()

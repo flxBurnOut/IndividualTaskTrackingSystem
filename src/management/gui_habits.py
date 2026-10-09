@@ -2,11 +2,45 @@
 from __future__ import annotations
 import datetime as dt
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDialog,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QLineEdit,QTextEdit,
+from PySide6.QtWidgets import (QDialog,QVBoxLayout,QHBoxLayout,QGridLayout,QFormLayout,QLabel,QLineEdit,QTextEdit,
     QCheckBox,QSpinBox,QPushButton,QListWidget,QListWidgetItem,QComboBox,QFrame,QWidget,QScrollArea,QMessageBox)
 from shiboken6 import isValid
 from .gui_recurring import RecurringDialog,text_label,action
 from .gui_forms import label_type
+from .gui_layout import ActionRow
+from .gui_theme import bind_theme
+from .gui_visual_profile import visual_style
+
+
+HABIT_CHOICES = {
+    'behavior': {
+        'title': '日常安排习惯',
+        'description': '用文字说明平时希望怎样安排，供你和助手参考。例如“重要的事先做，下午留些空余”。',
+        'example': '例如：重要的事先做',
+        'policy_example': '例如：每天先处理最重要的一件事，下午留些空余。',
+    },
+    'capacity': {
+        'title': '每天最多安排多久',
+        'description': '设置日计划的时长上限，例如 180 分钟就是 3 小时。已填用时的合计超出上限时，需要调整后再保存计划。',
+        'example': '例如：每天的计划不超过 3 小时',
+    },
+    'protected_time': {
+        'title': '不安排任务的时段',
+        'description': '为睡眠、吃饭等保留时间，例如 23:00–07:00。带具体钟点的计划占用这些时段时，需要调整后再保存。',
+        'example': '例如：晚上睡觉时间',
+    },
+    'warning': {
+        'title': '日程与截止日期提醒',
+        'description': '设置提前多久在“今天”和“总览”显示日期提醒。例如提前 3 天看到临近日程或截止日期；这是软件内提示，不是定时闹钟。',
+        'example': '例如：提前 3 天关注到期事项',
+    },
+    'temporary': {
+        'title': '这段时间的特别安排',
+        'description': '记录近期的特殊要求，供你和助手参考。例如“本周少排任务，多留休息”。填好适用日期；不填结束日期就不会自动到期。',
+        'example': '例如：这周安排轻松一些',
+        'policy_example': '例如：这周只安排少量重点，多留休息与缓冲。请在下面填写适用日期。',
+    },
+}
 
 
 class HabitEditor(QDialog):
@@ -14,37 +48,58 @@ class HabitEditor(QDialog):
         super().__init__(parent);self.bridge,self.entity,self.on_saved=bridge,entity,on_saved
         self.epoch,self.revision=bridge.epoch,bridge.revision;self.saving=False;self.dirty=False
         data=(entity or {}).get('data',{});self.kind=data.get('rule_kind',kind)
-        kind_title={'behavior':'文字偏好','temporary':'临时偏好','capacity':'每日可用容量','protected_time':'休息与保护时段','warning':'提前提醒'}.get(self.kind,'安排偏好')
-        self.setWindowTitle(('查看与修改' if entity else '添加')+kind_title);self.resize(620,530)
-        layout=QVBoxLayout(self);layout.addWidget(text_label(self.windowTitle(),'DialogHeading'))
-        effect=(entity or {}).get('effect') or {'capacity':'保存每日计划时检查可用容量；不会自动安排任务。','protected_time':'保存带具体时间的计划时检查冲突，保护休息时间。','warning':'在今天页显示提前提醒；不会自动创建待办。'}.get(self.kind,'文字偏好供你安排时参考；使用助手时也会提供。不会自动执行或创建待办。')
+        choice=HABIT_CHOICES.get(self.kind,{})
+        kind_title=choice.get('title','安排偏好')
+        self.setWindowTitle(('查看与修改 · ' if entity else '添加 · ')+kind_title);self.resize(680,610)
+        outer=QVBoxLayout(self);outer.setContentsMargins(24,20,24,18);outer.setSpacing(14);outer.addWidget(text_label(self.windowTitle(),'DialogHeading'))
+        self.editor_scroll=QScrollArea();self.editor_scroll.setWidgetResizable(True);self.editor_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body=QWidget();layout=QVBoxLayout(body);self.editor_scroll.setWidget(body);outer.addWidget(self.editor_scroll,1)
+        effect=choice.get('description') or (entity or {}).get('effect') or '供你和助手安排时参考。'
         layout.addWidget(text_label(effect))
         if entity and entity.get('scope_warning'):layout.addWidget(text_label(entity['scope_warning']))
-        form=QFormLayout();layout.addLayout(form)
-        self.title=QLineEdit((entity or {}).get('title',''));form.addRow('名称',self.title)
+        form=QFormLayout();form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows);form.setVerticalSpacing(14);layout.addLayout(form)
+        self.title=QLineEdit((entity or {}).get('title',''));self.title.setPlaceholderText(choice.get('example','为这项设置起个名字'));form.addRow('这项设置的名称',self.title)
         self.fields={}
         if self.kind in {'behavior','temporary'} or self.kind not in {'warning','capacity','protected_time'}:
-            self.policy=QTextEdit(data.get('policy') or data.get('notes') or '');self.policy.setAcceptRichText(False);self.policy.setMinimumHeight(120);form.addRow('安排时遵循的习惯',self.policy);self.fields['policy']=self.policy
+            self.policy=QTextEdit(data.get('policy') or data.get('notes') or '');self.policy.setAcceptRichText(False);self.policy.setMinimumHeight(120);self.policy.setPlaceholderText(choice.get('policy_example','写下你希望怎样安排。'));form.addRow('这段时间希望怎样安排' if self.kind=='temporary' else '平时希望怎样安排',self.policy);self.fields['policy']=self.policy
         elif self.kind=='warning':
-            for key,title,maximum in [('days_before','提前天数',366),('calendar_months_before','提前日历月数',24)]:
-                editor=QSpinBox();editor.setRange(0,maximum);editor.setValue(data.get(key) or 0);form.addRow(title,editor);self.fields[key]=editor
+            for key,title,maximum,suffix in [('days_before','提前多少天',366,' 天'),('calendar_months_before','按月提前（可选）',24,' 个月')]:
+                editor=QSpinBox();editor.setRange(0,maximum);editor.setValue(data.get(key) or 0);editor.setSuffix(suffix);form.addRow(title,editor);self.fields[key]=editor
+            form.addRow('',text_label('一般只填天数，月数保留 0。两项都填时，取更早的提醒日期，不相加；都填 0 表示当天开始提醒。','Hint'))
         elif self.kind=='capacity':
-            editor=QSpinBox();editor.setRange(-1,1440);editor.setSpecialValueText('尚未明确');editor.setValue(data.get('minutes') if data.get('minutes') is not None else -1);form.addRow('每天可安排的分钟数',editor);self.fields['minutes']=editor
+            editor=QSpinBox();editor.setRange(-1,1440);editor.setSpecialValueText('尚未明确');editor.setSuffix(' 分钟');editor.setValue(data.get('minutes') if data.get('minutes') is not None else -1);form.addRow('每天的计划时长上限',editor);self.fields['minutes']=editor
+            form.addRow('',text_label('例如：180 分钟 = 3 小时。只合计已加入日计划的项目；没有加入计划的课表、日程不会自动扣除，未填用时的项目仍待核对。','Hint'))
         else:
-            for key,title in [('start','保护时段开始'),('end','保护时段结束')]:
+            for key,title in [('start','从几点开始留空'),('end','到几点结束')]:
                 editor=QLineEdit(data.get(key) or '');editor.setPlaceholderText('HH:mm');form.addRow(title,editor);self.fields[key]=editor
-            layout.addWidget(text_label('例如 12:00–13:00；23:00–07:00 表示跨午夜保护。开始和结束相同表示全天保护。','Hint'))
-        self.enabled=QCheckBox('继续使用这项设置');self.enabled.setChecked(data.get('enabled',True) and (entity or {}).get('status') not in {'done','cancelled','draft'});form.addRow(self.enabled)
-        self.first=QLineEdit(data.get('effective_from') or '');self.first.setPlaceholderText('留空表示不限；格式 YYYY-MM-DD')
-        self.last=QLineEdit(data.get('effective_until') or '');self.last.setPlaceholderText('留空表示不限；格式 YYYY-MM-DD')
+            form.addRow('',text_label('例如 12:00–13:00；23:00–07:00 表示夜里到次日早上。开始和结束相同表示全天留空。只排先后、不填钟点的计划仍需另行核对。','Hint'))
+        self.enabled=QCheckBox('启用这项设置');self.enabled.setChecked(data.get('enabled',True) and (entity or {}).get('status') not in {'done','cancelled','draft'});form.addRow(self.enabled)
+        self.first=QLineEdit(data.get('effective_from') or '');self.first.setPlaceholderText('留空不限；YYYY-MM-DD')
+        self.last=QLineEdit(data.get('effective_until') or '');self.last.setPlaceholderText('结束日期：YYYY-MM-DD' if self.kind=='temporary' else '留空不限；YYYY-MM-DD')
         form.addRow('从哪天开始适用',self.first);form.addRow('适用到哪天',self.last)
-        self.note=text_label('');layout.addWidget(self.note);layout.addStretch()
-        row=QHBoxLayout();row.addStretch();self.cancel=action('取消',self.reject);row.addWidget(self.cancel);self.save_button=action('保存设置',self.save);self.save_button.setObjectName('Primary');row.addWidget(self.save_button);layout.addLayout(row)
+        if self.kind=='temporary':form.addRow('',text_label('结束日期当天仍适用，第二天起不再采用这项要求；原记录会保留。','Hint'))
+        layout.addStretch();self.note=text_label('');outer.addWidget(self.note)
+        row=QHBoxLayout();row.addStretch();self.cancel=action('取消',self.reject);row.addWidget(self.cancel);self.save_button=action('保存设置',self.save);self.save_button.setObjectName('Primary');row.addWidget(self.save_button);outer.addLayout(row)
         self.edit_widgets=[self.title,self.first,self.last,*self.fields.values()]
         for widget in self.edit_widgets:
             signal=widget.valueChanged if isinstance(widget,QSpinBox) else widget.textChanged
             signal.connect(self.changed)
         self.enabled.toggled.connect(self.changed)
+        bind_theme(self,self.fit_fields)
+
+    def fit_fields(self):
+        from .gui_workflows import fit_input_fields
+        fit_input_fields(self)
+        modern=visual_style()=='glass';scale=max(1,self.fontMetrics().height()/18)
+        self.title.setMaximumWidth(round(460*scale) if modern else 16777215)
+        for field in (self.first,self.last):
+            field.setMaximumWidth(max(round(220*scale),field.fontMetrics().horizontalAdvance(field.placeholderText())+32) if modern else 16777215)
+        for field in self.fields.values():
+            if isinstance(field,QSpinBox):
+                field.setMaximumWidth(max(round(170*scale),field.sizeHint().width()) if modern else 16777215)
+            elif isinstance(field,QLineEdit):
+                field.setMaximumWidth(round(140*scale) if modern else 16777215)
+        self.editor_scroll.widget().updateGeometry()
 
     def changed(self,*_):self.dirty=True
 
@@ -61,10 +116,12 @@ class HabitEditor(QDialog):
             if data['effective_from'] and data['effective_until'] and data['effective_from']>data['effective_until']:raise ValueError('起始日期晚于结束日期')
         except ValueError:
             self.note.setText('请使用 YYYY-MM-DD，且结束日期不得早于开始日期。');return
-        if not self.title.text().strip() or self.kind in {'behavior','temporary'} and not data.get('policy'):
-            self.note.setText('请填写名称和具体的安排习惯。');return
+        if not self.title.text().strip():
+            self.note.setText('请给这项设置填写一个名称，方便以后查看或修改。');return
+        if self.kind in {'behavior','temporary'} and not data.get('policy'):
+            self.note.setText('请写下具体的安排要求；示例文字不会自动保存。');return
         if self.kind=='capacity' and self.enabled.isChecked() and data.get('minutes') is None:
-            self.note.setText('启用容量设置前，请填写每天可安排的分钟数；尚未明确时可先取消启用。');return
+            self.note.setText('启用时长上限前，请填写每天最多安排多少分钟；尚未明确时可先取消启用。');return
         if self.kind=='protected_time' and self.enabled.isChecked():
             try:
                 start,end=(dt.time.fromisoformat(data.get(key) or '') for key in ('start','end'))
@@ -96,50 +153,93 @@ class HabitsPanel(QScrollArea):
     def __init__(self,bridge,reminder,parent=None,on_changed=None):
         super().__init__(parent);self.bridge,self.on_changed=bridge,on_changed;self.generation=0;self.result={};self.dialogs=[];self.dead=False
         self.destroyed.connect(lambda *_:setattr(self,'dead',True));self.setWidgetResizable(True);self.setFrameShape(QFrame.Shape.NoFrame)
-        body=QWidget();self.content=QVBoxLayout(body);self.content.setSpacing(16);self.setWidget(body)
-        self.content.addWidget(text_label('设置一次，之后按你的习惯安排。日常只需要看今天的计划和提醒。'))
-        box,layout=self.card('什么时候提醒我复盘')
+        body=QWidget();self.content=QVBoxLayout(body);self.content.setContentsMargins(2,0,10,0);self.content.setSpacing(18);self.setWidget(body)
+        self.content.addWidget(text_label('在这里设置提醒、计划时长和休息时间，也可以写下自己的安排习惯。只填写你需要的项目。'))
+        self.sections=[];self.section_grid=QGridLayout();self.section_grid.setHorizontalSpacing(30);self.section_grid.setVerticalSpacing(22);self.content.addLayout(self.section_grid)
+        self.reminder_box,layout=self.card('什么时候提醒我复盘')
         self.reminder_summary=text_label('正在读取…');layout.addWidget(self.reminder_summary)
-        self.reminder_toggle=QPushButton('调整提醒时间');self.reminder_toggle.setCheckable(True);layout.addWidget(self.reminder_toggle)
+        self.reminder_toggle=QPushButton('调整提醒时间');self.reminder_toggle.setCheckable(True);self.reminder_toggle.setProperty('disclosure',True);self.actions(layout,self.reminder_toggle)
         self.reminder=reminder;reminder.setVisible(False);layout.addWidget(reminder);self.reminder_toggle.toggled.connect(self.show_reminders)
         self.prep_box,layout=self.card('课前与截止前准备')
         self.prep_summary=text_label('正在读取…');layout.addWidget(self.prep_summary)
         layout.addWidget(text_label('例如：每次 Tutorial 前一天提醒我完成对应题目。设置后会生成待办，再由你安排进每日计划。'))
         self._assistants_visible=True
         self.codex_preparation=action('请助手建议准备规则',self.discuss_preparation)
-        self.prep_toggle=QPushButton('查看与设置准备规则');self.prep_toggle.setCheckable(True);self.prep_toggle.setObjectName('Primary')
-        controls=QHBoxLayout();controls.addWidget(self.prep_toggle,1);controls.addWidget(self.codex_preparation,1);layout.addLayout(controls)
+        self.prep_toggle=QPushButton('查看与设置准备规则');self.prep_toggle.setCheckable(True);self.prep_toggle.setProperty('disclosure',True)
+        self.actions(layout,self.prep_toggle,self.codex_preparation)
         self.prep_details=QWidget();detail=QVBoxLayout(self.prep_details);detail.setContentsMargins(0,8,0,0);layout.addWidget(self.prep_details);self.prep_details.hide()
         self.prep_toggle.toggled.connect(lambda opened:self.toggle_details(self.prep_toggle,self.prep_details,opened,'查看与设置准备规则'))
         self.preparations=QListWidget();self.preparations.setMaximumHeight(115);self.preparations.itemDoubleClicked.connect(self.edit_preparation);detail.addWidget(self.preparations)
-        self.prep_edit=action('修改这项准备',self.edit_preparation);detail.addWidget(self.prep_edit)
-        self.prep_previous=action('上一页',lambda:self.previous_page('preparation'));detail.addWidget(self.prep_previous)
-        self.prep_more=action('下一页',self.more_preparations);detail.addWidget(self.prep_more)
+        self.prep_edit=action('修改这项准备',self.edit_preparation)
+        self.prep_previous=action('上一页',lambda:self.previous_page('preparation'))
+        self.prep_more=action('下一页',self.more_preparations);self.actions(detail,self.prep_edit,self.prep_previous,self.prep_more)
         detail.addWidget(text_label('选择日程，填写提前天数和准备内容：'))
-        row=QHBoxLayout();self.anchor=QComboBox();self.anchor.setMinimumContentsLength(20);self.anchor.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon);row.addWidget(self.anchor,1)
-        self.create_preparation=action('填写准备内容',self.new_preparation);self.create_preparation.setEnabled(False);row.addWidget(self.create_preparation);detail.addLayout(row)
+        self.anchor=QComboBox();self.anchor.setMinimumContentsLength(12);self.anchor.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.create_preparation=action('填写准备内容',self.new_preparation);self.create_preparation.setEnabled(False);self.actions(detail,self.anchor,self.create_preparation)
         self.anchor.currentIndexChanged.connect(lambda:self.create_preparation.setEnabled(bool(self.anchor.currentData())))
         self.rules_box,layout=self.card('我希望怎样安排一天')
         self.rule_summary=text_label('');layout.addWidget(self.rule_summary)
         self.preference_summary=text_label('');layout.addWidget(self.preference_summary)
+        layout.addWidget(text_label('你想设置什么？','SectionHeading'))
         self.discuss_button=action('请助手建议安排偏好',lambda:self.discuss(general=True))
-        new_row=QHBoxLayout();self.new_kind=QComboBox();self.new_kind.setAccessibleName('新增安排设置类型')
-        for title,kind in [('文字偏好','behavior'),('每日可用容量','capacity'),('休息与保护时段','protected_time'),('提前提醒','warning'),('临时偏好','temporary')]:self.new_kind.addItem(title,kind)
-        new_row.addWidget(self.new_kind,1);self.new_rule_button=action('添加设置',self.new_habit);self.new_rule_button.setObjectName('Primary');new_row.addWidget(self.new_rule_button);layout.addLayout(new_row)
-        self.rules_toggle=QPushButton('查看已有设置');self.rules_toggle.setCheckable(True)
-        controls=QHBoxLayout();controls.addWidget(self.rules_toggle,1);controls.addWidget(self.discuss_button,1);layout.addLayout(controls)
+        self.new_kind=QComboBox();self.new_kind.setAccessibleName('新增安排设置类型')
+        for kind,choice in HABIT_CHOICES.items():self.new_kind.addItem(choice['title'],kind)
+        self.new_rule_button=action('填写这项设置',self.new_habit);self.new_rule_button.setObjectName('Primary');self.actions(layout,self.new_kind,self.new_rule_button)
+        self.new_kind_help=text_label('');layout.addWidget(self.new_kind_help)
+        self.new_kind.currentIndexChanged.connect(self.describe_new_kind);self.describe_new_kind()
+        self.rules_toggle=QPushButton('查看已有设置');self.rules_toggle.setCheckable(True);self.rules_toggle.setProperty('disclosure',True)
+        self.actions(layout,self.rules_toggle,self.discuss_button)
         self.rule_details=QWidget();detail=QVBoxLayout(self.rule_details);detail.setContentsMargins(0,8,0,0);layout.addWidget(self.rule_details);self.rule_details.hide()
         self.rules_toggle.toggled.connect(lambda opened:self.toggle_details(self.rules_toggle,self.rule_details,opened,'查看已有设置'))
         self.rules=QListWidget();self.rules.setMaximumHeight(165);self.rules.currentItemChanged.connect(lambda *_:self.describe_rule());self.rules.itemDoubleClicked.connect(self.edit_rule);detail.addWidget(self.rules)
         self.rule_info=text_label('安排计划时参考你的要求。');detail.addWidget(self.rule_info)
-        row=QHBoxLayout();self.edit_button=action('查看原文 / 修改',self.edit_rule);row.addWidget(self.edit_button);detail.addLayout(row)
-        self.rule_previous=action('上一页',lambda:self.previous_page('rules'));detail.addWidget(self.rule_previous)
-        self.rule_more=action('下一页',self.more_rules);detail.addWidget(self.rule_more)
+        self.edit_button=action('查看原文 / 修改',self.edit_rule)
+        self.rule_previous=action('上一页',lambda:self.previous_page('rules'))
+        self.rule_more=action('下一页',self.more_rules);self.actions(detail,self.edit_button,self.rule_previous,self.rule_more)
         self.boundary=text_label('');self.content.addWidget(self.boundary);self.note=text_label('');self.content.addWidget(self.note);self.content.addStretch()
-        self.rules_offset=self.prep_offset=0;self.refresh()
+        self.rules_offset=self.prep_offset=0;bind_theme(self,self.apply_visual_style);self.refresh()
 
     def card(self,title):
-        box=QFrame();box.setObjectName('ProgressCard');layout=QVBoxLayout(box);layout.setContentsMargins(16,14,16,14);layout.addWidget(text_label(title,'SectionHeading'));self.content.addWidget(box);return box,layout
+        box=QFrame();layout=QVBoxLayout(box);layout.setSpacing(12);layout.addWidget(text_label(title,'SectionHeading'));self.sections.append(box);return box,layout
+
+    @staticmethod
+    def actions(layout,*widgets):
+        row=ActionRow()
+        for widget in widgets:row.addWidget(widget)
+        layout.addWidget(row)
+        return row
+
+    def apply_visual_style(self):
+        modern=visual_style()=='glass'
+        for section in self.sections:
+            section.setObjectName('ContentSection' if modern else 'ProgressCard')
+            section.layout().setContentsMargins(*( (2,12,2,18) if modern else (16,14,16,14)))
+            section.style().unpolish(section);section.style().polish(section)
+        self.reflow_sections()
+
+    def reflow_sections(self):
+        if not hasattr(self,'rules_box'):return
+        wide=visual_style()=='glass' and self.viewport().width()>=round(820*max(1,self.fontMetrics().height()/18))
+        key=(wide,self.reminder_toggle.isChecked())
+        if getattr(self,'_section_layout',None)==key:return
+        self._section_layout=key
+        for section in self.sections:self.section_grid.removeWidget(section)
+        self.section_grid.setColumnStretch(0,1);self.section_grid.setColumnStretch(1,1 if wide else 0)
+        if wide and not self.reminder_toggle.isChecked():
+            self.section_grid.addWidget(self.reminder_box,0,0,alignment=Qt.AlignmentFlag.AlignTop)
+            self.section_grid.addWidget(self.prep_box,0,1,alignment=Qt.AlignmentFlag.AlignTop)
+            self.section_grid.addWidget(self.rules_box,1,0,1,2)
+        else:
+            for index,section in enumerate(self.sections):self.section_grid.addWidget(section,index,0,1,2 if wide else 1)
+        self.widget().updateGeometry()
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event);self.reflow_sections()
+
+    def describe_new_kind(self,*_):
+        description=HABIT_CHOICES[self.new_kind.currentData()]['description']
+        self.new_kind_help.setText(description)
+        self.new_kind.setAccessibleDescription(description)
 
     def set_assistants_visible(self,visible):
         self._assistants_visible=bool(visible)
@@ -152,6 +252,7 @@ class HabitsPanel(QScrollArea):
     def show_reminders(self,value=True):
         self.reminder_toggle.setChecked(bool(value));self.reminder.setVisible(bool(value));self.reminder_toggle.setText('收起提醒时间' if value else '调整提醒时间')
         self.prep_box.setVisible(not value);self.rules_box.setVisible(not value)
+        self.reflow_sections()
 
     def refresh(self,*_):
         self.generation+=1;generation=self.generation
@@ -184,8 +285,8 @@ class HabitsPanel(QScrollArea):
             index=self.anchor.findData(chosen)
             if index>=0:self.anchor.setCurrentIndex(index)
         self.anchor.blockSignals(False);self.create_preparation.setEnabled(bool(self.anchor.currentData()));self.codex_preparation.setEnabled(True)
-        self.rule_summary.setText(f"已保存 {summary['guidance_rules']} 条安排偏好、{summary.get('validation_rules',0)} 条容量与保护设置、{summary['warning_rules']} 条提前提醒。")
-        self.preference_summary.setText('容量和保护时段在保存计划时校验；文字偏好供安排时参考，提前提醒在今天页显示。它们不会自行生成计划或准备待办。')
+        self.rule_summary.setText(f"当前适用：{summary['guidance_rules']} 条安排要求、{summary.get('validation_rules',0)} 条时长或时段限制、{summary['warning_rules']} 条日期提醒。")
+        self.preference_summary.setText('下面的设置用于参考、检查计划或显示提醒。计划由你发起；需要自动生成准备待办时，使用上方“课前与截止前准备”。')
         attention=sum(bool(r.get('scope_warning')) and r.get('effective',False) for r in value['rules']['items'])
         if attention:self.rule_summary.setText(self.rule_summary.text()+f' · 本页 {attention} 项范围待核对')
         selected=self.rules.currentItem().data(Qt.ItemDataRole.UserRole)['id'] if self.rules.currentItem() else None
@@ -201,7 +302,8 @@ class HabitsPanel(QScrollArea):
     def describe_rule(self):
         item=self.rules.currentItem()
         if not item:self.rule_info.clear();return
-        e=item.data(Qt.ItemDataRole.UserRole);text=e['effect']+('\n'+e['scope_warning'] if e.get('scope_warning') else '')+'\n点击“查看原文 / 修改”可查看完整要求，修改或停用。'
+        e=item.data(Qt.ItemDataRole.UserRole);choice=HABIT_CHOICES.get(e['data'].get('rule_kind'),{})
+        text=choice.get('title','安排设置')+'：'+choice.get('description',e['effect'])+('\n'+e['scope_warning'] if e.get('scope_warning') else '')+'\n点击“查看原文 / 修改”可查看完整要求，修改或停用。'
         self.rule_info.setText(text[:260]+('…' if len(text)>260 else ''));self.rule_info.setToolTip(text)
 
     def keep_dialog(self,dialog):
@@ -249,7 +351,7 @@ class HabitsPanel(QScrollArea):
         from .gui_workflows import SettingsDialog
         from PySide6.QtWidgets import QApplication
         owner=self.window()
-        if not hasattr(owner,'data_dir'):
+        if not getattr(owner,'data_dir',None):
             self.note.setText('请在软件设置的 Codex 协助页完成连接。');return None
         dialog=SettingsDialog(self.bridge,owner.capabilities,owner.data_dir,QApplication.activeModalWidget() or owner,self.changed)
         dialog.tabs.setCurrentIndex(dialog._provider_tab)

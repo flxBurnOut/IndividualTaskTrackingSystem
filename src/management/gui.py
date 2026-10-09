@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import datetime as dt
 from zoneinfo import ZoneInfo
-from PySide6.QtCore import QDate, Qt, QTimer, QThread
+from PySide6.QtCore import QDate, QSize, Qt, QTimer, QThread
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -25,6 +26,9 @@ from .branding import APP_NAME
 NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("tasks", "任务"), ("projects", "项目与课程"), ("reviews", "复盘")]
 from .appearance import normalize_appearance, assistants_visible
 from .gui_theme import apply_appearance, current_appearance, stylesheet, bind_theme
+from .gui_visual_profile import visual_style, set_visual_style
+from .gui_materials import AppCanvas, GlassPanel, NavigationButton, PageTransition
+from .gui_icons import symbol_icon
 
 # Kept as an import-compatible light default for embedders and tests.
 STYLESHEET = stylesheet()
@@ -41,9 +45,13 @@ def configure_palette(app):
 
 
 class SearchDialog(QDialog):
-    def __init__(self, bridge, parent, on_selected):
+    def __init__(self, bridge, parent, on_selected, *, initial_text=''):
         super().__init__(parent)
         self.bridge, self.on_selected, self.generation = bridge, on_selected, 0
+        self.offset, self.next_offset = 0, None
+        self.page_history = []
+        self.loading, self._closed = False, False
+        self._loaded_text = None
         self.visible_types = list(TREE_TYPES) + [key for key, definition in getattr(parent, "type_map", {}).items() if definition.get("module") not in (None, "builtin")]
         self.setWindowTitle("查找事项")
         self.resize(620, 500)
@@ -52,48 +60,122 @@ class SearchDialog(QDialog):
         layout.addWidget(plain_label("查找事项", "DialogHeading"))
         self.search = QLineEdit()
         self.search.setPlaceholderText("输入任务、项目或课程名称")
+        self.search.setClearButtonEnabled(True)
         layout.addWidget(self.search)
         self.results = QListWidget()
-        self.results.itemDoubleClicked.connect(self.choose)
+        self.results.itemActivated.connect(self.choose)
         layout.addWidget(self.results, 1)
         self.hint = plain_label("输入名称后开始查找。", "Quiet")
+        self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
+        actions = QHBoxLayout()
+        self.previous = make_button('上一页', self.previous_page)
+        self.next = make_button('下一页', lambda: self.set_page(self.next_offset))
+        self.open_button = make_button('打开所选事项', self.choose, True)
+        self.cancel_button = make_button('关闭', self.reject)
+        for button in (self.previous, self.next, self.open_button, self.cancel_button):
+            button.setAutoDefault(False)
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        self.results.currentItemChanged.connect(self.update_actions)
+        self.update_actions()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.load)
         self.search.textChanged.connect(self.search_changed)
-        self.search.returnPressed.connect(self.choose)
+        self.search.returnPressed.connect(self.search_or_open)
+        if initial_text:
+            self.search.setText(initial_text)
+            self.load()
 
     def search_changed(self, *_):
         self.generation += 1
+        self.offset, self.next_offset, self._loaded_text = 0, None, None
+        self.page_history.clear()
+        self.results.clear()
+        self.hint.setText('正在查找…' if self.search.text().strip() else '输入名称后开始查找。')
+        self.update_actions()
         self.timer.start()
 
+    def update_actions(self, *_):
+        available = not self.loading and not self._closed
+        self.previous.setEnabled(available and bool(self.page_history))
+        self.next.setEnabled(available and self.next_offset is not None)
+        self.open_button.setEnabled(available and self.results.currentItem() is not None)
+
+    def set_page(self, offset):
+        if offset is not None and not self.loading:
+            if offset > self.offset:
+                self.page_history.append(self.offset)
+            self.offset = offset
+            self.load()
+
+    def previous_page(self):
+        if self.page_history and not self.loading:
+            self.offset = self.page_history.pop()
+            self.load()
+
+    def search_or_open(self):
+        if self.timer.isActive() or self._loaded_text != self.search.text().strip():
+            self.load()
+        elif not self.loading:
+            self.choose()
+
     def load(self):
+        if self._closed:
+            return
+        self.timer.stop()
         self.generation += 1
         generation = self.generation
         text = self.search.text().strip()
+        self._loaded_text = None
+        self.results.clear()
+        self.next_offset = None
+        self.loading = bool(text)
+        self.update_actions()
         if not text:
-            self.results.clear()
             self.hint.setText("输入名称后开始查找。")
             return
+        self.hint.setText('正在查找…')
         def loaded(result):
-            if generation != self.generation:
+            if self._closed or generation != self.generation:
                 return
+            self.loading, self._loaded_text = False, text
+            self.next_offset = result.get('next_offset')
             self.results.clear()
             for entity in result.get("items", []):
                 item = QListWidgetItem(entity["title"])
                 item.setData(Qt.ItemDataRole.UserRole, entity)
                 self.results.addItem(item)
-            self.hint.setText(f"找到 {result.get('total', 0)} 项" + ("，请补充关键词缩小范围。" if result.get("next_offset") is not None else ""))
-        self.bridge.query("list", loaded, lambda e: self.hint.setText(e.get("message", str(e))), types=self.visible_types, search=text, limit=30)
+            if self.results.count():
+                self.results.setCurrentRow(0)
+                self.hint.setText(f"找到 {result.get('total', 0)} 项 · 当前第 {self.offset + 1}–{self.offset + self.results.count()} 项。选中后点击打开，或按 Enter。")
+            else:
+                self.hint.setText('没有找到匹配事项，请换一个关键词。')
+            self.update_actions()
+        def failed(error):
+            if self._closed or generation != self.generation:
+                return
+            self.loading = False
+            self.hint.setText(error.get('message', str(error)))
+            self.update_actions()
+        self.bridge.query("list", loaded, failed, types=self.visible_types, search=text, limit=30, offset=self.offset)
 
     def choose(self, *_):
+        if self._closed or self.loading or self._loaded_text != self.search.text().strip():
+            return
         item = self.results.currentItem()
         if item:
             entity = item.data(Qt.ItemDataRole.UserRole)
             self.accept()
             self.on_selected(entity)
+
+    def done(self, result):
+        self._closed = True
+        self.generation += 1
+        self.timer.stop()
+        super().done(result)
 
 
 class MainWindow(QMainWindow):
@@ -120,7 +202,9 @@ class MainWindow(QMainWindow):
         self._calendar_day, self._clock_minute = clock_snapshot()
         self.review_attention = False
         self.dialogs = set()
+        self.search_dialog = None
         self._display_generation = 0
+        self._onboarding_display_loaded = False
         self._display_epoch = self._display_revision = None
         self._saved_appearance = normalize_appearance()
         self._sidebar_pending = False
@@ -150,14 +234,15 @@ class MainWindow(QMainWindow):
         self.poll.start()
 
     def _build(self):
-        central = QWidget()
-        outer = QHBoxLayout(central)
+        central = AppCanvas()
+        central.setObjectName('AppCanvas')
+        outer = self.shell_layout = QHBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        sidebar = self.navigation_sidebar = QFrame()
+        sidebar = self.navigation_sidebar = GlassPanel(role='sidebar')
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(182)
-        side = QVBoxLayout(sidebar)
+        side = self.sidebar_layout = QVBoxLayout(sidebar)
         side.setContentsMargins(15, 25, 15, 19)
         side.setSpacing(8)
         side.addWidget(plain_label("个人事务", "Brand"))
@@ -166,7 +251,8 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for key, label in NAVIGATION:
-            widget = make_button(label, lambda _, k=key: self.navigate(k))
+            widget = NavigationButton(label)
+            widget.clicked.connect(lambda _, k=key: self.navigate(k))
             widget.setObjectName("Nav")
             widget.setCheckable(True)
             self.nav_group.addButton(widget)
@@ -179,6 +265,12 @@ class MainWindow(QMainWindow):
         self.create_menu = QMenu(self.new_button)
         self.new_button.setMenu(self.create_menu)
         side.addWidget(self.new_button)
+        self.habits_button = make_button('日常习惯', self.open_habits)
+        self.habits_button.setToolTip('设置安排习惯、计划时长、留空时段与日期提醒')
+        side.addWidget(self.habits_button)
+        self.assistant_button = make_button('Codex 协助', lambda: self.open_settings(page='Codex 协助'))
+        self.assistant_button.setToolTip('查看助手设置与连接状态；打开此页不会启用助手')
+        side.addWidget(self.assistant_button)
         self.guide_button = MenuButton("使用指南")
         self.guide_button.setToolTip("重新查看功能介绍，或设置自动介绍")
         self.guide_menu = QMenu(self.guide_button)
@@ -192,10 +284,11 @@ class MainWindow(QMainWindow):
         side.addWidget(plain_label("本地保存 · 同一份记录", "SidebarHint"))
         outer.addWidget(sidebar)
         main = QWidget()
-        main_layout = QVBoxLayout(main)
+        main_layout = self.main_layout = QVBoxLayout(main)
         main_layout.setContentsMargins(31, 26, 30, 17)
         main_layout.setSpacing(20)
-        header = QHBoxLayout()
+        self.header_panel = GlassPanel(role='toolbar')
+        header = self.header_layout = QHBoxLayout(self.header_panel)
         heading = QVBoxLayout()
         heading.setSpacing(4)
         self.page_title = plain_label("总览", "PageTitle")
@@ -203,11 +296,20 @@ class MainWindow(QMainWindow):
         heading.addWidget(self.page_title)
         heading.addWidget(self.page_subtitle)
         header.addLayout(heading, 1)
-        self.search_button = make_button("搜索", self.search)
-        self.search_button.setObjectName("QuietButton")
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName('GlobalSearch')
+        self.search_input.setPlaceholderText('搜索事项，按 Enter · Ctrl+K')
+        self.search_input.setAccessibleName('搜索事项')
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMinimumWidth(190)
+        self.search_input.setMaximumWidth(320)
+        self.search_input.returnPressed.connect(self.search)
+        self.search_symbol = self.search_input.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition)
+        self.search_shortcut = QShortcut(QKeySequence('Ctrl+K'), self)
+        self.search_shortcut.activated.connect(self.focus_search)
         self.settings_button = make_button("设置", self.open_settings)
         self.settings_button.setObjectName("QuietButton")
-        header.addWidget(self.search_button)
+        header.addWidget(self.search_input)
         header.addWidget(self.settings_button)
         self.update_button = make_button('版本与更新', self.open_update)
         self.update_button.setObjectName('QuietButton')
@@ -215,7 +317,7 @@ class MainWindow(QMainWindow):
         self.jobs_button = make_button('助手处理记录', self.open_jobs)
         self.jobs_button.hide()
         header.addWidget(self.jobs_button)
-        main_layout.addLayout(header)
+        main_layout.addWidget(self.header_panel)
         self.notice = plain_label("", "Notice")
         self.notice.hide()
         main_layout.addWidget(self.notice)
@@ -231,7 +333,7 @@ class MainWindow(QMainWindow):
         self.codex_connection_panel.hide()
         main_layout.addWidget(self.codex_connection_panel)
         self.pages = QStackedWidget()
-        self.today_page = TodayPage(self.bridge, self, on_plan=self.plan_with_codex, on_manual=self.manual_plan, on_review=self.open_review, on_task=self.open_task, on_changed=self.saved, on_timetable=self.open_timetable, on_habits=lambda:self.open_settings(page='日常习惯'))
+        self.today_page = TodayPage(self.bridge, self, on_plan=self.plan_with_codex, on_manual=self.manual_plan, on_review=self.open_review, on_task=self.open_task, on_changed=self.saved, on_timetable=self.open_timetable, on_habits=self.open_habits)
         install_calendar(self.today_page.date)
         self.today_page.error.connect(self.show_error)
         self.today_page.review_attention.connect(self.review_attention_changed)
@@ -246,11 +348,14 @@ class MainWindow(QMainWindow):
         self.dashboard_page = DashboardPage(self.bridge, self, on_today=self.open_today, on_timetable=self.open_timetable, on_projects=self.open_project, on_task=self.open_task)
         self.dashboard_page.error.connect(self.show_error)
         self.dashboard_page.review_attention.connect(self.review_attention_changed)
+        for page in (self.dashboard_page, self.review_page):
+            page.chart_settings_requested.connect(lambda key: self.open_settings(page='显示', chart_key=key))
         self.pages.addWidget(self.dashboard_page)
         self.pages.addWidget(self.today_page)
         self.pages.addWidget(self.tasks_page)
         self.pages.addWidget(self.workspace_page)
         self.pages.addWidget(self.review_page)
+        self.page_transition = PageTransition(self.pages, self)
         main_layout.addWidget(self.pages, 1)
         outer.addWidget(main, 1)
         self.setCentralWidget(central)
@@ -262,11 +367,54 @@ class MainWindow(QMainWindow):
         self.nav_buttons["dashboard"].setChecked(True)
 
     def refresh_global_metrics(self):
+        modern = visual_style() == 'glass'
+        self.navigation_sidebar.setObjectName('GlassSidebar' if modern else 'Sidebar')
+        self.header_panel.setObjectName('GlassToolbar' if modern else '')
+        self.shell_layout.setContentsMargins(*(12, 12, 12, 0) if modern else (0, 0, 0, 0))
+        self.shell_layout.setSpacing(10 if modern else 0)
+        self.sidebar_layout.setContentsMargins(*(12, 20, 12, 16) if modern else (15, 25, 15, 19))
+        self.sidebar_layout.setSpacing(5 if modern else 8)
+        self.main_layout.setContentsMargins(*(12, 0, 2, 12) if modern else (31, 26, 30, 17))
+        self.main_layout.setSpacing(22 if modern else 20)
+        self.header_layout.setContentsMargins(*(18, 13, 18, 13) if modern else (0, 0, 0, 0))
+        self.navigation_sidebar.style().unpolish(self.navigation_sidebar)
+        self.navigation_sidebar.style().polish(self.navigation_sidebar)
+        self.header_panel.style().unpolish(self.header_panel)
+        self.header_panel.style().polish(self.header_panel)
         brand = self.navigation_sidebar.findChild(QLabel, 'Brand')
-        widths = [max(182, round(182 * current_appearance()['font_size'] / 13)), *(button.fontMetrics().horizontalAdvance(button.text()) + 60 for button in self.nav_buttons.values())]
+        base_width = 204 if modern else 182
+        widths = [max(base_width, round(base_width * current_appearance()['font_size'] / 13)), *(button.fontMetrics().horizontalAdvance(button.text()) + (78 if modern else 60) for button in self.nav_buttons.values())]
         if brand is not None:
             widths.append(brand.fontMetrics().horizontalAdvance(brand.text()) + 46)
         self.navigation_sidebar.setFixedWidth(max(widths))
+        self.refresh_navigation_icons()
+
+    def refresh_navigation_icons(self):
+        from .gui_theme import color
+        modern = visual_style() == 'glass'
+        size = max(18, round(19 * current_appearance()['font_size'] / 13))
+        for key, button in self.nav_buttons.items():
+            button.setIcon(symbol_icon(key, color('primary') if button.isChecked() else color('muted'), size) if modern else QIcon())
+            button.setIconSize(QSize(size, size))
+        for button, name in ((self.habits_button, 'habits'), (self.assistant_button, 'assistant'),
+                             (self.guide_button, 'help'), (self.settings_button, 'settings'),
+                             (self.update_button, 'update')):
+            button.setIcon(symbol_icon(name, color('muted'), size) if modern else QIcon())
+            button.setIconSize(QSize(size, size))
+        self.new_button.setIcon(symbol_icon('plus', color('primary_text'), size) if modern else QIcon())
+        self.new_button.setText('新建' if modern else '＋ 新建')
+        self.search_symbol.setVisible(modern)
+        self.search_symbol.setIcon(symbol_icon('search', color('muted'), 16) if modern else QIcon())
+
+    def apply_visual_style(self, selected):
+        """Change presentation in place; never rebuild editors or touch Core."""
+        set_visual_style(selected)
+        apply_appearance(QApplication.instance(), current_appearance())
+        for page in (self.today_page,self.review_page):
+            if hasattr(page,'apply_visual_style'):
+                page.apply_visual_style()
+        if self.onboarding.overlay is not None:
+            self.onboarding.overlay.update()
 
     def activity_changed(self, busy):
         self.activity_label.setText("处理中…" if busy else "")
@@ -302,6 +450,13 @@ class MainWindow(QMainWindow):
             self.refresh()
         self.bridge.query("capabilities", loaded, self.show_error)
 
+    def onboarding_ready(self):
+        # Initial structure and display preferences determine tutorial targets.
+        # Unrelated polls and later refreshes need not drain the entire bridge.
+        if not self.type_map or not self._onboarding_display_loaded or self.closed:
+            return False
+        return self.section != 'dashboard' or bool(self.dashboard_page.result)
+
     def _apply_display_preferences(self, settings, epoch=None, revision=None):
         if epoch == self._display_epoch and revision is not None and self._display_revision is not None and revision < self._display_revision:
             return
@@ -319,11 +474,13 @@ class MainWindow(QMainWindow):
         self._business_timezone = settings.get("timezone")
         self._saved_appearance = normalize_appearance(settings.get('appearance'))
         apply_appearance(QApplication.instance(), self._saved_appearance)
-        self.review_page.set_weekly_style(settings.get('charts', {}).get('weekly_style', 'columns'))
+        self.review_page.set_chart_preferences(settings.get('charts', {}))
+        self.dashboard_page.set_chart_preferences(settings.get('charts', {}))
         if not self._sidebar_pending:
             self._sidebar_desired = self._saved_appearance['workspace_sidebar_collapsed']
             if hasattr(self.workspace_page, 'set_sidebar_collapsed'):
                 self.workspace_page.set_sidebar_collapsed(self._sidebar_desired)
+        self._onboarding_display_loaded = True
 
     def load_display_preferences(self):
         self._display_generation += 1
@@ -362,6 +519,7 @@ class MainWindow(QMainWindow):
             return
         self.section = section
         self.nav_buttons[section].setChecked(True)
+        self.refresh_navigation_icons()
         self.pages.setCurrentWidget({'dashboard': self.dashboard_page, 'today': self.today_page, 'tasks': self.tasks_page, 'projects': self.workspace_page, 'reviews': self.review_page}[section])
         titles = {
             "dashboard": ("总览", "日期、本周安排与当前进展。"),
@@ -509,13 +667,26 @@ class MainWindow(QMainWindow):
             on_open_settings=lambda:self.open_settings(page='Codex 协助'))
         dialog.exec()
 
-    def open_settings(self, *_args, page=None, timetable_id=None):
+    def open_settings(self, *_args, page=None, timetable_id=None, chart_key=None):
+        if page in {'日常习惯', '复盘时间'}:
+            return self.open_habits(reminders=page == '复盘时间')
         dialog=SettingsDialog(self.bridge,self.capabilities,self.data_dir,self,self.load_capabilities)
-        if page=='复盘时间':page='日常习惯';dialog.habits.show_reminders()
         if timetable_id:dialog.timetable_settings.select_timetable(timetable_id)
         if page:
             for index in range(dialog.tabs.count()):
                 if dialog.tabs.tabText(index)==page:dialog.tabs.setCurrentIndex(index)
+        if chart_key:
+            dialog.focus_chart(chart_key)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def open_habits(self, *_args, reminders=False):
+        from .gui_workflows import HabitsDialog
+        dialog = HabitsDialog(self.bridge, self.capabilities, self, on_saved=lambda *_: self.load_capabilities())
+        if reminders:
+            dialog.habits.show_reminders()
         try:
             dialog.exec()
         finally:
@@ -568,15 +739,37 @@ class MainWindow(QMainWindow):
         elif command == 'exit':
             from .gui_shutdown import request_exit
             request_exit(self)
+        elif command in {'visual-classic', 'visual-glass'}:
+            self.apply_visual_style(command.removeprefix('visual-'))
+
+    def focus_search(self):
+        self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_input.selectAll()
 
     def search(self):
+        if self.search_dialog is not None and self.search_dialog.isVisible():
+            self.search_dialog.search.setText(self.search_input.text())
+            self.search_dialog.load()
+            self.search_dialog.raise_()
+            self.search_dialog.activateWindow()
+            return
         def selected(entity):
             if entity["type"] in {"task", "note", "milestone", "topic"}:
                 self.open_task(entity["id"])
             else:
                 self.navigate("projects")
                 self.workspace_page.open_object(entity)
-        SearchDialog(self.bridge, self, selected).exec()
+        dialog = SearchDialog(self.bridge, self, selected, initial_text=self.search_input.text())
+        self.search_dialog = dialog
+        self.dialogs.add(dialog)
+        def finished(_result):
+            self.search_input.setText(dialog.search.text())
+            self.dialogs.discard(dialog)
+            if self.search_dialog is dialog:
+                self.search_dialog = None
+            dialog.deleteLater()
+        dialog.finished.connect(finished)
+        dialog.open()
 
     def poll_changes(self):
         if self.closed or self.poll_pending or not self.type_map:
@@ -649,7 +842,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def run(data_dir, argv=None, *, show_update=False):
+def run(data_dir, argv=None, *, show_update=False, ui_style=None):
     from .branding import set_windows_identity, configure_application
     from .data_space import require_beta_dir
     data_dir = require_beta_dir(data_dir)
@@ -659,8 +852,11 @@ def run(data_dir, argv=None, *, show_update=False):
     from .gui_instance import WindowInstance, notify_window
     instance = WindowInstance(data_dir, app)
     if not instance.acquire():
-        if not notify_window(data_dir, 'update' if show_update else 'show'):
-            QMessageBox.information(None, APP_NAME, '已有 Beta 窗口正在启动或退出，请稍后重试。')
+        command = 'visual-' + ui_style if ui_style else 'update' if show_update else 'show'
+        if not notify_window(data_dir, command):
+            message = ('当前 Beta 窗口尚未响应界面切换。请先保存并关闭 Beta 主窗口，再运行此切换入口；无需退出后台。'
+                       if ui_style else '已有 Beta 窗口正在启动或退出，请稍后重试。')
+            QMessageBox.information(None, APP_NAME, message)
         return 0
     manager = install_gui_gc(app)
     app.setStyle("Fusion")

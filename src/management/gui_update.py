@@ -2,10 +2,13 @@
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
+from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QLabel, QPushButton,
+                              QScrollArea, QFrame, QWidget, QLayout)
 
 from . import __version__
 from .branding import APP_NAME
+from .gui_layout import ActionRow
+from .gui_settings_controls import SelectableText
 
 
 def version_summary(state):
@@ -34,14 +37,21 @@ class UpdateDialog(QDialog):
         self.setWindowTitle('Beta 版本与更新')
         self.resize(680, 470)
         layout = QVBoxLayout(self)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll.setMinimumSize(0, 0)
+        body = QWidget()
+        content = QVBoxLayout(body)
+        content.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.content_scroll.setWidget(body)
+        layout.addWidget(self.content_scroll, 1)
         self.versions = QLabel(f'{APP_NAME}\n软件版本：{__version__}\n正在核验 Beta 后台版本…')
         self.versions.setWordWrap(True)
         self.versions.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.versions)
-        self.location = QLabel('Beta 数据位置（更新后继续使用）\n' + str(Path(window.data_dir).resolve()))
-        self.location.setWordWrap(True)
-        self.location.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.location)
+        content.addWidget(self.versions)
+        self.location = SelectableText('Beta 数据位置（更新后继续使用）\n' + str(Path(window.data_dir).resolve()))
+        content.addWidget(self.location)
         steps = QLabel(
             '当前为 Beta 源码测试版，尚未提供独立 Beta 安装包。\n\n'
             '1. 保存并关闭 Beta 编辑窗口，等待 Beta 后台及关联的 Codex 任务完成。\n'
@@ -50,12 +60,13 @@ class UpdateDialog(QDialog):
             '4. 如已连接 Beta MCP，在关联任务空闲后刷新该连接，并通过接口调用核验版本。\n\n'
             'Beta 更新不使用正式版安装包。需要保留测试记录时，可先在“设置 → 数据与高级”创建备份。')
         steps.setWordWrap(True)
-        layout.addWidget(steps)
+        content.addWidget(steps)
+        content.addStretch()
         self.status = QLabel('')
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
-        buttons = QHBoxLayout()
+        buttons = ActionRow()
         self.prepare = QPushButton('退出 Beta 并准备更新')
         self.prepare.clicked.connect(self.prepare_update)
         self.refresh = QPushButton('重新核验版本')
@@ -64,7 +75,7 @@ class UpdateDialog(QDialog):
         self.cancel.clicked.connect(self.reject)
         for button in (self.prepare, self.refresh, self.cancel):
             buttons.addWidget(button)
-        layout.addLayout(buttons)
+        layout.addWidget(buttons)
         self.check_versions()
 
     def check_versions(self):

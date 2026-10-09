@@ -1,7 +1,7 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
-from PySide6.QtWidgets import QApplication,QFrame,QPushButton
+from PySide6.QtWidgets import QApplication,QFrame,QPushButton,QLabel
 from PySide6.QtCore import QCoreApplication,QEvent
 from management.core import Core
 from management.gui_task_list import TaskListPanel
@@ -57,6 +57,39 @@ def test_late_page_response_does_not_touch_destroyed_panel(app):
     query['callback']({'items':[],'counts':{'done':0},'next_offset':None})
 
 
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_long_task_titles_wrap_without_hiding_status_or_open_action(app, font_size):
+    from PySide6.QtWidgets import QLabel
+    from PySide6.QtTest import QTest
+    from management.gui_theme import apply_appearance, current_appearance
+    previous = current_appearance()
+    apply_appearance(app, {'theme': 'dark', 'font_size': font_size})
+    bridge = ControlledBridge(); opened = []
+    owner = {'id': 'owner', 'title': '【演示】较长的课程与项目信息需要完整显示'}
+    panel = TaskListPanel(bridge, owner, on_open=lambda item: opened.append(item['id']), on_edit=lambda *_: None)
+    item = {'id': 'long-task', 'version': 1, 'status': 'active',
+            'title': '【演示】根据提纲绘制展示卡片并逐项核对文字说明、日期以及尚未确认的内容',
+            'data': {'due_date': '2030-01-09'}}
+    try:
+        panel.show()
+        bridge.take('workspace_tasks')['callback']({'items': [item], 'counts': {'done': 0}, 'next_offset': None})
+        for width in (900, 390, 700):
+            panel.resize(width, 600); QTest.qWait(80)
+            assert panel.width() == width
+            labels = [label for label in panel.findChildren(QLabel) if label.isVisible() and label.text()]
+            assert any(label.text() == item['title'] for label in labels)
+            for label in labels:
+                if label.wordWrap():
+                    assert label.height() >= label.heightForWidth(label.width())
+                assert label.parentWidget().rect().contains(label.geometry())
+        button = next(button for button in panel.findChildren(QPushButton) if button.accessibleName() == '查看任务：' + item['title'])
+        button.click()
+        assert opened == [item['id']] and bridge.commands == []
+    finally:
+        panel.close(); panel.deleteLater(); app.processEvents()
+        apply_appearance(app, previous)
+
+
 def test_completed_recovery_does_not_remain_above_the_fold(app,tmp_path):
     from test_catchup_v5 import register,report
     from management.gui_recovery import RecoveryPanel
@@ -66,7 +99,10 @@ def test_completed_recovery_does_not_remain_above_the_fold(app,tmp_path):
     bridge=QueuedCoreBridge(core);panel=RecoveryPanel(bridge,course);panel.show()
     try:
         wait(app,lambda:bridge.pending==0)
-        titles=[b.text() for b in panel.findChildren(QPushButton)]
+        wait(app, lambda: any(label.text() == opened['title'] and label.isVisible()
+                              for label in panel.findChildren(QLabel)))
+        titles=[label.text() for label in panel.findChildren(QLabel) if label.isVisible()]
         assert opened['title'] in titles and completed['title'] not in titles
+        assert any(button.text() == '查看任务' and button.isVisible() for button in panel.findChildren(QPushButton))
         assert '已完成的 1 项' in panel.summary.text()
     finally:panel.close();panel.deleteLater();app.processEvents()

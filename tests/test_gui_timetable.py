@@ -33,6 +33,39 @@ def table(id='table-a', version=2):
             'data':{'semester_start':'2030-01-07','semester_end':'2030-04-14','timezone':'Asia/Shanghai','source_text':'合成手动信息'}}
 
 
+def test_exception_controls_wrap_at_large_font_without_hiding_text(app, cleanup):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QScrollArea
+    from management.gui_theme import apply_appearance, current_appearance
+
+    previous = current_appearance()
+    apply_appearance(app, {**previous, 'font_size': 20})
+    bridge = ControlledBridge()
+    dialog = TimetableRowDialog(bridge, table(), [])
+    cleanup.append(dialog)
+    try:
+        dialog.title.setText('尚未保存的课程时段')
+        dialog.exception_toggle.setChecked(True)
+        dialog.show()
+        for width in (920, 650, 920):
+            dialog.resize(width, 680)
+            QTest.qWait(60)
+            scroll = dialog.findChild(QScrollArea)
+            assert scroll.horizontalScrollBar().maximum() == 0
+            controls = (dialog.exception_date, dialog.cancelled, dialog.exception_start, dialog.exception_end)
+            for control in controls:
+                assert control.width() >= control.sizeHint().width()
+                assert control.parentWidget().rect().contains(control.geometry())
+            if width == 650:
+                assert len({control.y() for control in controls}) > 1
+            assert dialog.title.text() == '尚未保存的课程时段'
+        assert bridge.commands == []
+    finally:
+        dialog.dirty = False
+        dialog.close()
+        apply_appearance(app, previous)
+
+
 def event(id='event-a', start=540, end=630, **extra):
     return dict({'id':id,'type':'event','title':'Lecture','course_title':'合成数据库','version':3,'status':'active',
             'start_minute':start,'end_minute':end,'business_date':'2030-01-07',

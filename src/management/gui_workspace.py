@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from .gui_forms import label_type, label_status, DeleteTaskDialog, EntityPicker, EntityForm
 from .gui_calendar import install_calendar
 from .gui_theme import color, bind_theme
+from .gui_layout import ActionRow
 from .gui_sources import AddSourceDialog, RefileSourceDialog, SourceContentDialog, extraction_label, source_origin
 
 BASE_TYPES = ("task", "project", "course", "activity", "domain", "goal")
@@ -825,20 +826,22 @@ class WorkspacePage(QWidget):
         clear_layout(self.content_layout)
         names = self.tree.breadcrumb(entity["id"])
         self.content_layout.addWidget(plain_label(" / ".join(names[:-1]) or "项目与课程", "Eyebrow"))
-        header = QHBoxLayout()
+        header = QVBoxLayout()
         heading = QVBoxLayout()
         heading.addWidget(plain_label(entity["title"], "PageTitle"))
         heading.addWidget(plain_label(self.type_map.get(entity["type"], {}).get("label", label_type(entity["type"])), "Quiet"))
-        header.addLayout(heading, 1)
+        header.addLayout(heading)
+        header_actions = ActionRow()
+        header.addWidget(header_actions)
         edit_button = make_button("编辑", lambda: self.on_edit(entity))
         edit_button.setEnabled(not self.type_map.get(entity["type"], {}).get("read_only", False))
-        header.addWidget(edit_button)
+        header_actions.addWidget(edit_button)
         if entity['type'] in {'domain','project','course','activity','phase','task','goal'}:
             from .gui_library import open_library
             folder=make_button('打开文件夹')
             folder.clicked.connect(lambda _,b=folder,i=entity['id']:open_library(self.bridge,self,b,i,self.show_error))
-            header.addWidget(folder)
-        if entity["type"] == "event" and has_preparation_date(entity): header.addWidget(make_button(preparation_label(entity), lambda: self.open_recurring(entity)))
+            header_actions.addWidget(folder)
+        if entity["type"] == "event" and has_preparation_date(entity): header_actions.addWidget(make_button(preparation_label(entity), lambda: self.open_recurring(entity)))
         add = make_button("＋ 添加")
         menu = QMenu(add)
         kinds = ["task", "project", "activity", "goal", "note"]
@@ -863,7 +866,7 @@ class WorkspacePage(QWidget):
             menu.addSeparator()
             menu.addAction("添加资料或通知…", self.attach_file)
         add.setMenu(menu)
-        header.addWidget(add)
+        header_actions.addWidget(add)
         self.content_layout.addLayout(header)
         description = entity.get("data", {}).get("purpose") or entity.get("data", {}).get("notes") or entity.get("data", {}).get("description")
         if description:
@@ -998,7 +1001,7 @@ class WorkspacePage(QWidget):
         elif result.get("files_has_more"):
             self.content_layout.addWidget(plain_label("还有文件未显示，请稍后刷新以继续读取。", "Quiet"))
         self.content_layout.addSpacing(4)
-        footer = QHBoxLayout()
+        footer = ActionRow()
         if self.on_codex:
             if entity["type"] == "course":
                 footer.addWidget(self.assistant_action("请助手整理课程信息", lambda: self.on_codex(entity, organize=True)))
@@ -1007,7 +1010,7 @@ class WorkspacePage(QWidget):
         archive.setObjectName("QuietButton")
         footer.addStretch()
         footer.addWidget(archive)
-        self.content_layout.addLayout(footer)
+        self.content_layout.addWidget(footer)
         self.content_layout.addStretch()
 
     def content_pager(self, key, total, count, next_offset, label):

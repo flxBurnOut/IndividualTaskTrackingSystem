@@ -5,6 +5,8 @@
 !/AGENTS.md
 !/pyproject.toml
 !/启动个人事务管理Beta.vbs
+!/切换Beta旧界面.vbs
+!/切换Beta新界面.vbs
 !/src/
 !/tests/
 !/packaging/
@@ -79,6 +81,8 @@ auth.json
 runtime.json
 ui-onboarding.json
 .ui-onboarding-*.tmp
+ui-visual.json
+.ui-visual-*.tmp
 ui-plan-drafts/
 config.local.*
 settings.local.*

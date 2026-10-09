@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .gui_forms import EntityPicker
+from .gui_layout import ActionRow
 from .schemas import TYPES
 
 
@@ -78,13 +79,13 @@ class TaskBatchDialog(QDialog):
         self.paste = QTextEdit(); self.paste.setMaximumHeight(85)
         self.paste.setPlaceholderText('每行一项任务；也可粘贴表格五列：标题、完成标准、分钟、截止日期、安排日期。日期填 YYYY-MM-DD，未知可留空。')
         self.paste.textChanged.connect(self.input_changed); editor.addWidget(self.paste)
-        paste_actions = QHBoxLayout()
+        paste_actions = ActionRow()
         self.import_button = QPushButton('将文本加入下方表格'); self.import_button.clicked.connect(self.import_rows); paste_actions.addWidget(self.import_button)
         self.add_button = QPushButton('增加一行'); self.add_button.clicked.connect(self.add_row); paste_actions.addWidget(self.add_button)
         self.remove_button = QPushButton('删除选中行'); self.remove_button.clicked.connect(self.remove_rows); paste_actions.addWidget(self.remove_button)
         self.up_button = QPushButton('上移'); self.up_button.clicked.connect(lambda:self.move_row(-1)); paste_actions.addWidget(self.up_button)
         self.down_button = QPushButton('下移'); self.down_button.clicked.connect(lambda:self.move_row(1)); paste_actions.addWidget(self.down_button)
-        paste_actions.addStretch(); self.count = QLabel('0 / 50 项'); paste_actions.addWidget(self.count); editor.addLayout(paste_actions)
+        self.count = QLabel('0 / 50 项'); paste_actions.addWidget(self.count); editor.addWidget(paste_actions)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(['任务标题', '完成标准' + ('（必填）' if source else ''), '预计分钟', '截止日期', '安排日期'])
         for column in (2,3,4):self.table.horizontalHeaderItem(column).setToolTip('可留空；未知时不推定分钟或日期。日期格式 YYYY-MM-DD。')

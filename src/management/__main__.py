@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--resume-update', help=argparse.SUPPRESS)
     parser.add_argument('--tray', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--show-update', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--ui-style', choices=('classic', 'glass'), help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
     parser.add_argument('--mcp-discussion')
     parser.add_argument('--discussion-epoch')
@@ -99,6 +100,11 @@ def main():
             return 1
         QMessageBox.information(None, 'Beta 快捷方式已创建', f'桌面和开始菜单中都可以找到“{APP_NAME}”。\n\n打开的 Beta 数据空间：'+result['data_dir'])
         return 0
+    from .gui_visual_profile import configure_visual_profile
+    try:
+        configure_visual_profile(args.data_dir, args.ui_style)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
     from .installation_state import resume_after_update
     try:
         resume_after_update(args.data_dir)
@@ -108,7 +114,7 @@ def main():
         QMessageBox.warning(None, '更新尚未完成', str(error))
         return 1
     from .gui import run
-    return run(args.data_dir, show_update=args.show_update)
+    return run(args.data_dir, show_update=args.show_update, ui_style=args.ui_style)
 
 
 if __name__ == '__main__':

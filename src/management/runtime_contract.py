@@ -10,7 +10,7 @@ from .data_space import CHANNEL
 
 
 PROTOCOL_VERSION = 1
-CAPABILITIES = ('release_handshake', 'idle_update_shutdown')
+CAPABILITIES = ('release_handshake', 'idle_update_shutdown', 'appearance_accent')
 VERSION_HEADER = 'X-PersonalManagement-Version'
 PROTOCOL_HEADER = 'X-PersonalManagement-Protocol'
 ENTRANCE_HEADER = 'X-PersonalManagement-Entrance'
@@ -48,5 +48,7 @@ def service_mismatch_message(value):
     version = value.get('app_version') if isinstance(value, dict) else None
     advertised = version if isinstance(version, str) and len(version) <= 64 else '无法识别的旧版本'
     return (f'软件入口为 Beta {__version__}，后台为 {advertised}，通道、版本或接口能力尚未对齐；未执行本次操作。'
-            '请更新本 Beta 工作目录的源码，再从同一 Beta 数据空间打开软件；当前尚未提供独立 Beta 安装包。'
+            '请先保存并关闭 Beta 主窗口；若 Beta 后台还有任务，等待完成后，在 Beta 托盘选择“退出 Beta 软件与后台”。'
+            '确认 Beta 后台退出后，再从本 Beta 工作目录的“启动个人事务管理Beta.vbs”重新启动。'
+            '仅重新打开窗口不会替换仍在运行的旧后台；当前尚未提供独立 Beta 安装包。'
             '如果提示来自 Codex，请在任务空闲后重启其 MCP 连接，加载新版事务助手接口。')

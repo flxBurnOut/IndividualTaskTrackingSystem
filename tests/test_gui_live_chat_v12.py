@@ -11,7 +11,15 @@ from test_ux_workflows_v2 import ControlledBridge,ready_conversation
 THREAD='00000000-0000-4000-8000-000000000101'
 
 @pytest.fixture(scope='session')
-def app():return QApplication.instance() or QApplication([])
+def app():
+    from pathlib import Path
+    from PySide6.QtGui import QFontDatabase
+    application=QApplication.instance() or QApplication([])
+    if application.platformName()=='offscreen' and os.name=='nt':
+        for name in ('msyh.ttc','msyhbd.ttc'):
+            path=Path(os.environ.get('WINDIR','C:/Windows'))/'Fonts'/name
+            if path.is_file():QFontDatabase.addApplicationFont(str(path))
+    return application
 
 @pytest.fixture
 def chat(app):
@@ -157,6 +165,41 @@ def test_polling_preserves_scrolled_history_and_selection(chat,app):
         deliver_poll(dialog,bridge,snapshot(messages=history,preview='Partial '+('result '*seq),phase='receiving',sequence=seq));app.processEvents();app.processEvents()
     assert dialog.cards['4'] is selected and selected.body.textCursor().selectedText()==text
     assert abs(bar.value()-300)<3
+
+
+@pytest.mark.parametrize('theme,font_size',[('light',13),('dark',20)])
+def test_discussion_long_context_and_attachment_text_fit_after_font_change(chat,app,theme,font_size):
+    from pathlib import Path
+    from PySide6.QtWidgets import QLabel,QPushButton
+    from management.gui_theme import apply_appearance,current_appearance
+    from management.gui_visual_profile import set_visual_style,visual_style
+    dialog,bridge=chat;previous=current_appearance();profile=visual_style();failures=[]
+    try:
+        set_visual_style('glass');apply_appearance(app,{'theme':theme,'font_size':font_size})
+        dialog.scope_label.setText('【演示】社区阅读角与信息展示原型：整理所有资料，并检查长中文标题和说明是否显示完整。'*2)
+        dialog.selected_ids=['source-'+str(i) for i in range(4)]
+        dialog.source_meta={key:{'title':'【演示】课程原文和阶段项目说明资料，供本次讨论参考'+str(i)} for i,key in enumerate(dialog.selected_ids)}
+        dialog.refresh_chips()
+        dialog.messages={'long':message('long','【演示】说明和反馈保持完整，确认实际情况后再保存。'*45,'assistant',1,None)}
+        dialog.render_history()
+        draft=dialog.prompt.toPlainText()
+        for width in (840,620):
+            dialog.resize(width,720)
+            for _ in range(5):app.processEvents()
+            for label in dialog.findChildren(QLabel):
+                if label.isVisibleTo(dialog) and label.text().strip():
+                    needed=label.heightForWidth(label.width()) if label.wordWrap() else label.sizeHint().height()
+                    if label.height()+1<needed:failures.append((width,label.text(),label.height(),needed))
+            assert dialog.chip_scroll.verticalScrollBar().maximum()==0
+            for chip in dialog.chips.findChildren(QPushButton):
+                assert chip.height()>=chip.minimumSizeHint().height()
+                assert chip.height()<=dialog.chip_scroll.viewport().height()
+            assert dialog.prompt.toPlainText()==draft and not bridge.commands
+            report=os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR')
+            if report:assert dialog.grab().save(str(Path(report)/f'text-discussion-{theme}-{width}.png'))
+        assert not failures,failures
+    finally:
+        set_visual_style(profile);apply_appearance(app,previous);app.processEvents()
 
 
 def test_lower_progress_sequence_cannot_roll_back_preview(chat):

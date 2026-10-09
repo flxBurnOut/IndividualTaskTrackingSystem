@@ -29,6 +29,45 @@ def snapshot(core):
     return core.query('state'), core.query('list', limit=100)
 
 
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_task_actions_wrap_and_long_completion_text_stays_visible(app, monkeypatch, font_size):
+    from PySide6.QtWidgets import QPushButton, QStyle, QStyleOptionButton
+    from management.gui_theme import apply_appearance, current_appearance
+    from management.gui_visual_profile import set_visual_style, visual_style
+    previous, profile = current_appearance(), visual_style()
+    set_visual_style('glass'); apply_appearance(app, {**previous, 'font_size': font_size})
+    bridge = ControlledBridge(); page = TasksPage(bridge)
+    page.resize(1300, 850); page.show(); app.processEvents()
+    page.quick_input.setText('保留尚未保存的新任务')
+    owner_title = '【演示】设计研究课程与综合实践项目，保留完整课程名称。' * 5
+    class SelectedOwner:
+        def __init__(self, *args, **kwargs):
+            self.selected = {'id': 'owner-long', 'title': owner_title}
+        def exec(self): return True
+        def deleteLater(self): pass
+    monkeypatch.setattr('management.gui_tasks.EntityPicker', SelectedOwner)
+    try:
+        page.choose_owner()
+        bridge.deliver('task_pool', {'group': 'open', 'items': [], 'total': 0, 'date': '2030-01-02', 'next_offset': None})
+        assert owner_title in page.status.text() and page.owner_button.toolTip() == owner_title
+        for width in (1300, 660, 1300):
+            page.resize(width, 850)
+            page.completion.setText('完成标准：' + '逐条核对原始要求，保留检验结论与尚未确认的内容。' * 8)
+            wait(app, lambda: page.completion.height() >= page.completion.heightForWidth(page.completion.width()) - 1)
+            assert page.status.height() >= page.status.heightForWidth(page.status.width()) - 1
+            assert page.width() <= width, 'button row must not force the page beyond the available width'
+            for button in page.findChildren(QPushButton):
+                if not button.isVisible(): continue
+                option = QStyleOptionButton(); button.initStyleOption(option)
+                content = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, button)
+                text = button.fontMetrics().boundingRect(button.text())
+                assert content.width() >= text.width() and content.height() >= text.height(), (button.text(), content, text)
+                assert button.parentWidget().rect().contains(button.geometry())
+            assert page.quick_input.text() == '保留尚未保存的新任务' and bridge.commands == []
+    finally:
+        dispose(app, page); set_visual_style(profile); apply_appearance(app, previous)
+
+
 def test_undated_unowned_tasks_are_discoverable_across_pages_without_writes(tmp_path):
     core = Core(tmp_path)
     expected = {create(core, f'Unscheduled practice {index:02}')['id'] for index in range(37)}
@@ -79,7 +118,8 @@ def test_group_names_and_keys_query_the_expected_service_group(app, tmp_path):
 
 
 def test_quick_capture_continues_after_each_saved_task_without_dates(app, tmp_path):
-    core = Core(tmp_path); bridge = QueuedCoreBridge(core); page = TasksPage(bridge)
+    core = Core(tmp_path); bridge = QueuedCoreBridge(core); opened = []
+    page = TasksPage(bridge, on_task=opened.append)
     try:
         for title in ('First thought', 'Second thought'):
             page.quick_input.setText(title)
@@ -88,9 +128,13 @@ def test_quick_capture_continues_after_each_saved_task_without_dates(app, tmp_pa
             wait(app, lambda: bridge.pending == 0)
             assert page.quick_input.text() == ''
             assert not page.quick_pending and page.quick_button.isEnabled() and not page.quick_input.isReadOnly()
+            assert not page.quick_open_button.isHidden()
+            page.quick_open_button.click()
+            assert core.query('get', id=opened[-1])['entity']['title'] == title
         records = core.query('list', type='task')['items']
         assert {item['title'] for item in records} == {'First thought', 'Second thought'}
         assert len(bridge.commands) == 2
+        assert len(opened) == 2 and opened[0] != opened[1]
         assert all(not item['parent_id'] and not item['data'].get('due_date') and not item['data'].get('scheduled_date') for item in records)
         assert core.query('list', type='plan')['total'] == 0
     finally:
@@ -98,7 +142,7 @@ def test_quick_capture_continues_after_each_saved_task_without_dates(app, tmp_pa
 
 
 def test_quick_capture_late_success_does_not_clear_newer_input(app):
-    bridge = ControlledBridge(); page = TasksPage(bridge)
+    bridge = ControlledBridge(); opened = []; page = TasksPage(bridge, on_task=opened.append)
     try:
         page.quick_input.setText('First task'); page.save_quick(); page.save_quick()
         assert len(bridge.commands) == 1 and page.quick_pending
@@ -107,9 +151,47 @@ def test_quick_capture_late_success_does_not_clear_newer_input(app):
         bridge.commands[0]['callback']({'result': {'entity': {'id': 'first'}}, 'revision': 11})
         assert page.quick_input.text() == 'Next task already entered'
         assert not page.quick_pending and page.quick_button.isEnabled()
+        page.quick_open_button.click()
+        assert opened == ['first'] and page.quick_input.text() == 'Next task already entered'
         page.save_quick()
         assert bridge.commands[-1]['payload']['title'] == 'Next task already entered'
+        bridge.commands[-1]['error']({'code': 'conflict', 'message': 'Synthetic retry needed'})
+        assert '上次成功记录' in page.quick_open_button.text()
+        page.quick_open_button.click()
+        assert opened == ['first', 'first'] and page.quick_input.text() == 'Next task already entered'
     finally: dispose(app, page)
+
+
+@pytest.mark.parametrize('filter_kind', ['done', 'owner', 'search'])
+def test_quick_capture_can_open_saved_record_hidden_by_unchanged_filters(app, tmp_path, filter_kind):
+    core = Core(tmp_path); bridge = QueuedCoreBridge(core); opened = []
+    page = TasksPage(bridge, on_task=opened.append)
+    try:
+        if filter_kind == 'done':
+            page.group_picker.setCurrentIndex(page.group_picker.findData('done'))
+        elif filter_kind == 'owner':
+            page.owner = cmd(core, 'create', {'type': 'project', 'title': 'Synthetic filter owner'})['result']['entity']
+            page.owner_button.setText(page.owner['title'])
+        else:
+            page.search_input.setText('Only match another task')
+        page.filter_changed()
+        wait(app, lambda: bridge.pending == 0)
+        filters = (page.group_picker.currentData(), page.owner, page.search_input.text(), page.offset)
+        page.quick_input.setText('Captured outside the active filter')
+        page.save_quick()
+        wait(app, lambda: bridge.pending == 0)
+        assert page.items.topLevelItemCount() == 0
+        assert '当前筛选' in page.quick_note.text() and not page.quick_open_button.isHidden()
+        saved = core.query('get', id=page.last_quick_task_id)['entity']
+        assert saved['title'] == 'Captured outside the active filter' and saved['parent_id'] is None
+        page.quick_input.setText('Keep this unsaved next thought')
+        page.quick_open_button.click()
+        assert opened == [saved['id']]
+        assert page.quick_input.text() == 'Keep this unsaved next thought'
+        assert (page.group_picker.currentData(), page.owner, page.search_input.text(), page.offset) == filters
+        assert len(bridge.commands) == 1
+    finally:
+        wait(app, lambda: bridge.pending == 0); dispose(app, page)
 
 
 def test_quick_capture_failure_keeps_input_and_allows_explicit_retry(app):

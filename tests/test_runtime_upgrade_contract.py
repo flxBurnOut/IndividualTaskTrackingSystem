@@ -74,6 +74,7 @@ def raw(live, path, payload=None, *, headers=None, token=None):
     {**service_contract(), 'protocol_version': 99},
     {**service_contract(), 'protocol_version': True},
     {**service_contract(), 'capabilities': []},
+    {**service_contract(), 'capabilities': ['release_handshake','idle_update_shutdown']},
 ])
 @pytest.mark.parametrize('autostart', [True, False])
 def test_skewed_or_legacy_live_service_is_rejected_without_bootstrap(live, contract, autostart):
@@ -84,6 +85,10 @@ def test_skewed_or_legacy_live_service_is_rejected_without_bootstrap(live, contr
         client.__init__(live.core.root, autostart=autostart)
     assert error.value.code == 'service_version_mismatch'
     assert '未执行' in error.value.message and 'MCP' in error.value.message
+    assert '先保存并关闭 Beta 主窗口' in error.value.message
+    assert '等待完成后，在 Beta 托盘选择“退出 Beta 软件与后台”' in error.value.message
+    assert '确认 Beta 后台退出后' in error.value.message and '启动个人事务管理Beta.vbs' in error.value.message
+    assert '仅重新打开窗口不会替换仍在运行的旧后台' in error.value.message
     assert client.runtime is None and client.epoch is None and client.revision is None
     assert live.paths == ['/v1/query/state'] and not live.starts
     assert live.core.query('state') == before

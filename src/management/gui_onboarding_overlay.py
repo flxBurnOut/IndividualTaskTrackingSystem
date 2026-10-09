@@ -44,6 +44,8 @@ class TutorialOverlay(QWidget):
         self._focus_guard = False
         self._last_layout = None
         self._geometry_pending = False
+        self._reveal_pending = False
+        self._last_target = None
         self._scroll_positions = {}
         self.setObjectName('TutorialOverlay')
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
@@ -140,6 +142,7 @@ class TutorialOverlay(QWidget):
         self._last_layout = None
         if self._active:
             self._refresh_geometry()
+            self._schedule_geometry(reveal=True)
 
     def start(self):
         if self._active:
@@ -241,7 +244,7 @@ class TutorialOverlay(QWidget):
                 content = ancestor.widget()
                 fits = target.width() <= viewport.width() and target.height() <= viewport.height()
                 belongs = content is not None and (content is target or content.isAncestorOf(target))
-                visible = QRect(target.mapTo(viewport, QPoint()), target.size())
+                visible = QRect(viewport.mapFromGlobal(target.mapToGlobal(QPoint())), target.size())
                 if fits and belongs and not viewport.rect().contains(visible):
                     bars = (ancestor.horizontalScrollBar(), ancestor.verticalScrollBar())
                     before = [(bar, bar.value()) for bar in bars]
@@ -262,10 +265,14 @@ class TutorialOverlay(QWidget):
         if target is None:
             return QRect()
         try:
-            rect = QRect(target.mapTo(self, QPoint()), target.size())
+            # The overlay is a sibling, not an ancestor of the target. Mapping
+            # directly to that sibling can traverse an owned native dialog's
+            # QObject parent and add its owner's window offset. Screen-space
+            # mapping respects native window boundaries and Qt's DPI handling.
+            rect = QRect(self.mapFromGlobal(target.mapToGlobal(QPoint())), target.size())
             ancestor = target.parentWidget()
             while ancestor is not None and ancestor is not self.host:
-                clip = QRect(ancestor.mapTo(self, QPoint()), ancestor.size())
+                clip = QRect(self.mapFromGlobal(ancestor.mapToGlobal(QPoint())), ancestor.size())
                 rect = rect.intersected(clip)
                 ancestor = ancestor.parentWidget()
             rect = rect.intersected(self.rect())
@@ -281,6 +288,11 @@ class TutorialOverlay(QWidget):
             return
         if self.geometry() != self.host.rect():
             self.setGeometry(self.host.rect())
+        widget = self._resolve_target()
+        previous = self._last_target() if self._last_target is not None else None
+        if widget is not previous:
+            self._last_target = weakref.ref(widget) if widget is not None else None
+            self._reveal_target()
         target = self._resolve_target_rect()
         signature = (self.size().width(), self.size().height(), target.getRect(), self.current_index)
         if signature == self._last_layout:
@@ -288,16 +300,66 @@ class TutorialOverlay(QWidget):
         self._last_layout = signature
         self.spotlight_rect = target
         self._layout_card(target)
+        if self._avoid_covering_target(target):
+            target = self._resolve_target_rect()
+            self.spotlight_rect = target
+            self._layout_card(target)
         self.raise_()
         self.update()
 
-    def _schedule_geometry(self):
+    def _avoid_covering_target(self, target_rect):
+        """Use available scroll space when a large caption would hide its control."""
+        if target_rect.isEmpty() or not self.card.geometry().intersects(target_rect):
+            return False
+        target = self._resolve_target()
+        if target is None:
+            return False
+        def overlap(rect):
+            covered = QRect(self._card_position(rect), self.card.size()).intersected(rect)
+            return 0 if covered.isEmpty() else covered.width() * covered.height()
+        best_score = overlap(target_rect)
+        best = None
+        ancestor = target.parentWidget()
+        while ancestor is not None and ancestor is not self.host:
+            if isinstance(ancestor, QScrollArea):
+                viewport = ancestor.viewport()
+                content = ancestor.widget()
+                if (content is not None and (content is target or content.isAncestorOf(target))
+                        and target.height() <= viewport.height()):
+                    bar = ancestor.verticalScrollBar()
+                    viewport_rect = QRect(self.mapFromGlobal(viewport.mapToGlobal(QPoint())), viewport.size())
+                    current = bar.value()
+                    # Move the highlighted control toward either edge, then put
+                    # the caption in the freed area. Compare before scrolling.
+                    for shift in (viewport_rect.top() + 12 - target_rect.top(),
+                                  viewport_rect.bottom() - 12 - target_rect.bottom()):
+                        value = max(bar.minimum(), min(bar.maximum(), current - shift))
+                        predicted = target_rect.translated(0, current - value)
+                        if not viewport_rect.adjusted(-5, -5, 5, 5).contains(predicted):
+                            continue
+                        score = overlap(predicted)
+                        if score < best_score:
+                            best_score, best = score, (bar, value)
+            ancestor = ancestor.parentWidget()
+        if best is None:
+            return False
+        bar, value = best
+        if bar not in self._scroll_positions:
+            self._scroll_positions[bar] = bar.value()
+        bar.setValue(value)
+        return True
+
+    def _schedule_geometry(self, *, reveal=False):
+        self._reveal_pending = self._reveal_pending or reveal
         if not self._geometry_pending:
             self._geometry_pending = True
             QTimer.singleShot(0, self._after_layout)
 
     def _after_layout(self):
         self._geometry_pending = False
+        reveal, self._reveal_pending = self._reveal_pending, False
+        if self._active and reveal:
+            self._reveal_target()
         self._refresh_geometry()
 
     def _place_buttons(self, columns):
@@ -310,12 +372,14 @@ class TutorialOverlay(QWidget):
         for i, button in enumerate(buttons):
             self.buttons.addWidget(button, i // columns, i % columns)
 
-    def _layout_card(self, target):
+    def _layout_card(self, target, *, available_width=None):
         bounds = self.rect().adjusted(16, 16, -16, -16)
         if bounds.width() < 1 or bounds.height() < 1:
             return
         scale = current_appearance()['font_size'] / 13
         width = min(round(450 * max(1, scale * .9)), bounds.width())
+        if available_width is not None:
+            width = min(width, available_width)
         inner_width = max(1, width - 48)
         self.card.ensurePolished()
         for widget in (self.counter_label, self.title_label, self.body_label,
@@ -340,6 +404,19 @@ class TutorialOverlay(QWidget):
         self.card.setFixedHeight(height)
         self.card.layout().activate()
 
+        self.card.move(self._card_position(target))
+        if available_width is None and not target.isEmpty() and self.card.geometry().intersects(target):
+            # A caption need not span most of a dialog just because the font is
+            # larger. Reflow it into a usable side column before scrolling the
+            # underlying page; the body remains scrollable if needed.
+            side_width = max(bounds.right() - target.right() - 18 + 1,
+                             target.left() - bounds.left() - 18)
+            if 320 <= side_width < width:
+                self._layout_card(target, available_width=side_width)
+
+    def _card_position(self, target):
+        bounds = self.rect().adjusted(16, 16, -16, -16)
+        width, height = self.card.width(), self.card.height()
         if target.isEmpty():
             position = QPoint(bounds.center().x() - width // 2, bounds.center().y() - height // 2)
         else:
@@ -356,7 +433,7 @@ class TutorialOverlay(QWidget):
                 overlap = box.intersected(target)
                 return overlap.width() * overlap.height() if not overlap.isEmpty() else 0
             position = min((bounded(point) for point in candidates), key=score)
-        self.card.move(position)
+        return position
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -417,6 +494,8 @@ class TutorialOverlay(QWidget):
             if kind == QEvent.Type.Resize:
                 self._last_layout = None
                 self._refresh_geometry()
+                # Child layouts and scroll ranges settle after this event.
+                self._schedule_geometry(reveal=True)
         if not self._belongs_to_host(watched):
             return False
         own = self._belongs_to_overlay(watched)
@@ -424,7 +503,10 @@ class TutorialOverlay(QWidget):
                                 QEvent.Type.Hide, QEvent.Type.LayoutRequest, QEvent.Type.ParentChange):
             # Follow real layout/scroll changes on the next event cycle. The
             # timer remains a fallback for callable targets that change identity.
-            self._schedule_geometry()
+            # Reveal after an actual control reflow, not after an ordinary
+            # scrollbar move. That keeps intentional scroll changes intact.
+            reveal = kind in (QEvent.Type.Move, QEvent.Type.Resize) and watched is self._resolve_target()
+            self._schedule_geometry(reveal=reveal)
         if kind == QEvent.Type.ShortcutOverride:
             event.accept()
             return True

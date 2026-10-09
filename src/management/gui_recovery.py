@@ -4,6 +4,7 @@ from PySide6.QtCore import QDate,Qt
 from PySide6.QtWidgets import (QWidget,QDialog,QFrame,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QPushButton,QLineEdit,QTextEdit,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QDateEdit,QDialogButtonBox,QProgressBar,QMessageBox)
 from .gui_forms import FormDialog,EntityPicker
 from .gui_calendar import install_calendar
+from .gui_layout import ActionRow
 
 
 def label(text,name='Quiet'):
@@ -200,7 +201,11 @@ class RecoveryPanel(QFrame):
             if hidden:message+=' 已完成的 '+str(hidden)+' 项保留在所属事项的已完成记录中。'
             self.summary.setText(message)
             for task in result.get('items',[]):
-                p=task.get('progress',{});row=QFrame();row.setObjectName('TaskRow');v=QVBoxLayout(row);top=QHBoxLayout();top.addWidget(button(task.get('display_title') or task['title'],lambda _,e=task:self.open_task(e)),1);top.addWidget(button('修改范围',lambda _,e=task:self.edit(e)));v.addLayout(top)
+                p=task.get('progress',{});row=QFrame();row.setObjectName('TaskRow');v=QVBoxLayout(row)
+                # A task name is document content: allow the full name to wrap
+                # independently of the controls instead of squeezing a button.
+                v.addWidget(label(task.get('display_title') or task['title'],'SectionHeading'))
+                top=ActionRow();top.addWidget(button('查看任务',lambda _,e=task:self.open_task(e)));top.addWidget(button('修改范围',lambda _,e=task:self.edit(e)));v.addWidget(top)
                 if task.get('owner_label'):v.addWidget(label(task['owner_label'],'StatusPill'))
                 if task.get('learning_unit_missing'):v.addWidget(label('课次编号待补充；尚无明确资料，未按日期或教学周推测。'))
                 state='已明确完成' if p.get('completion_confirmed') else '原完成记录与当前数量需核对' if p.get('completion')=='done' else '整体尚未明确完成'
@@ -209,6 +214,6 @@ class RecoveryPanel(QFrame):
                 if p.get('ratio') is not None:
                     bar=QProgressBar();bar.setRange(0,100);bar.setValue(round(max(0,min(1,p['ratio']))*100));bar.setTextVisible(True);bar.setFormat('%p%（数量进度）');v.addWidget(bar)
                 else:v.addWidget(label('数量尚未明确，不显示推测的完成百分比。'))
-                actions=QHBoxLayout();actions.addWidget(button('更新进度',lambda _,e=task:self.record(e)));actions.addWidget(button('加入某天计划',lambda _,e=task:self.open_task(e)));actions.addStretch();v.addLayout(actions);self.rows_layout.addWidget(row)
+                actions=ActionRow();actions.addWidget(button('更新进度',lambda _,e=task:self.record(e)));actions.addWidget(button('加入某天计划',lambda _,e=task:self.open_task(e)));v.addWidget(actions);self.rows_layout.addWidget(row)
             self.next_offset=result.get('next_offset');self.previous.setVisible(self.offset>0);self.next.setVisible(self.next_offset is not None)
         self.bridge.query('recovery_summary',got,lambda e:self.summary.setText(e.get('message',str(e))),course_id=self.course['id'],limit=10,offset=self.offset,open_only=True)

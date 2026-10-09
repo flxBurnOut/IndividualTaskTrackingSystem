@@ -3,6 +3,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox, QTreeWidget, QTreeWidgetItem, QLabel
 from .gui_workspace import make_button, plain_label
 from .gui_forms import EntityPicker, label_status
+from .gui_layout import ActionRow
 
 
 GROUPS = [('open', '待办任务'), ('undated', '未填日期'), ('due', '到期与逾期'),
@@ -20,6 +21,7 @@ class TasksPage(QWidget):
         self.page_history = []
         self.owner, self.result, self.dead = None, None, False
         self.quick_pending = self.plan_pending = False
+        self.last_quick_task_id = None
         self.dialogs = []
         self.destroyed.connect(lambda *_: setattr(self, 'dead', True))
         layout = QVBoxLayout(self)
@@ -36,7 +38,13 @@ class TasksPage(QWidget):
         quick.addWidget(self.batch_button)
         layout.addLayout(quick)
         self.quick_note = plain_label('按 Enter 保存后可继续录入。记录任务不会自动安排日期。', 'Quiet')
-        layout.addWidget(self.quick_note)
+        self.quick_note.setWordWrap(True)
+        captured = QHBoxLayout()
+        captured.addWidget(self.quick_note, 1)
+        self.quick_open_button = make_button('查看刚记录任务', self.open_recent_quick)
+        self.quick_open_button.hide()
+        captured.addWidget(self.quick_open_button)
+        layout.addLayout(captured)
         filters = QHBoxLayout()
         self.group_picker = QComboBox()
         for value, label in GROUPS:
@@ -44,7 +52,7 @@ class TasksPage(QWidget):
         self.group_picker.currentIndexChanged.connect(self.filter_changed)
         filters.addWidget(self.group_picker)
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText('搜索全部任务标题')
+        self.search_input.setPlaceholderText('按标题搜索当前筛选')
         self.search_input.setClearButtonEnabled(True)
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -71,7 +79,7 @@ class TasksPage(QWidget):
         self.completion = plain_label('选中任务可查看完成标准，或打开详情设置前后依赖。', 'Quiet')
         self.completion.setWordWrap(True)
         layout.addWidget(self.completion)
-        actions = QHBoxLayout()
+        actions = ActionRow()
         self.open_button = make_button('任务详情', self.open_selected)
         self.edit_button = make_button('编辑任务', self.edit_selected)
         self.plan_button = make_button('加入今天', self.plan_today)
@@ -84,7 +92,7 @@ class TasksPage(QWidget):
         self.next = make_button('下一页', lambda: self.set_page((self.result or {}).get('next_offset')))
         actions.addWidget(self.previous)
         actions.addWidget(self.next)
-        layout.addLayout(actions)
+        layout.addWidget(actions)
         self.selection_changed()
 
     def selected(self):
@@ -101,7 +109,8 @@ class TasksPage(QWidget):
         picker = EntityPicker(self.bridge, self, allowed_types=['project', 'course', 'activity', 'domain', 'goal'])
         if picker.exec() and picker.selected:
             self.owner = picker.selected
-            self.owner_button.setText(self.owner['title'])
+            self.owner_button.setText('更换归属')
+            self.owner_button.setToolTip(self.owner['title'])
             self.filter_changed()
         picker.deleteLater()
 
@@ -114,6 +123,7 @@ class TasksPage(QWidget):
         self.group_picker.blockSignals(False)
         self.owner = None
         self.owner_button.setText('筛选归属')
+        self.owner_button.setToolTip('')
         self.filter_changed()
 
     def set_page(self, offset):
@@ -164,6 +174,8 @@ class TasksPage(QWidget):
             if self.items.topLevelItemCount() and not self.items.currentItem():
                 self.items.setCurrentItem(self.items.topLevelItem(0))
             self.status.setText(f"{dict(GROUPS)[result['group']]} · 共 {result['total']} 项 · 今天 {result['date']}" + (' · 没有符合筛选的任务' if not result['items'] else ''))
+            if self.owner:
+                self.status.setText(self.status.text() + '\n归属：' + self.owner['title'])
             self.previous.setEnabled(self.offset > 0)
             self.next.setEnabled(result['next_offset'] is not None)
             self.selection_changed()
@@ -231,6 +243,8 @@ class TasksPage(QWidget):
         self.quick_input.setReadOnly(True)
         self.quick_button.setEnabled(False)
         self.quick_note.setText('正在保存…')
+        if self.last_quick_task_id:
+            self.quick_open_button.setText('查看上次成功记录')
         def finish():
             self.quick_pending = False
             self.quick_input.setReadOnly(False)
@@ -241,7 +255,13 @@ class TasksPage(QWidget):
             finish()
             if self.quick_input.text().strip() == title:
                 self.quick_input.clear()
-            self.quick_note.setText('已记下：' + title + '。可以继续输入下一件事。')
+            entity = (receipt.get('result') or {}).get('entity') or {}
+            identifier = entity.get('id')
+            self.last_quick_task_id = identifier if isinstance(identifier, str) and identifier else None
+            self.quick_open_button.setVisible(bool(self.last_quick_task_id) and self.on_task is not None)
+            self.quick_open_button.setText('查看刚记录任务')
+            self.quick_open_button.setToolTip('打开最近一次成功记录的任务：' + str(entity.get('title') or title))
+            self.quick_note.setText('已记下：' + title + '。新任务可能不在当前筛选中，可直接查看或继续录入。')
             self.quick_input.setFocus()
             self.refresh()
             if self.on_changed:
@@ -253,6 +273,10 @@ class TasksPage(QWidget):
             self.quick_note.setText('保存未完成，输入已保留。' + error.get('message', ''))
             self.error.emit(error)
         self.bridge.command('create', {'type': 'task', 'title': title, 'data': {}}, saved, failed)
+
+    def open_recent_quick(self):
+        if not self.dead and self.last_quick_task_id and self.on_task:
+            self.on_task(self.last_quick_task_id)
 
     def plan_today(self):
         task, result = self.selected(), self.result

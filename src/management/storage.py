@@ -10,6 +10,7 @@ import uuid
 
 from .schemas import BusinessError
 from .appearance import DEFAULT_APPEARANCE
+from .chart_preferences import CHART_DEFAULTS
 
 
 def now():
@@ -27,7 +28,7 @@ def new_id():
 DEFAULT_SETTINGS = {
     "appearance": dict(DEFAULT_APPEARANCE),
     "timezone": "Asia/Shanghai", "favorites": [], "ai": {"enabled": False, "executable": "", "model": "", "timeout_seconds": 180},
-    "charts": {"weekly_style": "columns"},
+    "charts": dict(CHART_DEFAULTS),
     "timetable_defaults": {"week_numbering": "teaching", "recess_weeks": []},
     "reserve_bytes": 1073741824, "page_size": 100, "context_characters": 42000,
 }

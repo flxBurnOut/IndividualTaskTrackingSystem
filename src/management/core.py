@@ -761,7 +761,8 @@ class Core:
             value.setdefault("appearance", copy.deepcopy(DEFAULT_APPEARANCE))
             if 'show_assistants' not in old.get('appearance', {}):
                 value['appearance']['show_assistants'] = bool(old.get('ai', {}).get('enabled'))
-            value.setdefault("charts", {"weekly_style":"columns"})
+            from .chart_preferences import normalize_chart_preferences, validate_chart_preferences
+            value["charts"] = normalize_chart_preferences(value.get("charts"))
             from .timetable import normalize_timetable_defaults
             value.setdefault("timetable_defaults", normalize_timetable_defaults({}))
             updates = p["settings"]
@@ -777,9 +778,7 @@ class Core:
                         raise BusinessError("validation", "课表设置格式无效。")
                     value[k] = normalize_timetable_defaults({**value[k], **v})
                 elif k == "charts":
-                    if not isinstance(v,dict) or set(v)-{"weekly_style"} or v.get("weekly_style") not in {"columns","rows"}:
-                        raise BusinessError("validation","请选择支持的每周回顾图表样式。")
-                    value[k].update(v)
+                    value[k] = validate_chart_preferences(v, current=value[k])
                 elif k == "ai":
                     if not isinstance(v, dict) or set(v) - (set(value["ai"]) | {"execution_mode"}):
                         raise BusinessError("validation", "AI 设置无效。")

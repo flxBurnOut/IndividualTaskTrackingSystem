@@ -17,6 +17,46 @@ def register(core,owner,**extra):
     return cmd(core,'set_recovery_task',p)['result']['entity']
 def close(dialog):dialog.finished_ok=True;dialog.saving=False;dialog.close()
 
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_recovery_panel_long_task_title_wraps_in_narrow_course_column(app, font_size):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QScrollArea, QPushButton
+    from management.gui_theme import apply_appearance, current_appearance
+
+    previous = current_appearance()
+    apply_appearance(app, {**previous, 'font_size': font_size})
+    bridge = ControlledBridge()
+    panel = RecoveryPanel(bridge, {'id': 'course', 'title': '演示课程'})
+    title = '需要补完的长课程名称与对应练习，保留完整的任务范围。' * 5
+    bridge.deliver('recovery_summary', {'items': [
+        {'id': 'catchup', 'title': title, 'data': {}, 'version': 1,
+         'progress': {'completed_quantity': 2, 'total_quantity': 8, 'unit': '节课'}},
+    ], 'total': 1})
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(panel)
+    try:
+        scroll.show()
+        for width in (900, 469, 900):
+            scroll.resize(width, 680)
+            QTest.qWait(70)
+            assert scroll.horizontalScrollBar().maximum() == 0
+            labels = [w for w in panel.findChildren(QLabel) if w.text() == title]
+            assert len(labels) == 1 and labels[0].wordWrap()
+            assert labels[0].height() >= labels[0].heightForWidth(labels[0].width())
+            for control in panel.findChildren(QPushButton):
+                if control.isVisible():
+                    assert control.width() >= control.sizeHint().width()
+                    assert control.parentWidget().rect().contains(control.geometry())
+        assert bridge.commands == []
+    finally:
+        scroll.close()
+        scroll.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        apply_appearance(app, previous)
+
 def test_form_registers_three_of_eight_without_plan_or_completion(app,core):
     owner=course(core);bridge=QueuedCoreBridge(core);dialog=RecoveryTaskDialog(bridge,owner)
     try:

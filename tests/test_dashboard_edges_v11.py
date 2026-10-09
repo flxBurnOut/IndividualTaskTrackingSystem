@@ -1,10 +1,13 @@
 """Dashboard date projections, current totals and asynchronous time refresh."""
-import os,datetime as dt
+import os,datetime as dt,time
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
-from PySide6.QtCore import QDate,QCoreApplication,QEvent
-from PySide6.QtWidgets import QApplication,QLabel,QDateEdit
+from PySide6.QtCore import QDate,QCoreApplication,QEvent,QPoint,QRect
+from PySide6.QtGui import QFontDatabase
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication,QLabel,QDateEdit,QPushButton
 from management.core import Core
 from management.gui_dashboard import DashboardPage
 from management.gui_today import TodayPage
@@ -12,9 +15,105 @@ from management.gui import MainWindow
 from test_ux_workflows_v2 import ControlledBridge,cmd
 
 @pytest.fixture(scope='session')
-def app():return QApplication.instance() or QApplication([])
+def app():
+    application = QApplication.instance() or QApplication([])
+    if application.platformName() == 'offscreen' and os.name == 'nt':
+        for name in ('msyh.ttc', 'msyhbd.ttc'):
+            path = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / name
+            if path.is_file(): QFontDatabase.addApplicationFont(str(path))
+    application.setStyle('Fusion')
+    return application
 
 def create(core,kind,title,**p):return cmd(core,'create',{'type':kind,'title':title,**p})['result']['entity']
+
+
+def settle_today_layout(app, condition):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if condition(): return
+        QTest.qWait(10)
+
+
+def test_dashboard_week_heading_matches_fixed_events_scope(app):
+    opened=[];page=DashboardPage(ControlledBridge(),on_timetable=opened.append);page.day='2030-01-02'
+    try:
+        page.render({'date_label':'2030 年 1 月 2 日','weekday':'星期三','week_label':'教学周尚未设置',
+            'week_start':'2029-12-31','week_end':'2030-01-06','periods':[],
+            'plan':{'has_plan':False,'summary':{'total':0,'done':0,'unreported':0}},
+            'tasks':{'total':0,'done':0,'open':0},'days':[],'owners':[],
+            'warnings':{'counts':{'current':0,'past':0},'items':[]}})
+        assert page.position.text()=='本周  ·  12-31 — 01-06'
+        words=[label.text() for label in page.findChildren(QLabel)]
+        assert '本周固定日程' in words and '本周安排' not in words
+        next(button for button in page.findChildren(QPushButton) if button.text()=='查看每周日程').click()
+        assert opened==['2030-01-02']
+    finally:page.close();page.deleteLater();app.processEvents()
+
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_dashboard_long_owner_warning_and_event_text_survives_resize(app, font_size):
+    from management.gui_theme import apply_appearance, current_appearance
+    from management.gui_visual_profile import set_visual_style, visual_style
+    original, profile = current_appearance(), visual_style()
+    set_visual_style('glass'); apply_appearance(app, {**original, 'font_size': font_size})
+    bridge, opened = ControlledBridge(), []
+    page = DashboardPage(bridge, on_projects=opened.append, on_task=opened.append)
+    page.resize(1400, 900); page.show(); app.processEvents()
+    title = '【演示】设计研究课程与综合实践项目，保留完整课程名称。' * 3
+    reason = '截止日期：2030-01-09。请核对原始要求与已保存的完成标准。' * 4
+    result = {'date': '2030-01-02', 'date_label': '2030 年 1 月 2 日', 'weekday': '星期三',
+        'week_label': '', 'week_start': '2029-12-31', 'week_end': '2030-01-06', 'periods': [],
+        'plan': {'has_plan': False, 'summary': {'total': 0, 'done': 0, 'unreported': 0}},
+        'tasks': {'total': 2, 'done': 1, 'open': 1},
+        'days': [{'weekday': '周三', 'date': '2030-01-02', 'is_today': True, 'event_count': 1,
+                  'events': [{'start': '09:00', 'title': title, 'event_kind': 'other', 'owner_label': title}]}],
+        'owners': [{'id': 'owner-long', 'label': title, 'done': 1, 'total': 2}],
+        'warnings': {'counts': {'current': 1, 'past': 1}, 'items': [{'id': 'warning-long', 'title': title, 'reason': reason}]}}
+    try:
+        page.refresh(); bridge.deliver('dashboard', result)
+        page.past_toggle.click()
+        bridge.deliver('warnings', {'items': [{'id': 'past-long', 'title': title, 'reason': reason}], 'next_offset': None})
+        for width in (1400, 650, 1400):
+            page.resize(width, 900)
+            labels = [label for label in page.findChildren(QLabel) if label.wordWrap() and label.text()]
+            settle_today_layout(app, lambda: all(label.height() >= label.heightForWidth(label.width()) - 1
+                                                  for label in labels if label.isVisible()))
+            assert page.horizontalScrollBar().maximum() == 0
+            for label in labels:
+                if label.isVisible():
+                    assert label.height() >= label.heightForWidth(label.width()) - 1, (width, label.text(), label.size(), label.heightForWidth(label.width()), label.parentWidget().objectName(), label.parentWidget().size(), label.parentWidget().minimumHeight(), label.parentWidget().layout().totalHeightForWidth(label.parentWidget().width()))
+                    ancestor = label.parentWidget()
+                    while ancestor is not None:
+                        region = QRect(label.mapTo(ancestor, QPoint()), label.size())
+                        assert ancestor.rect().contains(region), (label.text(), ancestor.objectName(), ancestor.rect(), region)
+                        if ancestor is page.widget(): break
+                        ancestor = ancestor.parentWidget()
+            owner_labels = [label for label in page.owner_section.findChildren(QLabel) if label.text() == title]
+            assert len(owner_labels) == 1 and owner_labels[0].wordWrap(), 'full owner name must be visible rather than clipped in a capped button'
+        owner_action = page.owner_section.findChild(QPushButton, 'OwnerOpen')
+        owner_action.click(); assert opened == ['owner-long']
+        section_layout = page.attention_section.layout()
+        expanded_height = section_layout.totalHeightForWidth(page.attention_section.width())
+        page.past_toggle.click()
+        settle_today_layout(app, lambda: section_layout.totalHeightForWidth(page.attention_section.width()) < expanded_height)
+        assert page.past_box.isHidden() and section_layout.totalHeightForWidth(page.attention_section.width()) < expanded_height
+        assert bridge.commands == []
+    finally:
+        page.close(); page.deleteLater(); app.processEvents()
+        set_visual_style(profile); apply_appearance(app, original)
+
+
+@pytest.mark.parametrize('fixed',[False,True])
+def test_today_only_explains_attendance_when_fixed_schedules_are_present(app,fixed):
+    from test_review_ui_v2 import daily
+    page=TodayPage(ControlledBridge());value=daily()
+    value['has_fixed_schedule']=fixed
+    try:
+        page.render_plan(value)
+        assert ('出勤不代表学习完成' in page.progress.title.text()) is fixed
+        assert ('按任务完成标准记录' in page.progress.title.text()) is not fixed
+    finally:page.close();page.deleteLater();app.processEvents()
 
 def test_week_and_today_show_reschedule_and_timezone_projected_clock(app,tmp_path):
     core=Core(tmp_path)
@@ -86,3 +185,126 @@ def test_clock_business_day_uses_configured_zone(monkeypatch):
     local_day,key=gui.clock_snapshot('Asia/Shanghai')
     assert local_day==QDate(2030,1,3)
     assert gui.clock_snapshot('America/Los_Angeles')[0]==QDate(2030,1,2)
+
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_glass_today_actions_keep_content_width_and_wrap_without_wide_cards(app, font_size):
+    from PySide6.QtWidgets import QFrame
+    from management.gui_layout import ActionRow
+    from management.gui_theme import apply_appearance, current_appearance
+    from management.gui_visual_profile import visual_style, set_visual_style
+    old_style, old_appearance = visual_style(), current_appearance()
+    set_visual_style('glass'); apply_appearance(app, {'font_size': font_size})
+    bridge = ControlledBridge(); opened = []
+    page = TodayPage(bridge, on_task=opened.append)
+    page.resize(1400, 900)
+    page.set_assistants_visible(True)
+    page.review_result = {'has_plan': False, 'can_review': False}
+    page.render_plan(page.review_result)
+    page.warning_result = {'items': [{'id': 'warning-one', 'title': 'Due soon', 'reason': 'Synthetic deadline'}], 'total': 1}
+    page.render_attention()
+    page.render_tasks({'date': page.date_iso(), 'plan': None, 'items': [
+        {'id': 'candidate-one', 'title': 'Short candidate', 'owner_label': 'Synthetic project',
+         'reason': 'Due today', 'data': {}}], 'total': 1, 'next_offset': None})
+    try:
+        page.show(); app.processEvents()
+        actions = page.plan_box.findChildren(QPushButton)
+        assert len(actions) == 2
+        assert len({button.y() for button in actions}) == 1
+        assert all(button.width() <= button.sizeHint().width() + 2 for button in actions)
+        assert all(button.width() < page.plan_box.width() / 2 for button in actions)
+        assert page.plan_box.objectName() != 'PlanCard'
+        assert not page.tasks_box.findChildren(QFrame, 'TaskRow')
+        assert not page.attention_box.findChildren(QFrame, 'CurrentWarningCard')
+
+        warning_row = page.attention_box.findChild(QFrame, 'TimelineRow')
+        warning_actions = warning_row.findChild(ActionRow)
+        heading = warning_actions.layout().itemAt(0).widget()
+        view = warning_actions.layout().itemAt(1).widget()
+        assert 0 <= view.x() - heading.geometry().right() <= warning_actions.layout().spacing() + 2
+        assert view.width() <= view.sizeHint().width() + 2
+        view.click(); assert opened == ['warning-one']
+
+        task_row = page.tasks_box.findChild(QFrame, 'TimelineRow')
+        task_actions = task_row.findChild(ActionRow)
+        content = task_row.layout().itemAt(0).widget()
+        task_view = task_actions.layout().itemAt(0).widget()
+        add = task_actions.layout().itemAt(1).widget()
+        assert 0 <= task_actions.y() - content.geometry().bottom() <= task_row.layout().spacing() + 2
+        assert 0 <= add.x() - task_view.geometry().right() <= task_actions.layout().spacing() + 2
+        assert add.width() <= add.sizeHint().width() + 2
+        task_view.click(); assert opened[-1] == 'candidate-one'
+
+        controls = [widget for widget in page._date_controls + page._plan_controls if widget.isVisible()]
+        natural_width = page.compact_controls.layout().sizeHint().width()
+        narrow_width = max(page.minimumSizeHint().width(), natural_width - max(32, controls[-1].sizeHint().width() // 2))
+        assert narrow_width < natural_width
+        page.resize(narrow_width, 760)
+        wrapped = lambda: max(widget.y() for widget in controls) - min(widget.y() for widget in controls) >= min(widget.height() for widget in controls)
+        settle_today_layout(app, wrapped)
+        assert page.compact_controls.width() < natural_width
+        assert max(widget.y() for widget in controls) - min(widget.y() for widget in controls) >= min(widget.height() for widget in controls)
+        assert all(widget.geometry().right() < page.compact_controls.width() for widget in controls)
+        assert all(button.width() <= max(button.sizeHint().width(), button.minimumWidth()) + 2
+                   for button in controls if isinstance(button, QPushButton))
+        title = content.layout().itemAt(0).widget()
+        title.setText('较长的事项说明仍须保留完整内容并能在窄窗口换行。' * 8)
+        settle_today_layout(app, lambda: title.height() >= title.heightForWidth(title.width()) - 2)
+        assert title.wordWrap() and title.height() >= title.heightForWidth(title.width()) - 2
+        assert content.geometry().right() < task_row.width()
+
+        # Removing attention items must leave the empty plan at the viewport's
+        # top, even when more vertical space is available. No hidden section or
+        # flow row may turn the first half of the page into a blank spacer.
+        page.warning_result = {'items': [], 'total': 0}
+        page.today_result = {'notifications': [], 'unknowns': []}
+        page.render_attention()
+        page.render_tasks({'items': [], 'total': 0, 'next_offset': None})
+        page.render_events([])
+        page.resize(page.width(), 1200)
+        page.scroll.verticalScrollBar().setValue(0)
+        heading = page.plan_layout.itemAt(0).widget()
+        top_limit = page.body.contentsMargins().top() + page.plan_layout.contentsMargins().top() + page.body.spacing()
+        settled_top = lambda: heading.mapTo(page.scroll.widget(), QPoint()).y() <= top_limit
+        settle_today_layout(app, settled_top)
+        assert heading.mapTo(page.scroll.widget(), QPoint()).y() <= top_limit
+        natural_height = max(page.plan_layout.sizeHint().height(), page.plan_layout.totalHeightForWidth(page.plan_box.width()))
+        assert page.plan_box.height() <= natural_height + 6
+        assert bridge.commands == []
+    finally:
+        page.close(); page.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
+        set_visual_style(old_style); apply_appearance(app, old_appearance)
+
+
+def test_today_visual_switch_reuses_controls_and_preserves_pending_state_and_input(app):
+    from PySide6.QtWidgets import QFrame, QLineEdit
+    from management.gui_visual_profile import visual_style, set_visual_style
+    old_style = visual_style(); set_visual_style('glass')
+    bridge = ControlledBridge(); page = TodayPage(bridge)
+    draft = QLineEdit('Unsaved synthetic draft', page)
+    controls = page.date, page.manual_button, page.plan_button, page.habits_button
+    day = page.date_iso()
+    page.set_assistants_visible(True)
+    page.review_result = {'has_plan': False, 'can_review': False}
+    page.render_plan(page.review_result)
+    page.warning_result = {'items': [{'id': 'warning-one', 'title': 'Warning', 'reason': 'Evidence'}], 'total': 1}
+    page.render_attention()
+    page.render_tasks({'date': day, 'plan': None, 'items': [
+        {'id': 'candidate-one', 'title': 'Candidate', 'owner_label': 'Project', 'data': {}}], 'total': 1})
+    page.pending_targets.add((day, 'candidate-one'))
+    try:
+        for profile in ('classic', 'glass', 'classic'):
+            set_visual_style(profile); page.apply_visual_style(profile)
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
+            assert (page.date, page.manual_button, page.plan_button, page.habits_button) == controls
+            assert page.date_iso() == day and draft.text() == 'Unsaved synthetic draft'
+            assert page.pending_targets == {(day, 'candidate-one')} and page.assistants_visible
+            assert bool(page.tasks_box.findChildren(QFrame, 'TaskRow')) is (profile == 'classic')
+            assert page.plan_box.objectName() == ('PlanCard' if profile == 'classic' else 'TodayPlanEmpty')
+            assert page.classic_controls.isHidden() is (profile == 'glass')
+        assert bridge.commands == [] and bridge.queries == []
+    finally:
+        page.close(); page.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
+        set_visual_style(old_style)

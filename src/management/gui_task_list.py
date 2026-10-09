@@ -1,7 +1,8 @@
 """Open tasks first; completed history is collapsed and loaded on demand."""
-from PySide6.QtCore import Signal,QDate
+from PySide6.QtCore import Signal,QDate,Qt
 from PySide6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QLabel,QFrame,QSizePolicy
 from .gui_forms import label_status
+from .gui_layout import ActionRow
 
 
 class TaskListPanel(QWidget):
@@ -62,16 +63,18 @@ class TaskListPanel(QWidget):
         state=task.get('completion_state');group='done' if state=='done' else 'open'
         if task['id'] in self.ids[group]:return
         self.ids[group].add(task['id'])
-        row=QFrame();row.setObjectName('CompletedTaskRow' if group=='done' else 'TaskRow');inner=QHBoxLayout(row);inner.setContentsMargins(15,12,15,12)
-        mark=QPushButton('✓' if group=='done' else '○');mark.setObjectName('TaskMark');mark.setFixedWidth(36);mark.setToolTip('标为未完成' if group=='done' else '标为完成');mark.setAccessibleName(task['title']+'：'+mark.toolTip());mark.setEnabled(task['id'] not in self.pending);mark.clicked.connect(lambda _,e=task,b=mark:self.complete(e,'incomplete' if group=='done' else 'done',b));inner.addWidget(mark)
-        title=QPushButton(task.get('display_title') or task['title']);title.setObjectName('TextLink');title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);title.setToolTip(task['title']);title.clicked.connect(lambda _,e=task:self.on_open(e) if self.on_open else None);inner.addWidget(title,1)
-        owner=QLabel(task.get('owner_label') or self.owner.get('data',{}).get('code') or self.owner['title']);owner.setObjectName('Quiet');owner.setWordWrap(True);owner.setMaximumWidth(190);inner.addWidget(owner)
-        if task.get('data',{}).get('catchup_enabled'):inner.addWidget(QLabel('补课 / 补欠'))
-        if task.get('data',{}).get('due_date'):inner.addWidget(QLabel('截止 '+task['data']['due_date']))
+        row=QFrame();row.setObjectName('CompletedTaskRow' if group=='done' else 'TaskRow');inner=QVBoxLayout(row);inner.setContentsMargins(15,12,15,12)
+        title=QLabel(task.get('display_title') or task['title']);title.setTextFormat(Qt.TextFormat.PlainText);title.setWordWrap(True);title.setObjectName('SectionHeading');inner.addWidget(title)
+        owner=QLabel(task.get('owner_label') or self.owner.get('data',{}).get('code') or self.owner['title']);owner.setTextFormat(Qt.TextFormat.PlainText);owner.setObjectName('Quiet');owner.setWordWrap(True);inner.addWidget(owner)
+        actions=ActionRow();inner.addWidget(actions)
+        mark=QPushButton('✓' if group=='done' else '○');mark.setObjectName('TaskMark');mark.setFixedWidth(36);mark.setToolTip('标为未完成' if group=='done' else '标为完成');mark.setAccessibleName(task['title']+'：'+mark.toolTip());mark.setEnabled(task['id'] not in self.pending);mark.clicked.connect(lambda _,e=task,b=mark:self.complete(e,'incomplete' if group=='done' else 'done',b));actions.addWidget(mark)
+        open_button=QPushButton('查看');open_button.setAccessibleName('查看任务：'+task['title']);open_button.clicked.connect(lambda _,e=task:self.on_open(e) if self.on_open else None);actions.addWidget(open_button)
+        if task.get('data',{}).get('catchup_enabled'):actions.addWidget(QLabel('补课 / 补欠'))
+        if task.get('data',{}).get('due_date'):actions.addWidget(QLabel('截止 '+task['data']['due_date']))
         label={'done':'已完成','incomplete':'未完成','partial':'部分完成','not_started':'未开始','blocked':'受阻'}.get(state,label_status(task.get('status')))
-        pill=QLabel(label);pill.setObjectName('StatusPill');inner.addWidget(pill)
+        pill=QLabel(label);pill.setObjectName('StatusPill');actions.addWidget(pill)
         if self.on_edit:
-            edit=QPushButton('编辑任务');edit.clicked.connect(lambda _,e=task:self.on_edit(e));inner.addWidget(edit)
+            edit=QPushButton('编辑任务');edit.clicked.connect(lambda _,e=task:self.on_edit(e));actions.addWidget(edit)
         if group=='done':self.done_layout.insertWidget(max(0,self.done_layout.count()-1),row)
         else:self.open_layout.addWidget(row)
 

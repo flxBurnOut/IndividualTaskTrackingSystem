@@ -7,6 +7,7 @@ from shiboken6 import isValid
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication
 from .appearance import DEFAULT_APPEARANCE, normalize_appearance
+from .gui_visual_profile import visual_style
 
 LIGHT = dict(window='#f6f8f7',surface='#ffffff',surface_alt='#edf3ef',sidebar='#ecf1ee',
     text='#263b3c',muted='#7d8d84',border='#dce5df',primary='#326f57',primary_text='#ffffff',
@@ -48,7 +49,16 @@ def current_appearance():
 
 
 def color(name):
-    return (DARK if current_appearance()['theme'] == 'dark' else LIGHT)[name]
+    config = current_appearance()
+    if visual_style() == 'glass':
+        from .gui_theme_glass import palette_tokens
+        return palette_tokens(config['theme'], config.get('accent', 'default'))[name]
+    return classic_palette_tokens(config['theme'], config.get('accent', 'default'))[name]
+
+
+def classic_palette_tokens(theme='light', accent='default'):
+    from .gui_theme_glass import accent_tokens
+    return {**(DARK if theme == 'dark' else LIGHT), **accent_tokens(theme, accent)}
 
 
 def available_font_families():
@@ -67,11 +77,24 @@ def resolved_font_family(config):
 
 def stylesheet(config=None):
     config = normalize_appearance(config)
-    tokens = DARK if config['theme'] == 'dark' else LIGHT
+    if visual_style() == 'glass':
+        from .gui_theme_glass import stylesheet as glass_stylesheet
+        return glass_stylesheet(config)
+    return _classic_stylesheet(config)
+
+
+def _classic_stylesheet(config=None):
+    config = normalize_appearance(config)
+    tokens = classic_palette_tokens(config['theme'], config['accent'])
     text = _LIGHT_STYLE
     if config['theme'] == 'dark':
         mapping = {'#'+hex: tokens[role] for role, values in _DARK_ROLES.items() for hex in values.split()}
         text = re.sub(r'#[0-9a-fA-F]{6}', lambda m: mapping[m.group().lower()], text)
+    elif config['accent'] != 'default':
+        accent_roles = {'primary', 'primary_hover', 'selection', 'selection_text', 'focus'}
+        mapping = {'#'+hex: tokens[role] for role, values in _DARK_ROLES.items()
+                   if role in accent_roles for hex in values.split()}
+        text = re.sub(r'#[0-9a-fA-F]{6}', lambda m: mapping.get(m.group().lower(), m.group()), text)
     family = config['font_family'].replace('\\', '\\\\').replace('"', '\\"')
     if not family:
         family = 'Microsoft YaHei UI'
@@ -118,6 +141,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     text += f'\nQLabel#DashboardDate, QLabel#TodayDateHeading {{ font-size: {round(27*scale)}px; font-weight: 700; }}'
     text += f'\nQLabel#DashboardWeek {{ font-size: {round(16*scale)}px; color: {tokens["muted"]}; }}'
     text += f'\nQLabel#DashboardMetric {{ font-size: {round(24*scale)}px; font-weight: 700; }}'
+    if config['accent'] != 'default':
+        # The legacy CSS combines the completed marker with an action marker.
+        # Keep the original completed color while recoloring action controls.
+        done_dot = DARK['primary'] if config['theme'] == 'dark' else '#39846c'
+        text += f'\nQLabel#DoneDot {{ color: {done_dot}; }}'
+        text += f'\nQLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTimeEdit {{ selection-color: {tokens["selection_text"]}; }}'
     return text
 
 
@@ -152,13 +181,18 @@ def apply_appearance(app, config=None):
     install_gui_gc(app)
     if QThread.currentThread() != app.thread():
         raise RuntimeError('Applying appearance requires the GUI thread')
+    from .gui_indicators import install_indicators
+    install_indicators(app)
     config = normalize_appearance(config)
     old = getattr(app, '_management_appearance', None)
+    profile = visual_style()
     # Sidebar persistence is not a palette change; avoid rebuilding all widgets.
-    if old and all(old.get(k) == config[k] for k in ('theme','font_family','font_size')):
+    if (old and getattr(app, '_management_visual_style', None) == profile
+            and all(old.get(k) == config[k] for k in ('theme','accent','font_family','font_size'))):
         app._management_appearance = dict(config)
         return config
     app._management_appearance = dict(config)
+    app._management_visual_style = profile
     palette = QPalette()
     for role, name in {
         QPalette.ColorRole.Window: 'window', QPalette.ColorRole.WindowText: 'text',

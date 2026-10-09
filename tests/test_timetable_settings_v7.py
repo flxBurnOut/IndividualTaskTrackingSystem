@@ -120,6 +120,46 @@ def test_page_loads_only_when_shown_and_save_waits_for_loaded_settings(app):
     finally:close(app,page)
 
 
+@pytest.mark.parametrize('theme,font_size', [('light',13),('dark',20)])
+def test_settings_groups_keep_controls_compact_and_footer_visible_without_losing_edits(app,tmp_path,theme,font_size):
+    from pathlib import Path
+    from PySide6.QtWidgets import QScrollArea
+    from management.gui_theme import apply_appearance,current_appearance
+    from management.gui_visual_profile import visual_style,set_visual_style
+    previous,previous_style=current_appearance(),visual_style()
+    bridge=ControlledBridge();page=None
+    try:
+        set_visual_style('glass');apply_appearance(app,{'theme':theme,'font_size':font_size})
+        page=TimetableSettingsPage(bridge);page.resize(790,650);page.show()
+        bridge.deliver('timetables',{'items':[],'next_offset':None})
+        bridge.deliver('settings',{'settings':{'timezone':'Asia/Shanghai','timetable_defaults':{'week_numbering':'teaching','recess_weeks':[]}},'epoch':bridge.epoch,'revision':12})
+        page.timezone.setCurrentText('Asia/Singapore')
+        page.recess_date.setDate(QDate(2030,1,23));page.add_week()
+        controls=(page.scope,page.timezone,page.recess_date,page.add,page.remove,page.save_button,page.reload_button)
+        originals=tuple(id(widget) for widget in controls)
+        for _ in range(4):app.processEvents()
+        assert len(page.findChildren(QScrollArea))==1
+        for widget in controls:
+            assert widget.width()<page.width()*0.65
+        assert page.weeks.horizontalScrollBar().maximum()==0
+        report=Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR',str(tmp_path)))
+        assert page.grab().save(str(report/('settings-timetable-'+theme+'.png')))
+        for style,width in (('glass',460),('classic',460),('glass',790)):
+            set_visual_style(style);apply_appearance(app,{'theme':theme,'font_size':font_size})
+            page.resize(width,650)
+            for _ in range(4):app.processEvents()
+            assert page.scroll.horizontalScrollBar().maximum()==0
+            assert page.save_button.visibleRegion().boundingRect().contains(page.save_button.rect())
+            assert not page.scroll.isAncestorOf(page.save_button)
+            assert page.timezone.currentText()=='Asia/Singapore' and page.dirty
+            assert page.weeks.count()==1 and page.weeks.item(0).data(Qt.ItemDataRole.UserRole)=='2030-01-21'
+            assert tuple(id(widget) for widget in controls)==originals
+            assert not bridge.commands and len(bridge.queries)==2
+    finally:
+        if page is not None:close(app,page)
+        set_visual_style(previous_style);apply_appearance(app,previous)
+
+
 def test_page_default_settings_save_keeps_all_semesters_and_existing_table_unchanged(app,core):
     table=old_table(core);page,bridge=opened(app,core)
     try:

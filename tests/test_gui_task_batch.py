@@ -286,3 +286,34 @@ def test_batch_dialog_light_dark_large_font_and_long_source_layout(app,tmp_path)
     finally:
         if dialog:dispose(app,dialog)
         apply_appearance(app,previous)
+
+
+def test_batch_toolbar_wraps_at_large_font_without_hiding_actions(app):
+    from PySide6.QtTest import QTest
+    from management.gui_theme import apply_appearance, current_appearance
+
+    previous = current_appearance()
+    apply_appearance(app, {**previous, 'font_size': 20})
+    bridge = ControlledBridge()
+    dialog = TaskBatchDialog(bridge)
+    try:
+        dialog.paste.setPlainText('保留尚未导入的任务草稿')
+        dialog.show()
+        for width in (980, 650, 980):
+            dialog.resize(width, 680)
+            QTest.qWait(60)
+            assert dialog.editor_scroll.horizontalScrollBar().maximum() == 0
+            actions = (dialog.import_button, dialog.add_button, dialog.remove_button,
+                       dialog.up_button, dialog.down_button)
+            for action in actions:
+                assert action.width() >= action.sizeHint().width()
+                assert action.height() >= action.sizeHint().height()
+                assert action.parentWidget().rect().contains(action.geometry())
+            toolbar = dialog.import_button.parentWidget()
+            if toolbar.width() < toolbar.layout().sizeHint().width():
+                assert len({action.y() for action in (*actions, dialog.count)}) > 1
+            assert dialog.paste.toPlainText() == '保留尚未导入的任务草稿'
+        assert bridge.commands == []
+    finally:
+        dispose(app, dialog)
+        apply_appearance(app, previous)

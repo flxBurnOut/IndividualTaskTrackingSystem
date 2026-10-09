@@ -123,6 +123,27 @@ def test_environment_disables_only_automatic_and_global_disable_is_saved(ui):
     assert not loaded.automatic
 
 
+@pytest.mark.parametrize('automatic,seen', [
+    (False, {}), (True, {'today': 'completed'}), (True, {'today': 'skipped'}),
+])
+def test_saved_opt_out_and_seen_progress_are_not_rearmed_on_focus(ui, monkeypatch, automatic, seen):
+    app, create, root = ui
+    monkeypatch.delenv('PERSONAL_MANAGEMENT_NO_ONBOARDING')
+    path = root / 'space' / 'ui-onboarding.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'version': 1, 'automatic': automatic, 'seen': seen}), encoding='utf-8')
+    before = path.read_bytes()
+    window, manager = create()
+    manager.watch('today', window.panel, steps(window.button))
+    app.setActiveWindow(None)
+    app.processEvents()
+    app.setActiveWindow(window)
+    QTest.qWait(90)
+    assert manager.overlay is None and manager._watches['today'].pending_since is None
+    assert manager.automatic is automatic and manager._seen == seen
+    assert path.read_bytes() == before
+
+
 def test_first_show_waits_for_data_but_user_typing_cancels_that_visit(ui, monkeypatch):
     app, create, _ = ui
     monkeypatch.delenv('PERSONAL_MANAGEMENT_NO_ONBOARDING')
@@ -134,6 +155,9 @@ def test_first_show_waits_for_data_but_user_typing_cancels_that_visit(ui, monkey
     window.edit.setFocus()
     QTest.keyClicks(window.edit, 'unfinished note')
     ready['value'] = True
+    app.setActiveWindow(None)
+    app.processEvents()
+    app.setActiveWindow(window)
     QTest.qWait(90)
     assert manager.overlay is None
     assert window.edit.text() == 'unfinished note'
@@ -172,6 +196,68 @@ def test_automatic_guide_waits_for_real_window_focus(ui, monkeypatch):
     assert not manager.show('today')
     app.setActiveWindow(window)
     wait(app, lambda: manager.active_key == 'today')
+
+
+def test_slow_first_read_keeps_offer_until_ready_without_user_input(ui, monkeypatch):
+    app, create, _ = ui
+    monkeypatch.delenv('PERSONAL_MANAGEMENT_NO_ONBOARDING')
+    window, manager = create()
+    ready = {'value': False}
+    manager.watch('today', window.panel, steps(window.button), ready=lambda: ready['value'])
+    manager._watches['today'].pending_since -= 120
+    manager._try_pending()
+    assert manager.overlay is None and manager._watches['today'].pending_since is not None
+    ready['value'] = True
+    wait(app, lambda: manager.active_key == 'today')
+
+
+def test_unstarted_offer_survives_window_switch_and_late_focus(ui, monkeypatch):
+    app, create, _ = ui
+    monkeypatch.delenv('PERSONAL_MANAGEMENT_NO_ONBOARDING')
+    window, manager = create()
+    ready = {'value': False}
+    manager.watch('today', window.panel, steps(window.button), ready=lambda: ready['value'])
+    other, _ = create('other')
+    app.setActiveWindow(other)
+    app.processEvents()
+    manager._watches['today'].pending_since -= 120
+    ready['value'] = True
+    manager._try_pending()
+    assert manager.overlay is None and manager._watches['today'].pending_since is not None
+    app.setActiveWindow(window)
+    wait(app, lambda: manager.active_key == 'today')
+
+
+def test_main_readiness_tracks_initial_layout_but_not_unrelated_poll_callbacks():
+    from types import SimpleNamespace
+    from management.gui import MainWindow
+    state = SimpleNamespace(type_map={}, _onboarding_display_loaded=False, closed=False,
+                            section='dashboard', dashboard_page=SimpleNamespace(result=None),
+                            bridge=SimpleNamespace(callbacks={1: 'persistent status poll'}))
+    assert not MainWindow.onboarding_ready(state)
+    state.type_map = {'task': {}}
+    assert not MainWindow.onboarding_ready(state)
+    state._onboarding_display_loaded = True
+    assert not MainWindow.onboarding_ready(state)
+    state.dashboard_page.result = {'date': '2030-01-07'}
+    assert MainWindow.onboarding_ready(state)
+    assert state.bridge.callbacks
+    state.section = 'today'
+    state.dashboard_page.result = None
+    assert MainWindow.onboarding_ready(state)
+    state.closed = True
+    assert not MainWindow.onboarding_ready(state)
+    # A failed initial settings read reports its error and never marks the
+    # initial display setup ready merely because other queries have completed.
+    state.closed = False
+    state._onboarding_display_loaded = False
+    state._display_generation = 0
+    errors = []
+    state.show_error = errors.append
+    state.bridge.query = lambda name, done, failed: failed({'message': 'Synthetic settings unavailable'})
+    MainWindow.load_display_preferences(state)
+    assert errors == [{'message': 'Synthetic settings unavailable'}]
+    assert not MainWindow.onboarding_ready(state)
 
 
 def test_manual_replay_chooses_the_current_specific_panel(ui):
@@ -299,6 +385,7 @@ def test_future_preferences_are_not_downgraded_or_overwritten(ui):
     before = '{"version": 2, "automatic": false, "future": "keep"}'
     path.write_text(before, encoding='utf-8')
     _, manager = create()
+    assert not manager.automatic
     manager.set_automatic(False)
     assert path.read_text(encoding='utf-8') == before
 

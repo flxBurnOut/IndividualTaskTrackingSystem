@@ -30,6 +30,7 @@ TYPE_LABELS = {
 STATUS_LABELS = {
     "active": "进行中", "pending": "待处理", "todo": "待开始", "done": "已完成",
     "completed": "已完成", "cancelled": "已取消", "blocked": "受阻", "draft": "草稿",
+    "partial": "部分完成", "incomplete": "未完成", "not_started": "未开始", "planned": "已安排",
     "open": "进行中", "paused": "暂停", "unknown": "待确认", "scheduled": "已安排",
     "queued": "等待中", "running": "执行中", "succeeded": "已完成", "failed": "失败",
     "normal": "普通", "high": "高", "low": "低", "standard": "常规", "low_state": "低精力",

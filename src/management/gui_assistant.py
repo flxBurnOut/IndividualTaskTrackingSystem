@@ -113,7 +113,7 @@ class AssistanceDialog(QDialog):
         self.repair_button=button('恢复原会话关联',self.repair_conversation);self.repair_button.hide();layout.addWidget(self.repair_button,alignment=Qt.AlignmentFlag.AlignLeft)
         self.resume_button=button('从已保存进度继续',self.resume_operation);self.resume_button.hide();layout.addWidget(self.resume_button,alignment=Qt.AlignmentFlag.AlignLeft)
         composer=QFrame();composer.setObjectName('ChatComposer');composer_layout=QVBoxLayout(composer);composer_layout.setContentsMargins(12,10,12,10)
-        self.chips=QWidget();self.chip_layout=QHBoxLayout(self.chips);self.chip_layout.setContentsMargins(0,0,0,0);self.chip_scroll=QScrollArea();self.chip_scroll.setWidgetResizable(True);self.chip_scroll.setFrameShape(QFrame.Shape.NoFrame);self.chip_scroll.setWidget(self.chips);self.chip_scroll.setFixedHeight(51);composer_layout.addWidget(self.chip_scroll)
+        self.chips=QWidget();self.chip_layout=QHBoxLayout(self.chips);self.chip_layout.setContentsMargins(0,0,0,0);self.chip_scroll=QScrollArea();self.chip_scroll.setWidgetResizable(True);self.chip_scroll.setFrameShape(QFrame.Shape.NoFrame);self.chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);self.chip_scroll.setWidget(self.chips);composer_layout.addWidget(self.chip_scroll)
         self.prompt=Composer(self.start_job);self.prompt.setFrameShape(QFrame.Shape.NoFrame);self.prompt.setStyleSheet('QTextEdit {border:0;background:transparent;}');self.prompt.setFixedHeight(80);self.prompt.setPlaceholderText('说说你想安排什么，或补充新的实际情况…');self.prompt.setPlainText(prompt);composer_layout.addWidget(self.prompt)
         self.prompt.textChanged.connect(self.cancel_pending_connection_send)
         row=QHBoxLayout();self.attach=button('＋ 附件',self.choose_sources);row.addWidget(self.attach);row.addWidget(label('Enter 发送 · Shift + Enter 换行','Quiet'),1);self.send=button('发送',self.send_or_stop);self.send.setObjectName('Primary');self.send.setMinimumWidth(86);row.addWidget(self.send);composer_layout.addLayout(row);layout.addWidget(composer)
@@ -126,6 +126,7 @@ class AssistanceDialog(QDialog):
         if self.codex_connection is not None:
             self.codex_connection.changed.connect(self.desktop_connection_changed)
             self.desktop_connection_changed(self.codex_connection.snapshot())
+        bind_theme(self,self.fit_attachment_height)
 
     def desktop_connection_changed(self,value):
         if self.closed:return
@@ -288,6 +289,17 @@ class AssistanceDialog(QDialog):
             if (not self.desktop_connection_blocked() and self.prompt.toPlainText()==self._auto_send_text
                     and self.attachment_version==0):self.start_job(connect_if_needed=False)
 
+    def fit_attachment_height(self):
+        # Reserve the horizontal scrollbar as well as the current button height.
+        # A fixed 51px strip cut off large-font chips when the bar appeared.
+        for index in range(self.chip_layout.count()):
+            widget=self.chip_layout.itemAt(index).widget()
+            if widget:widget.ensurePolished()
+        self.chip_layout.invalidate()
+        content_height=self.chip_layout.sizeHint().height()
+        scrollbar_height=self.chip_scroll.horizontalScrollBar().sizeHint().height()
+        self.chip_scroll.setFixedHeight(max(51,content_height+scrollbar_height+2*self.chip_scroll.frameWidth()))
+
     def refresh_chips(self):
         if self._pending_connection_send and not self._connection_draft_matches(self._pending_connection_send):
             self.cancel_pending_connection_send()
@@ -300,7 +312,7 @@ class AssistanceDialog(QDialog):
         if automatic:
             self.chip_layout.addWidget(label('课程资料 · 按需读取','Quiet'))
         if len(self.selected_ids)>20:self.chip_layout.addWidget(label(f'共 {len(self.selected_ids)} 份资料','Quiet'))
-        self.chip_layout.addStretch();self.chip_scroll.setVisible(bool(self.selected_ids) or automatic)
+        self.chip_layout.addStretch();self.chip_scroll.setVisible(bool(self.selected_ids) or automatic);self.fit_attachment_height()
 
     def remove_source(self,identifier):
         if self.mutating:return

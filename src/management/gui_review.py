@@ -9,11 +9,31 @@ from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtWidgets import (
     QDateEdit, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QTextEdit,
-    QScrollArea, QTabWidget, QVBoxLayout, QWidget,
+    QLayout, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 from .gui_charts import CoverageChart, ORIGINAL_LABELS, WeekDaysChart
 from .gui_calendar import install_calendar
 from .gui_forms import EntityPicker, FeedbackDialog, FormDialog, FIELD_LABELS
+from .chart_preferences import normalize_chart_preferences
+from .gui_layout import ActionRow
+from .gui_materials import AnimatedTabWidget, TabTransition
+from .gui_theme import bind_theme
+from .gui_visual_profile import visual_style
+
+
+class _WeekHeading(QLabel):
+    """Prefer an unbroken date range without imposing a minimum row width."""
+    def sizeHint(self):
+        hint = super().sizeHint()
+        if visual_style() == 'glass' and self.wordWrap():
+            margins = self.contentsMargins()
+            text_width = max(self.fontMetrics().horizontalAdvance(self.text()),
+                             self.fontMetrics().boundingRect(self.text()).width())
+            width = max(hint.width(), text_width + margins.left() + margins.right()
+                        + 2 * self.margin() + max(0, self.indent()) + 2)
+            hint.setWidth(width)
+            hint.setHeight(max(0, super().heightForWidth(width)))
+        return hint
 
 
 class ActualFeedbackDialog(FeedbackDialog):
@@ -296,8 +316,9 @@ class ReviewNotesDialog(FormDialog):
 
 class ReviewPage(QWidget):
     has_pending = Signal(bool)
+    chart_settings_requested = Signal(str)
 
-    def __init__(self, bridge, parent=None, on_changed=None, on_codex=None):
+    def __init__(self, bridge, parent=None, on_changed=None, on_codex=None, on_chart_settings=None):
         super().__init__(parent)
         self.bridge, self.on_changed, self.on_codex = bridge, on_changed, on_codex
         self._date = QDate.currentDate().toString('yyyy-MM-dd')
@@ -310,15 +331,23 @@ class ReviewPage(QWidget):
         self.daily_data, self.weekly_data = None, None
         self.dialogs = []
         self._assistants_visible = True
+        self.chart_preferences = normalize_chart_preferences()
+        if on_chart_settings:
+            self.chart_settings_requested.connect(on_chart_settings)
+        self._visual_style = 'classic'
         self._build()
+        self.tab_transition = TabTransition(self.tabs)
+        bind_theme(self, self.apply_visual_style)
 
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        top = QHBoxLayout()
-        title = QLabel('复盘')
-        title.setObjectName('DialogHeading')
-        top.addWidget(title, 1)
+        self.classic_header = QWidget()
+        top = QHBoxLayout(self.classic_header)
+        top.setContentsMargins(0, 0, 0, 0)
+        self.header_title = QLabel('复盘')
+        self.header_title.setObjectName('DialogHeading')
+        top.addWidget(self.header_title, 1)
         self.date_editor = QDateEdit(QDate.fromString(self._date, 'yyyy-MM-dd'))
         install_calendar(self.date_editor)
         self.date_editor.setDisplayFormat('yyyy-MM-dd')
@@ -331,20 +360,31 @@ class ReviewPage(QWidget):
             button.setMinimumWidth(36)
             button.setStyleSheet('QPushButton { padding: 8px 10px; }')
             button.clicked.connect(lambda checked=False,amount=step:self.date_editor.setDate(self.date_editor.date().addDays(amount)))
-        top.addWidget(self.previous_date)
-        top.addWidget(self.date_editor)
-        top.addWidget(self.next_date)
+        self.date_navigation = QWidget()
+        navigation = QHBoxLayout(self.date_navigation)
+        navigation.setContentsMargins(0, 0, 0, 0)
+        navigation.addWidget(self.previous_date)
+        navigation.addWidget(self.date_editor)
+        navigation.addWidget(self.next_date)
+        top.addWidget(self.date_navigation)
         self.refresh_button = QPushButton('刷新')
         self.refresh_button.clicked.connect(lambda: self.refresh())
         top.addWidget(self.refresh_button)
-        layout.addLayout(top)
-        self.tabs = QTabWidget()
+        layout.addWidget(self.classic_header)
+        self.header_actions = ActionRow()
+        self.header_actions.hide()
+        layout.addWidget(self.header_actions)
+        self.tabs = AnimatedTabWidget()
         self.daily_tab, self.weekly_tab = QWidget(), QWidget()
         self.tabs.addTab(self.daily_tab, '每日复盘')
         self.tabs.addTab(self.weekly_tab, '每周回顾')
         layout.addWidget(self.tabs, 1)
 
-        day_layout = QVBoxLayout(self.daily_tab)
+        self.day_tab_layout = QVBoxLayout(self.daily_tab)
+        self.day_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.daily_body = QWidget()
+        self.day_tab_layout.addWidget(self.daily_body)
+        day_layout = self.day_layout = QVBoxLayout(self.daily_body)
         self.daily_heading = QLabel('正在等待读取计划')
         self.daily_heading.setWordWrap(True)
         day_layout.addWidget(self.daily_heading)
@@ -352,7 +392,9 @@ class ReviewPage(QWidget):
         self.notice.setWordWrap(True)
         self.notice.setObjectName('Notice')
         day_layout.addWidget(self.notice)
-        manual_actions = QHBoxLayout()
+        self.classic_manual_actions = QWidget()
+        manual_actions = QHBoxLayout(self.classic_manual_actions)
+        manual_actions.setContentsMargins(0, 0, 0, 0)
         self.feedback_button = QPushButton('记录实际情况')
         self.feedback_button.setObjectName('Primary')
         self.feedback_button.clicked.connect(self._record_actual)
@@ -360,7 +402,9 @@ class ReviewPage(QWidget):
         self.notes_button = QPushButton('写小结 / 查看已保存小结')
         self.notes_button.clicked.connect(self._open_notes)
         manual_actions.addWidget(self.notes_button)
-        day_layout.addLayout(manual_actions)
+        day_layout.addWidget(self.classic_manual_actions)
+        self.daily_actions = ActionRow(self.daily_body)
+        self.daily_actions.hide()
         self.feedback_history_button = QPushButton('查看已保存实际记录')
         self.feedback_history_button.clicked.connect(self._open_actual_history)
         day_layout.addWidget(self.feedback_history_button)
@@ -368,6 +412,13 @@ class ReviewPage(QWidget):
         self.codex_button.clicked.connect(self._ask_codex)
         day_layout.addWidget(self.codex_button)
         self.daily_chart = CoverageChart()
+        self.daily_chart_button = self._chart_settings_button('review_daily_style')
+        day_layout.addWidget(self.daily_chart_button)
+        self.daily_chart_tools = ActionRow(self.daily_body)
+        self.daily_chart_title = QLabel('已保存的实际结果')
+        self.daily_chart_title.setObjectName('SectionHeading')
+        self.daily_chart_tools.addWidget(self.daily_chart_title)
+        self.daily_chart_tools.hide()
         day_layout.addWidget(self.daily_chart)
         self.saved_hint = QLabel('上图是已保存的反馈。未选择的项目保持未反馈，不会自动算作未完成。')
         self.saved_hint.setWordWrap(True)
@@ -390,7 +441,9 @@ class ReviewPage(QWidget):
         self.pending_label.setWordWrap(True)
         self.pending_label.setObjectName('Hint')
         day_layout.addWidget(self.pending_label)
-        actions = QHBoxLayout()
+        self.classic_confirm_actions = QWidget()
+        actions = QHBoxLayout(self.classic_confirm_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
         self.reload_button = QPushButton('重新读取此日计划')
         self.reload_button.clicked.connect(lambda: self.reload_plan())
         actions.addWidget(self.reload_button)
@@ -399,10 +452,18 @@ class ReviewPage(QWidget):
         self.confirm_button.setObjectName('Primary')
         self.confirm_button.clicked.connect(self.submit)
         actions.addWidget(self.confirm_button)
-        day_layout.addLayout(actions)
+        day_layout.addWidget(self.classic_confirm_actions)
+        self.confirm_actions = ActionRow(self.daily_body)
+        self.confirm_actions.hide()
 
-        week_layout = QVBoxLayout(self.weekly_tab)
-        self.week_heading = QLabel()
+        self.week_tab_layout = QVBoxLayout(self.weekly_tab)
+        self.week_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.weekly_body = QWidget()
+        self.week_tab_layout.addWidget(self.weekly_body)
+        week_layout = self.week_layout = QVBoxLayout(self.weekly_body)
+        self.week_heading = _WeekHeading()
+        self.week_heading.setTextFormat(Qt.TextFormat.PlainText)
+        self.week_heading.setWordWrap(True)
         self.week_heading.setObjectName('ReviewSummary')
         week_layout.addWidget(self.week_heading)
         self.week_notice = QLabel()
@@ -410,10 +471,21 @@ class ReviewPage(QWidget):
         self.week_notice.setObjectName('Hint')
         week_layout.addWidget(self.week_notice)
         self.week_chart = CoverageChart()
+        self.week_chart_button = self._chart_settings_button('review_weekly_style')
+        week_layout.addWidget(self.week_chart_button)
+        self.week_header_tools = ActionRow(self.weekly_body)
+        self.week_header_tools.hide()
         week_layout.addWidget(self.week_chart)
         self.week_days = WeekDaysChart()
+        self.week_days_button = self._chart_settings_button('weekly_style', '每日图表样式…')
+        week_layout.addWidget(self.week_days_button)
+        self.week_days_tools = ActionRow(self.weekly_body)
+        self.week_days_title = QLabel('逐日回顾')
+        self.week_days_title.setObjectName('SectionHeading')
+        self.week_days_tools.addWidget(self.week_days_title)
+        self.week_days_tools.hide()
         self.week_days.date_selected.connect(self._open_day)
-        week_scroll = QScrollArea()
+        week_scroll = self.week_scroll = QScrollArea()
         week_scroll.setWidgetResizable(True)
         week_scroll.setFrameShape(QFrame.Shape.NoFrame)
         week_scroll.setWidget(self.week_days)
@@ -425,8 +497,135 @@ class ReviewPage(QWidget):
         week_layout.addWidget(self.week_error)
         self._render_daily()
 
+    @staticmethod
+    def _empty_layout(layout):
+        while layout.count():
+            layout.takeAt(0)
+
+    def apply_visual_style(self, selected=None):
+        """Move existing controls only; preserve drafts, selection and callbacks."""
+        style = visual_style() if selected is None else selected
+        if style not in ('classic', 'glass'):
+            raise ValueError('Unsupported review visual style')
+        if style == self._visual_style:
+            for layout in (self.day_layout, self.week_layout):
+                layout.invalidate()
+            self.updateGeometry()
+            return
+        modern = style == 'glass'
+        leaves = (self.header_title, self.date_navigation, self.refresh_button,
+                  self.daily_heading, self.notice, self.feedback_button, self.notes_button,
+                  self.feedback_history_button, self.codex_button, self.daily_chart_button,
+                  self.daily_chart, self.saved_hint, self.rows, self.message, self.pending_label,
+                  self.reload_button, self.confirm_button, self.week_heading, self.week_notice,
+                  self.week_chart_button, self.week_chart, self.week_days_button, self.week_days,
+                  self.week_error)
+        hidden = {widget: widget.isHidden() for widget in leaves}
+        scroll_positions = [(scroll.horizontalScrollBar().value(), scroll.verticalScrollBar().value())
+                            for scroll in (self.scroll, self.week_scroll)]
+        # The same public scroll areas stay visible in either mode. Taking their
+        # contents before moving them prevents nested scrolling or parent cycles.
+        for scroll in (self.scroll, self.week_scroll):
+            scroll.takeWidget()
+        for layout in (self.day_layout, self.week_layout, self.day_tab_layout, self.week_tab_layout,
+                       self.classic_header.layout(), self.header_actions.layout(),
+                       self.classic_manual_actions.layout(), self.daily_actions.layout(),
+                       self.classic_confirm_actions.layout(), self.confirm_actions.layout(),
+                       self.daily_chart_tools.layout(), self.week_header_tools.layout(),
+                       self.week_days_tools.layout()):
+            self._empty_layout(layout)
+
+        header = self.header_actions if modern else self.classic_header.layout()
+        for widget in (self.header_title, self.date_navigation, self.refresh_button):
+            header.addWidget(widget)
+        if not modern:
+            self.classic_header.layout().setStretch(0, 1)
+        manual = self.daily_actions if modern else self.classic_manual_actions.layout()
+        for widget in (self.feedback_button, self.notes_button):
+            manual.addWidget(widget)
+        if modern:
+            for widget in (self.feedback_history_button, self.codex_button):
+                manual.addWidget(widget)
+            for widget in (self.daily_chart_title, self.daily_chart_button):
+                self.daily_chart_tools.addWidget(widget)
+            for widget in (self.week_heading, self.week_chart_button):
+                self.week_header_tools.addWidget(widget)
+            for widget in (self.week_days_title, self.week_days_button):
+                self.week_days_tools.addWidget(widget)
+            for widget in (self.confirm_button, self.reload_button):
+                self.confirm_actions.addWidget(widget)
+            daily_widgets = (self.daily_heading, self.notice, self.daily_actions, self.daily_chart_tools,
+                             self.daily_chart, self.saved_hint, self.rows, self.message,
+                             self.pending_label, self.confirm_actions)
+            weekly_widgets = (self.week_header_tools, self.week_notice, self.week_chart,
+                              self.week_days_tools, self.week_days, self.week_error)
+        else:
+            footer = self.classic_confirm_actions.layout()
+            footer.addWidget(self.reload_button)
+            footer.addStretch()
+            footer.addWidget(self.confirm_button)
+            daily_widgets = (self.daily_heading, self.notice, self.classic_manual_actions,
+                             self.feedback_history_button, self.codex_button, self.daily_chart_button,
+                             self.daily_chart, self.saved_hint, self.scroll, self.message,
+                             self.pending_label, self.classic_confirm_actions)
+            weekly_widgets = (self.week_heading, self.week_notice, self.week_chart_button,
+                              self.week_chart, self.week_days_button, self.week_scroll, self.week_error)
+        for tab_layout, body, body_layout, scroll, content, widgets in (
+                (self.day_tab_layout, self.daily_body, self.day_layout, self.scroll, self.rows, daily_widgets),
+                (self.week_tab_layout, self.weekly_body, self.week_layout, self.week_scroll, self.week_days, weekly_widgets)):
+            if modern:
+                scroll.setParent(tab_layout.parentWidget())
+            else:
+                body.setParent(tab_layout.parentWidget())
+                scroll.setParent(body)
+                scroll.setWidget(content)
+            for widget in widgets:
+                body_layout.addWidget(widget, 1 if not modern and widget is scroll else 0)
+            if modern:
+                body_layout.addStretch()
+                scroll.setWidget(body)
+                tab_layout.addWidget(scroll)
+            else:
+                tab_layout.addWidget(body)
+            body_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            body.show()
+            scroll.show()
+        for widget in (self.header_actions, self.daily_actions, self.daily_chart_tools,
+                       self.confirm_actions, self.week_header_tools, self.week_days_tools):
+            widget.setVisible(modern)
+        for widget in (self.classic_header, self.classic_manual_actions, self.classic_confirm_actions):
+            widget.setVisible(not modern)
+        for widget, was_hidden in hidden.items():
+            widget.setVisible(not was_hidden)
+        for widget in (self.notes_button, self.feedback_history_button, self.codex_button):
+            widget.setObjectName('QuietButton' if modern else '')
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.updateGeometry()
+        self._visual_style = style
+        self.daily_chart_tools.setVisible(modern and not self.daily_chart.isHidden())
+        for scroll, (horizontal, vertical) in zip((self.scroll, self.week_scroll), scroll_positions):
+            scroll.horizontalScrollBar().setValue(horizontal)
+            scroll.verticalScrollBar().setValue(vertical)
+        self.updateGeometry()
+
     def set_weekly_style(self, style):
         self.week_days.set_style(style)
+        self.chart_preferences['weekly_style'] = style
+
+    def _chart_settings_button(self, key, label='图表样式…'):
+        button = QPushButton(label)
+        button.setObjectName('QuietButton')
+        button.setAccessibleName('设置' + {'review_daily_style': '每日复盘', 'review_weekly_style': '每周汇总', 'weekly_style': '每周每日分布'}[key] + '图表样式')
+        button.clicked.connect(lambda checked=False: self.chart_settings_requested.emit(key))
+        return button
+
+    def set_chart_preferences(self, preferences):
+        """Restyle saved summaries without changing pending feedback or querying data."""
+        self.chart_preferences = normalize_chart_preferences(preferences, current=self.chart_preferences)
+        self.daily_chart.set_style(self.chart_preferences['review_daily_style'])
+        self.week_chart.set_style(self.chart_preferences['review_weekly_style'])
+        self.week_days.set_style(self.chart_preferences['weekly_style'])
 
     def set_assistants_visible(self, visible):
         self._assistants_visible = bool(visible)
@@ -596,6 +795,7 @@ class ReviewPage(QWidget):
         self.codex_button.setEnabled(self.on_codex is not None)
         self.confirm_button.setVisible(has_plan)
         self.daily_chart.setVisible(has_plan)
+        self.daily_chart_tools.setVisible(self._visual_style == 'glass' and has_plan)
         self.saved_hint.setVisible(has_plan)
         if not known:
             self.daily_heading.setText(self._date + ' · 正在读取计划')
@@ -630,7 +830,7 @@ class ReviewPage(QWidget):
         title.setFont(font)
         layout.addWidget(title)
         if item.get('owner_label'):
-            owner = QLabel(item['owner_label']); owner.setObjectName('StatusPill'); owner.setTextFormat(Qt.TextFormat.PlainText); layout.addWidget(owner)
+            owner = QLabel(item['owner_label']); owner.setObjectName('StatusPill'); owner.setTextFormat(Qt.TextFormat.PlainText); owner.setWordWrap(True); layout.addWidget(owner)
         if item.get('completion_gate'):
             gate = QLabel(('记录说明：' if item.get('fixed_schedule') else '完成条件：') + str(item['completion_gate']))
             gate.setWordWrap(True)
@@ -645,12 +845,13 @@ class ReviewPage(QWidget):
         if detail:
             label = QLabel(' · '.join(detail))
             label.setObjectName('Hint')
+            label.setWordWrap(True)
             layout.addWidget(label)
         status = QLabel()
         status.setWordWrap(True)
         status.setObjectName('Hint')
         layout.addWidget(status)
-        choices = QHBoxLayout()
+        choices = ActionRow()
         buttons = {}
         for result, label in item.get('choices', [('done', '完成'), ('incomplete', '未完成')]):
             button = QPushButton(label)
@@ -664,7 +865,7 @@ class ReviewPage(QWidget):
             choices.addWidget(button)
             buttons[result] = button
         choices.addStretch()
-        layout.addLayout(choices)
+        layout.addWidget(choices)
         self.item_buttons[target], self.item_labels[target] = buttons, status
         self.rows_layout.addWidget(card)
         self._update_row(item)

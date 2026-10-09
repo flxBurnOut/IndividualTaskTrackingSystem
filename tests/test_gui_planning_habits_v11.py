@@ -96,9 +96,14 @@ def test_habits_hide_raw_rules_and_secondary_controls_until_requested(app,tmp_pa
         wait(app,lambda:bridge.pending==0)
         assert panel.prep_details.isHidden() and panel.rule_details.isHidden()
         assert panel.codex_preparation.isEnabled() and panel.codex_preparation.text()=='请助手建议准备规则'
-        assert panel.prep_toggle.objectName()=='Primary' and panel.new_rule_button.objectName()=='Primary'
+        assert panel.prep_toggle.isCheckable() and not panel.prep_toggle.isChecked()
+        assert panel.new_rule_button.objectName()=='Primary'
         visible=[b for b in panel.findChildren(QPushButton) if b.isVisible()]
         assert len(visible)<=6
+        panel.prep_toggle.click()
+        assert panel.prep_details.isVisible() and panel.prep_toggle.isChecked()
+        panel.prep_toggle.click()
+        assert panel.prep_details.isHidden() and not panel.prep_toggle.isChecked()
         panel.rules_toggle.click()
         assert panel.rule_details.isVisible() and '何时安排一天、累了怎么安排' in panel.rules.item(0).text()
         assert 'Only plan' not in panel.rule_info.text()

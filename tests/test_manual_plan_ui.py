@@ -10,6 +10,7 @@ from management.core import Core
 from management.gui_plan_drafts import PlanDrafts, DraftConflict
 from management.gui_workflows import PlanDialog
 from management.gui_today import TodayPage
+from management.gui_visual_profile import set_visual_style, visual_style
 from test_ux_workflows_v2 import ControlledBridge, QueuedCoreBridge, wait, cmd
 
 
@@ -203,16 +204,20 @@ def test_save_is_single_flight_and_failure_keeps_draft(app):
     finally:close(dialog,app)
 
 
-def test_today_empty_state_is_manually_actionable_without_assistant(app):
+@pytest.mark.parametrize('style',['classic','glass'])
+def test_today_empty_state_is_manually_actionable_without_assistant(app,style):
+    previous=visual_style();set_visual_style(style)
     bridge=ControlledBridge();opened=[];page=TodayPage(bridge,on_manual=opened.append)
     try:
         page.review_result={'has_plan':False,'can_review':False}
         page.render_plan(page.review_result)
         assert page.plan_button.isHidden()
-        buttons=[page.plan_layout.itemAt(i).widget() for i in range(page.plan_layout.count())]
+        buttons=page.plan_box.findChildren(QPushButton)
         manual=next(w for w in buttons if isinstance(w,QPushButton) and w.text()=='安排这一天')
         manual.click();assert opened==[page.date_iso()]
         page.set_assistants_visible(True);assert not page.plan_button.isHidden()
         page.set_assistants_visible(False);assert page.plan_button.isHidden()
         assert page.manual_button.isEnabled()
-    finally:page.close();page.deleteLater();app.processEvents()
+    finally:
+        page.close();page.deleteLater();app.processEvents()
+        set_visual_style(previous)
