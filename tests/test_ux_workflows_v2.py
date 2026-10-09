@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QPushButton
 from management.core import Core
 from management.gui_assistant import AssistanceDialog
 from management.gui_forms import EntityForm
-from management.gui_workflows import SettingsDialog
+from management.gui_workflows import HabitsDialog
 from management.schemas import BusinessError
 from management.storage import encode
 
@@ -109,7 +109,7 @@ def proposal(id='job-a',title='Synthetic candidate',status='awaiting_review'):
 @pytest.fixture
 def settings_dialog(app,tmp_path):
     bridge=ControlledBridge()
-    dialog=SettingsDialog(bridge,{'types':[]},tmp_path/'synthetic')
+    dialog=HabitsDialog(bridge,{'types':[]})
     dialog.show()
     yield dialog,bridge
     dialog.close()
@@ -189,7 +189,7 @@ def test_reminder_failed_save_retains_user_values(settings_dialog):
 def test_real_settings_round_trip_reuses_two_schedules_and_does_not_enable_defaults(app,tmp_path):
     core=Core(tmp_path/'settings-core')
     bridge=QueuedCoreBridge(core)
-    dialog=SettingsDialog(bridge,core.query('capabilities'),core.root)
+    dialog=HabitsDialog(bridge,core.query('capabilities'))
     reopened=None
     try:
         wait(app,lambda:bridge.pending==0)
@@ -209,7 +209,7 @@ def test_real_settings_round_trip_reuses_two_schedules_and_does_not_enable_defau
         save_button(dialog).click()
         wait(app,lambda:bridge.pending==0)
         assert {s['id'] for s in core.query('list',type='schedule')['items']}==ids
-        reopened=SettingsDialog(bridge,core.query('capabilities'),core.root)
+        reopened=HabitsDialog(bridge,core.query('capabilities'))
         wait(app,lambda:bridge.pending==0)
         assert reopened.daily_time.time().toString('HH:mm')=='22:35'
         assert reopened.weekly_day.currentIndex()==4
@@ -440,3 +440,23 @@ def test_real_candidate_confirmation_and_same_scope_reopen_without_model(app,tmp
     finally:
         dialog.close()
         if reopened:reopened.close()
+
+
+def test_habit_child_save_advances_only_its_own_reminder_snapshot(settings_dialog):
+    dialog, bridge = settings_dialog
+    bridge.deliver('review_preferences', preference(revision=10))
+    dialog.daily_time.setTime(QTime(23, 15))
+    dialog.saved({'epoch': 'synthetic-epoch', 'revision': 11})
+    assert dialog.preferences_revision == 11
+    assert dialog.daily_time.time().toString('HH:mm') == '23:15'
+    dialog.saved({'epoch': 'synthetic-epoch', 'revision': 14})
+    assert dialog.preferences_revision == 11
+    dialog.save_review_times()
+    assert bridge.commands[-1]['options']['expected_revision'] == 11
+
+
+def test_standalone_habits_without_path_explains_assistant_settings(settings_dialog):
+    dialog, bridge = settings_dialog
+    assert dialog.data_dir is None
+    assert dialog.habits.open_provider_settings() is None
+    assert 'Codex 协助页' in dialog.habits.note.text()

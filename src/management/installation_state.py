@@ -40,6 +40,9 @@ def installed_data_dir(executable=None):
 
 def remember_installed_data_dir(data_dir, executable):
     """Only a registered installation may change its next-upgrade selection."""
+    from .data_space import CHANNEL
+    if CHANNEL == 'beta':
+        return  # Beta must never change the stable installation's registry.
     if installed_data_dir(executable) is None:
         return
     import winreg
@@ -51,7 +54,8 @@ def remember_installed_data_dir(data_dir, executable):
 def resume_after_update(data_dir):
     """An explicit GUI launch resumes a stopped space, never a background MCP."""
     from .runtime import OwnerLock, read_startup_failure, start_service
-    root = Path(data_dir).resolve()
+    from .data_space import require_beta_dir
+    root = require_beta_dir(data_dir)
     marker = root / 'update_pending.json'
     if not marker.exists():
         return

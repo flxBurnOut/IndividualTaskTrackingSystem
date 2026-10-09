@@ -69,7 +69,7 @@ def test_note_cards_route_to_course_skill_without_writing_notes(app):
     try:
         course=render_course(page,[note])
         assert 'Original content stays unchanged.' in words(page)
-        next(b for b in page.findChildren(QPushButton) if b.text()=='整理课件笔记').click()
+        next(b for b in page.findChildren(QPushButton) if b.text()=='请助手整理课件笔记').click()
         assert calls==[((course,),{'intent':'course_notes'})] and bridge.commands==[]
         page.discuss_note(note);bridge.deliver('get',{'entity':course})
         assert calls[-1]==((course,),{'intent':'course_notes'})

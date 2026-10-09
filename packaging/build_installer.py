@@ -87,7 +87,7 @@ def validate_package(package: Path, version: str) -> list[dict]:
         if not (package / name).is_file():
             raise ValueError(f"Missing release input: {name}")
     forbidden = {".codex", ".agents", ".git", ".venv", ".analysis", ".test-output", "auth.json", "runtime.json", "service.lock", "restore_pending.json", "restore_reconciled.json",
-                 "upgrade-backups", "upgrade-state.json", "schema-upgrade.lock", "update_pending.json", "update_pending.json.new", "startup_failure.json", "startup_failure.json.new", "gui.lock", "tray.lock", "tray-status.json", "tray-status.json.new", "ui-onboarding.json"}
+                 "upgrade-backups", "upgrade-state.json", "schema-upgrade.lock", "update_pending.json", "update_pending.json.new", "startup_failure.json", "startup_failure.json.new", "gui.lock", "tray.lock", "tray-status.json", "tray-status.json.new", "ui-onboarding.json", "ui-plan-drafts"}
     entries = []
     for path in sorted(package.rglob("*")):
         plain_path(path)
@@ -162,6 +162,8 @@ def compiler_path(explicit: Path | None, bootstrap: bool) -> tuple[Path, str]:
 
 
 def main() -> None:
+    from management.data_space import require_packaged_channel
+    require_packaged_channel()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", default=None, help="Must match source and all release executable versions")
     parser.add_argument("--iscc", type=Path)

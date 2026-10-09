@@ -2,10 +2,12 @@
 from __future__ import annotations
 import datetime as dt
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QComboBox,
+from PySide6.QtWidgets import (QWidget,QVBoxLayout,QComboBox,QFrame,QLayout,QSizePolicy,
  QCheckBox,QDateEdit,QListWidget,QListWidgetItem,QPushButton,QLabel,QMessageBox,QScrollArea)
 from shiboken6 import isValid
 from .gui_calendar import install_calendar
+from .gui_layout import ActionRow
+from .gui_theme import bind_theme
 
 
 class TimetableSettingsPage(QWidget):
@@ -14,27 +16,70 @@ class TimetableSettingsPage(QWidget):
         self.bridge,self.on_changed=bridge,on_changed
         self.generation=0;self.pending=False;self.loading=False;self.dirty=False;self.ready=False
         self.entity=None;self.rows=[];self.selected_id=None;self.epoch=self.revision=None;self.table_offset=0
-        outer=QVBoxLayout(self)
+        outer=QVBoxLayout(self);outer.setContentsMargins(0,0,0,0)
+        self.scroll=QScrollArea();self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame);self.scroll.setMinimumSize(0,0)
+        body=QWidget();layout=QVBoxLayout(body);layout.setSpacing(22)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.scroll.setWidget(body);outer.addWidget(self.scroll,1)
+
+        def section(title):
+            group=QWidget();content=QVBoxLayout(group);content.setContentsMargins(0,0,0,0);content.setSpacing(9)
+            heading=QLabel(title);heading.setObjectName('SectionHeading');content.addWidget(heading)
+            layout.addWidget(group)
+            return content
+
+        scope_section=section('维护范围')
         self.scope=QComboBox();self.scope.addItem('新课表的默认设置',None)
-        row=QHBoxLayout();row.addWidget(self.scope,1);self.more=QPushButton('更多课表');self.more.hide();row.addWidget(self.more);outer.addLayout(row)
-        scroll=QScrollArea();scroll.setWidgetResizable(True);body=QWidget();layout=QVBoxLayout(body);scroll.setWidget(body);outer.addWidget(scroll,1)
-        self.hint=QLabel();self.hint.setWordWrap(True);self.hint.setObjectName('Hint');layout.addWidget(self.hint)
-        form=QFormLayout();self.timezone=QComboBox();self.timezone.setEditable(True)
+        self.scope.setAccessibleName('要维护的课表')
+        self.scope.setMinimumContentsLength(14)
+        self.scope.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.more=QPushButton('更多课表');self.more.hide()
+        scope_actions=ActionRow();scope_actions.addWidget(self.scope);scope_actions.addWidget(self.more)
+        scope_section.addWidget(scope_actions)
+        self.hint=QLabel();self.hint.setWordWrap(True);self.hint.setObjectName('Hint');scope_section.addWidget(self.hint)
+
+        time_section=section('时间与教学周')
+        self.timezone=QComboBox();self.timezone.setEditable(True);self.timezone.setAccessibleName('时区')
+        self.timezone.setMinimumContentsLength(17)
+        self.timezone.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.timezone.addItems(['Asia/Shanghai','Asia/Singapore','UTC','Asia/Tokyo','Europe/London','America/New_York'])
-        form.addRow('时区',self.timezone)
-        self.skip_recess=QCheckBox('Recess week 不计入教学周');self.skip_recess.setChecked(True);form.addRow(self.skip_recess);layout.addLayout(form)
-        text=QLabel('填入校历确认的 recess week。该周不安排课程；勾选后，假期结束接着上一教学周计数。');text.setWordWrap(True);layout.addWidget(text)
-        dates=QHBoxLayout();self.recess_date=QDateEdit(QDate.currentDate());install_calendar(self.recess_date);self.recess_date.setDisplayFormat('yyyy/MM/dd');dates.addWidget(self.recess_date,1)
-        self.add=QPushButton('加入这一周');dates.addWidget(self.add);layout.addLayout(dates)
-        self.weeks=QListWidget();self.weeks.setMaximumHeight(160);layout.addWidget(self.weeks)
-        self.remove=QPushButton('移除选中周');layout.addWidget(self.remove)
-        self.effect=QLabel();self.effect.setWordWrap(True);self.effect.setObjectName('Hint');layout.addWidget(self.effect);layout.addStretch()
+        timezone_row=ActionRow();timezone_row.addWidget(QLabel('时区'));timezone_row.addWidget(self.timezone)
+        time_section.addWidget(timezone_row)
+        self.skip_recess=QCheckBox('停课周不计入教学周');self.skip_recess.setChecked(True);time_section.addWidget(self.skip_recess)
+
+        recess_section=section('停课周')
+        text=QLabel('按校历添加停课周（Recess week）。该周不安排课程；启用上方规则时，假期后继续计算教学周。')
+        text.setWordWrap(True);text.setObjectName('Hint');recess_section.addWidget(text)
+        dates=ActionRow();self.recess_date=QDateEdit(QDate.currentDate());install_calendar(self.recess_date)
+        self.recess_date.setDisplayFormat('yyyy/MM/dd');self.recess_date.setAccessibleName('停课周内任意一天')
+        dates.addWidget(self.recess_date);self.add=QPushButton('加入这一周');dates.addWidget(self.add);recess_section.addWidget(dates)
+        self.weeks=QListWidget();self.weeks.setAccessibleName('已设置的停课周')
+        recess_section.addWidget(self.weeks)
+        self.remove=QPushButton('移除选中周');remove_row=ActionRow();remove_row.addWidget(self.remove);recess_section.addWidget(remove_row)
+        self.effect=QLabel();self.effect.setWordWrap(True);self.effect.setObjectName('Hint');recess_section.addWidget(self.effect)
+        layout.addStretch()
         self.status=QLabel();self.status.setWordWrap(True);outer.addWidget(self.status)
-        buttons=QHBoxLayout();self.save_button=QPushButton('保存课表设置');self.save_button.setObjectName('Primary');buttons.addWidget(self.save_button)
-        self.reload_button=QPushButton('重新读取');buttons.addWidget(self.reload_button);buttons.addStretch();outer.addLayout(buttons)
+        self.actions=ActionRow();self.save_button=QPushButton('保存课表设置');self.save_button.setObjectName('Primary');self.actions.addWidget(self.save_button)
+        self.reload_button=QPushButton('重新读取');self.actions.addWidget(self.reload_button);outer.addWidget(self.actions)
+        for control in (self.scope,self.timezone,self.recess_date):
+            control.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Fixed)
         self.scope.currentIndexChanged.connect(self.scope_changed);self.timezone.currentTextChanged.connect(self.edited);self.skip_recess.toggled.connect(self.edited)
         self.add.clicked.connect(self.add_week);self.remove.clicked.connect(self.remove_week);self.save_button.clicked.connect(self.save);self.reload_button.clicked.connect(self.reload);self.more.clicked.connect(self.load_tables)
         self.started=False;self.enable(False)
+        bind_theme(self,self.fit_fields);self.fit_fields()
+
+    def fit_fields(self):
+        # Keep fields legible after a live font change without stretching them
+        # across the panel. ActionRow wraps their neighbouring buttons as needed.
+        for control in (self.scope,self.timezone,self.recess_date):
+            control.setMinimumWidth(0)
+            control.setMinimumHeight(control.fontMetrics().height()+18)
+            control.updateGeometry()
+        row_width=self.weeks.fontMetrics().horizontalAdvance('2030-01-21 — 2030-01-27')+52
+        self.weeks.setMinimumWidth(0);self.weeks.setMaximumWidth(row_width)
+        self.weeks.setMaximumHeight(max(120,self.weeks.fontMetrics().height()*5+20))
+        self.scroll.widget().updateGeometry();self.actions.updateGeometry()
 
     def showEvent(self,event):
         super().showEvent(event)

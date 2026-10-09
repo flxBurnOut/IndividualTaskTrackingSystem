@@ -144,6 +144,32 @@ def query_daily(core, c, p):
     return _daily(core, c, _date(p['date']))
 
 
+def query_actual_feedback(core, c, p):
+    """Dated, immutable feedback history, separate from planned completion rates."""
+    day = _date(p.get('date'))
+    limit, offset = p.get('limit', 30), p.get('offset', 0)
+    if type(limit) is not int or type(offset) is not int or not 1 <= limit <= 100 or offset < 0:
+        raise BusinessError('validation', '实际记录分页参数无效。')
+    where = "f.type='feedback' AND f.archived=0 AND json_extract(f.data,'$.business_date')=?"
+    total = c.execute('SELECT count(*) FROM entities f WHERE ' + where, (day,)).fetchone()[0]
+    items = []
+    for row in c.execute("SELECT f.*,t.title AS target_title,t.type AS target_type,t.archived AS target_archived "
+                         "FROM entities f LEFT JOIN entities t ON t.id=json_extract(f.data,'$.target_id') WHERE "
+                         + where + ' ORDER BY f.created_at DESC,f.rowid DESC LIMIT ? OFFSET ?', (day, limit, offset)):
+        feedback = core.store.entity(row)
+        data = feedback['data']
+        dimensions = data.get('dimensions') or {}
+        items.append({'id': feedback['id'], 'business_date': day, 'target_id': data.get('target_id'),
+                      'target_title': row['target_title'] or feedback['title'], 'target_type': row['target_type'],
+                      'target_available': row['target_title'] is not None,
+                      'target_archived': bool(row['target_archived']), 'dimensions': dimensions,
+                      'actual_minutes': dimensions.get('actual_minutes'), 'source_text': data.get('source_text', ''),
+                      'reported_at': data.get('reported_at') or feedback['created_at'],
+                      'supersedes_id': data.get('supersedes_id')})
+    return {'date': day, 'items': items, 'total': total,
+            'next_offset': offset + len(items) if offset + len(items) < total else None}
+
+
 def query_weekly(core, c, p):
     start, end = _date(p['start']), _date(p['end'])
     first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
@@ -204,7 +230,7 @@ def submit_daily(core, c, p, rid):
     plan = _latest_plan(core, c, day)
     daily = _daily(core,c,day,plan=plan,plan_loaded=True)
     if not daily['can_review']:
-        raise BusinessError('review_no_plan','这一天没有计划或固定安排，请到 Codex 按实际情况复盘。',{'date':day,'needs_codex':True})
+        raise BusinessError('review_no_plan','这一天没有计划或固定安排。请在复盘页选择“记录实际情况”，为任务或日程填写反馈，也可以写下文字小结。',{'date':day,'needs_codex':True})
     if (plan and (p.get('plan_id') != plan['id'] or type(p.get('plan_version')) is not int or p['plan_version'] != plan['version'])) or (not plan and p.get('plan_id') is not None):
         raise BusinessError('review_plan_conflict','每日计划已经更新，请保留你的选择并重新读取后核对。')
     from . import occurrences
@@ -223,7 +249,7 @@ def submit_daily(core, c, p, rid):
         if item.get('target_archived'):
             raise BusinessError('task_deleted','这项记录已删除，历史反馈保留。请先恢复再更正。')
         if not item.get('available'):
-            raise BusinessError('not_found','原计划对象已不可用，请到 Codex 核对。')
+            raise BusinessError('not_found','原计划对象已不可用，请先核对原任务或日程；实际发生的情况仍可保存为文字小结。')
         if item.get('fixed_schedule'):
             if p.get('schedule_signature') != daily['schedule_signature']:
                 raise BusinessError('review_plan_conflict','课表或本次反馈已更新，请重新读取后核对。')

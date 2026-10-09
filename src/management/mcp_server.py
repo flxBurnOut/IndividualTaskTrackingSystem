@@ -1,6 +1,7 @@
 """Typed MCP tools backed exclusively by the independent business service."""
 from __future__ import annotations
 from . import __version__
+from .branding import APP_NAME
 
 import argparse
 import hashlib
@@ -19,7 +20,7 @@ from .mcp_pages import PAGE_QUERIES, PageQuery, page as business_page, validate_
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 INSTRUCTIONS = (
-    "个人事务业务接口。每个新任务及每轮业务处理先读取最新上下文。所有写入经业务命令，"
+    "个人事务管理 Beta 测试版业务接口，仅连接独立 Beta 数据空间。每个新任务及每轮业务处理先读取最新上下文。所有写入经业务命令，"
     "必须携带读取所得 epoch、revision 和唯一 request_id；重试使用同一 ID 与同一内容。"
     "旧聊天不是当前事实。未确认保持未知，完成/出席/学习/提交/掌握分别记录。"
     "事实更新不自动重排计划。不要访问数据库、工作簿或生成写库脚本。普通操作由你推理，"
@@ -34,7 +35,8 @@ QueryName = Literal[
     "codex_connection", "timetables", "timetable_week",
     "skills", "habits_overview", "dashboard",
     "recovery_summary",
-    "daily_tasks", "recurring_rules", "preview_recurring", "codex_models",
+    "daily_tasks", "task_pool", "actual_feedback", "preview_task_batch",
+    "recurring_rules", "preview_recurring", "codex_models",
     "sources", "source_content", "conversation", "library_folder", "library_destinations",
     "daily_review", "weekly_review", "review_preferences", "object_workspace", "workspace_tasks", "open_resource", "operation",
     "state", "capabilities", "list", "get", "changes", "today", "plan_context",
@@ -46,6 +48,7 @@ CommandName = Literal[
     "attach_conversation",
     "set_task_completion", "revise_plan",
     "delete_task", "restore_task",
+    "create_task_batch", "split_task",
     "apply_timetable",
     "set_recovery_task", "record_recovery_progress", "correct_recovery_scope",
     "add_to_plan", "set_recurring_rule", "materialize_recurring",
@@ -183,7 +186,7 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
     if client is None:
         from .client import Client
         client = Client(data_dir, entrance='mcp')
-    server = RoutedMCPServer("personal-management", title="个人事务管理", version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
+    server = RoutedMCPServer("personal-management", title=APP_NAME, version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
     routing = DiscussionRouting(server, client)
 
     def raw_capabilities() -> dict[str, Any]:
@@ -496,8 +499,8 @@ def run(data_dir: str | Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="个人事务管理 MCP 接口（标准输入输出）")
-    parser.add_argument("--data-dir", required=True, help="与桌面客户端相同的数据目录")
+    parser = argparse.ArgumentParser(description=APP_NAME + " MCP 接口（标准输入输出）")
+    parser.add_argument("--data-dir", required=True, help="与 Beta 桌面客户端相同的独立 Beta 数据目录")
     args = parser.parse_args()
     run(args.data_dir)
 

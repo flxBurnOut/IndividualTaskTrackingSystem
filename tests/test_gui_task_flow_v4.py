@@ -206,3 +206,120 @@ def test_real_recurring_form_generates_candidate_without_plan_or_feedback(app,tm
         rules=core.query('recurring_rules',anchor_id=event['id'])['items']
         assert rules[0]['data']['enabled'] is False and core.query('list',type='task')['total']==1
     finally:dialog.saving=False;dialog.allow_close=True;dialog.close()
+
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_today_chinese_warning_and_empty_plan_text_fit_after_resize(app, font_size):
+    """Measure rendered labels at their actual width, not the section width.
+
+    A left-aligned layout item can be narrower than the width Qt used for its
+    height-for-width calculation. That previously cut off warning dates and
+    the empty-plan explanation even on a maximized window.
+    """
+    from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QFrame
+    from management.gui_theme import apply_appearance, current_appearance
+    from management.gui_visual_profile import set_visual_style, visual_style
+
+    old_style, old_appearance = visual_style(), current_appearance()
+    set_visual_style('glass')
+    apply_appearance(app, {'theme': 'dark', 'font_size': font_size})
+    bridge = ControlledBridge()
+    page = TodayPage(bridge, on_task=lambda identifier: None)
+    page.render_plan({'has_plan': False, 'can_review': False})
+    page.warning_result = {'items': [
+        {'id': 'warning-one', 'owner_label': '【演示】信息展示原型',
+         'title': '【演示】根据提纲绘制展示卡片并核对文字说明',
+         'reason': '截止日期：2030-01-09。需要核对演示材料和说明文字，并保留未确认的细节。'},
+        {'id': 'warning-two', 'owner_label': '【演示】信息展示原型',
+         'title': '【演示】整理下一轮访谈问题', 'reason': '截止日期：\n2030-01-10'},
+    ], 'total': 2}
+    page.today_result = {'notifications': [
+        {'id': 'reminder-one', 'title': '回顾今天的实际安排与未完成事项', 'version': 1,
+         'data': {'content': '只记录已经发生的情况，不把尚未核对的任务当作完成。\n保留明天继续处理的事项。'}},
+    ], 'unknowns': []}
+    page.render_attention()
+    page.render_tasks({'items': [], 'total': 0, 'next_offset': None})
+    page.render_events([])
+
+    def settle():
+        for _ in range(6):
+            app.processEvents()
+            QTest.qWait(10)
+
+    def assert_label_fits(label):
+        rect = label.contentsRect()
+        required = label.fontMetrics().boundingRect(
+            QRect(0, 0, rect.width(), 100000),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+            label.text(),
+        ).height()
+        assert rect.height() >= required, (
+            label.objectName(), label.text(), rect.getRect(), required,
+            label.heightForWidth(label.width()),
+        )
+        assert label.height() >= label.heightForWidth(label.width())
+        parent = label.parentWidget()
+        assert parent.rect().contains(label.geometry()), (label.text(), label.geometry(), parent.rect())
+
+    try:
+        page.show()
+        for width in (1700, 820, 1280):
+            page.resize(width, 900)
+            settle()
+            assert page.scroll.horizontalScrollBar().maximum() == 0
+            labels = [label for section in (page.plan_box, page.attention_box, page.tasks_box)
+                      for label in section.findChildren(QLabel) if label.isVisible() and label.text()]
+            assert any(label.objectName() == 'AttentionText' for label in labels)
+            assert any('未定日期的任务' in label.text() for label in labels)
+            for label in labels:
+                assert_label_fits(label)
+            for row in page.attention_box.findChildren(QFrame, 'TimelineRow'):
+                children = [child for child in row.findChildren(QLabel) if child.isVisible()]
+                assert all(row.rect().contains(QRect(child.mapTo(row, child.rect().topLeft()), child.size()))
+                           for child in children)
+        assert bridge.commands == []
+    finally:
+        page.close()
+        page.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        set_visual_style(old_style)
+        apply_appearance(app, old_appearance)
+
+
+def test_preparation_anchor_confirmation_fits_large_font_without_sideways_scroll(app):
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QScrollArea
+    from management.gui_recurring import RecurringDialog
+    from management.gui_theme import apply_appearance, current_appearance
+
+    previous = current_appearance()
+    apply_appearance(app, {**previous, 'font_size': 20})
+    bridge = ControlledBridge()
+    dialog = RecurringDialog(bridge, {'id': 'event', 'type': 'event', 'title': '演示课程'})
+    try:
+        dialog.content.setPlainText('尚未保存的课前准备内容')
+        dialog.ack.show()
+        dialog.show()
+        for width in (900, 590, 900):
+            dialog.resize(width, 680)
+            QTest.qWait(50)
+            scroll = dialog.findChild(QScrollArea)
+            scroll.ensureWidgetVisible(dialog.ack)
+            app.processEvents()
+            assert scroll.horizontalScrollBar().maximum() == 0
+            assert dialog.ack.width() >= dialog.ack.sizeHint().width()
+            assert dialog.ack.height() >= dialog.ack.sizeHint().height()
+            assert scroll.viewport().rect().contains(dialog.ack.mapTo(scroll.viewport(), dialog.ack.rect().bottomRight()))
+            assert dialog.content.toPlainText() == '尚未保存的课前准备内容'
+        assert not dialog.ack.isChecked() and bridge.commands == []
+    finally:
+        dialog.allow_close = True
+        dialog.close()
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        apply_appearance(app, previous)

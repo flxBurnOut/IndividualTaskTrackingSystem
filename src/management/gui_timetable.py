@@ -20,6 +20,7 @@ from shiboken6 import isValid
 from .gui_calendar import install_calendar
 from .gui_sources import AddSourceDialog, SourcePickerDialog, SourceContentDialog, extraction_label, label, button, UNCONFIRMED_CLOSE_MESSAGE
 from .gui_theme import bind_theme, color
+from .gui_layout import ActionRow
 
 WEEKDAYS = ('周一', '周二', '周三', '周四', '周五', '周六', '周日')
 
@@ -883,12 +884,12 @@ class TimetableRowDialog(QDialog):
         self.exception_toggle = QCheckBox('临时例外：单次停课或改时间'); layout.addWidget(self.exception_toggle)
         self.exception_box = QWidget(); exceptions_layout = QVBoxLayout(self.exception_box); exceptions_layout.setContentsMargins(0, 0, 0, 0)
         self.exception_list = QListWidget(); self.exception_list.setMaximumHeight(115); exceptions_layout.addWidget(self.exception_list)
-        exception_fields = QHBoxLayout(); self.exception_date = QDateEdit(QDate.fromString(timetable['data'].get('semester_start') or dt.date.today().isoformat(), 'yyyy-MM-dd')); self.exception_date.setDisplayFormat('yyyy/MM/dd'); install_calendar(self.exception_date); exception_fields.addWidget(self.exception_date)
+        exception_fields = ActionRow(); self.exception_date = QDateEdit(QDate.fromString(timetable['data'].get('semester_start') or dt.date.today().isoformat(), 'yyyy-MM-dd')); self.exception_date.setDisplayFormat('yyyy/MM/dd'); install_calendar(self.exception_date); exception_fields.addWidget(self.exception_date)
         self.cancelled = QCheckBox('当次停课'); self.cancelled.setChecked(True); exception_fields.addWidget(self.cancelled)
         self.exception_start = QTimeEdit(self.start.time()); self.exception_end = QTimeEdit(self.end.time())
         for widget in (self.exception_start, self.exception_end): widget.setDisplayFormat('HH:mm'); widget.setEnabled(False); exception_fields.addWidget(widget)
         self.cancelled.toggled.connect(lambda checked: (self.exception_start.setEnabled(not checked), self.exception_end.setEnabled(not checked)))
-        exceptions_layout.addLayout(exception_fields); buttons = QHBoxLayout(); buttons.addWidget(button('加入 / 更新这次例外', self.add_exception)); buttons.addWidget(button('移除选中例外', self.remove_exception)); buttons.addStretch(); exceptions_layout.addLayout(buttons)
+        exceptions_layout.addWidget(exception_fields); buttons = ActionRow(); buttons.addWidget(button('加入 / 更新这次例外', self.add_exception)); buttons.addWidget(button('移除选中例外', self.remove_exception)); exceptions_layout.addWidget(buttons)
         layout.addWidget(self.exception_box); self.exception_box.hide(); self.exception_toggle.toggled.connect(self.exception_box.setVisible); self.refresh_exceptions()
         self.status = label('', 'Error'); self.status.hide(); outer.addWidget(self.status)
         controls = QHBoxLayout(); controls.addStretch(); controls.addWidget(button('取消', self.close)); self.save_button = button('保存课程时段', self.save); self.save_button.setObjectName('Primary'); controls.addWidget(self.save_button); outer.addLayout(controls)

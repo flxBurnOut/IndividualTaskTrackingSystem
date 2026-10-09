@@ -53,6 +53,63 @@ def workspace_tasks(core,c,p):
         'next_offset':offset+len(items) if offset+len(items)<total else None}
 
 
+def task_pool(core, c, p):
+    """Global, paged manual candidates; reading never schedules a task."""
+    from .core import date_value
+    from .presentation import Presenter, owner_sort_sql
+    from .reviews import _latest_plan
+    day = date_value(p.get('date') or core.today(c)).isoformat()
+    group = p.get('group', 'open')
+    if group not in {'open', 'done', 'undated', 'due', 'future', 'unowned', 'all'}:
+        raise BusinessError('validation', '任务分组无效。')
+    search = str(p.get('search') or '').strip()[:200]
+    limit, offset = max(1, min(100, int(p.get('limit', 30)))), max(0, int(p.get('offset', 0)))
+    clauses, args = ["e.status NOT IN ('cancelled','draft')"], []
+    if search:
+        clauses.append("e.title LIKE ? ESCAPE '\\'")
+        args.append('%' + search.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
+    if p.get('owner_id'):
+        core.store.get(c, p['owner_id'])
+        clauses.append("e.parent_id IN (WITH RECURSIVE owners(id) AS (SELECT ? UNION SELECT e.id FROM entities e JOIN owners o ON e.parent_id=o.id WHERE e.archived=0) SELECT id FROM owners)")
+        args.append(p['owner_id'])
+    sql = 'SELECT * FROM (' + rows_sql(' AND '.join(clauses), day) + ') pool'
+    open_state = "(completion_state IS NULL OR completion_state!='done')"
+    scheduled = "nullif(json_extract(pool.data,'$.scheduled_date'),'')"
+    due = "nullif(json_extract(pool.data,'$.due_date'),'')"
+    selected = {
+        'all': '1', 'open': open_state, 'done': "completion_state='done'",
+        'undated': f'{open_state} AND {scheduled} IS NULL AND {due} IS NULL',
+        'due': f'{open_state} AND {due}<=?',
+        'future': f'{open_state} AND {due}>?',
+        'unowned': f'{open_state} AND parent_id IS NULL',
+    }[group]
+    if group in {'due', 'future'}:
+        args.append(day)
+    filtered = sql + ' WHERE ' + selected
+    total = c.execute('SELECT count(*) FROM (' + filtered + ')', args).fetchone()[0]
+    date_order = f"min(coalesce({scheduled},'9999-12-31'),coalesce({due},'9999-12-31'))"
+    order = owner_sort_sql('pool') + ' COLLATE NOCASE,' + date_order + ',pool.created_at,pool.id'
+    plan = _latest_plan(core, c, day)
+    planned = {block['target_id'] for block in plan['data'].get('blocks', [])} if plan else set()
+    presenter, items, size = Presenter(core, c), [], 0
+    for row in c.execute(filtered + ' ORDER BY ' + order + ' LIMIT ? OFFSET ?', [*args, limit, offset]):
+        entity = presenter.entity(core.store.entity({key: row[key] for key in ENTITY_COLUMNS}))
+        entity.update(completion_state=row['completion_state'], in_plan=entity['id'] in planned)
+        from .daily_flow import completed_on_or_before
+        dependencies = c.execute("SELECT e.* FROM links l JOIN entities e ON e.id=l.target_id WHERE l.source_id=? AND l.kind='depends_on' ORDER BY e.title,e.id LIMIT 101", (entity['id'],)).fetchall()
+        entity['dependencies_truncated'] = len(dependencies) > 100
+        entity['dependencies'] = [{'id': dep['id'], 'title': dep['title'], 'archived': bool(dep['archived']),
+                                   'completed': completed_on_or_before(core, c, core.store.entity(dep), day)} for dep in dependencies[:100]]
+        cost = len(encode(entity).encode('utf-8'))
+        if items and size + cost > 512000:
+            break
+        items.append(entity)
+        size += cost
+    return {'date': day, 'group': group, 'search': search, 'items': items, 'total': total,
+            'next_offset': offset + len(items) if offset + len(items) < total else None,
+            'plan': {'id': plan['id'], 'version': plan['version'], 'mode': plan['data']['mode']} if plan else None}
+
+
 def summary(core,c,owner_id,exclude_draft=False):
     scope="e.id IN (WITH RECURSIVE scope(id) AS (SELECT ? UNION SELECT child.id FROM entities child JOIN scope ON child.parent_id=scope.id WHERE child.archived=0) SELECT id FROM scope) AND e.status!='cancelled'"
     if exclude_draft:scope+=" AND e.status!='draft'"

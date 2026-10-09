@@ -25,9 +25,9 @@ _SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z')
 _RESERVED = {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
 _FEATURES = ('shell_tool', 'unified_exec', 'apply_patch_freeform', 'js_repl',
              'apps', 'multi_agent', 'skill_mcp_dependency_install', 'hooks')
-_AGENTS = '''# 此事项的受管理讨论
+_AGENTS = '''# Beta 测试版 · 此事项的受管理讨论
 
-这是个人事务管理软件中一个事项的持续讨论，使用中文自然交流。
+这是个人事务管理 Beta 测试版中一个事项的持续讨论，仅连接所属的独立 Beta 数据空间，使用中文自然交流。
 
 本目录的规则覆盖父工作区中“通过普通 personal_management 接口直接保存、更新或办理事务”的流程。
 在本讨论里只使用 personal_management_discussion 提供的业务上下文及候选接口。

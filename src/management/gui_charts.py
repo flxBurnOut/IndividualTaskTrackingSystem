@@ -1,9 +1,9 @@
 """Small native charts with explicit denominators and separate unknown coverage."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from .gui_theme import color, LIGHT
 from .review_display import KIND_LABELS, RESULT_LABELS, label as review_label, color_role
@@ -42,7 +42,7 @@ def display_segments(summary):
         if remaining:rows.append({'key':'other_reported','kind':'task','result':'reported','count':remaining})
         if values['unreported']:rows.append({'key':'unreported','kind':'task','result':'unreported','count':values['unreported']})
     for row in rows:
-        row['label']=review_label(row);row['color']=color_role(row)
+        row['label']=row.get('label') or review_label(row);row['color']=color_role(row)
     return rows
 
 
@@ -82,34 +82,103 @@ class CoverageBar(QWidget):
 
 class CoverageChart(QWidget):
     """Count-based coverage, explicitly not work-volume or mastery progress."""
+    geometry_changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.summary = {}
+        self.chart_style = 'bar'
+        self._updating_geometry = False
         layout = QVBoxLayout(self)
+        self._content_layout = layout
+        # Height is recomputed below using wrapped text at the actual width.
+        # SetMinimumSize would replace that value with a width-free minimum.
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(0, 0, 0, 0)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
         self.heading = QLabel()
         self.heading.setWordWrap(True)
         self.heading.setObjectName('ReviewSummary')
         layout.addWidget(self.heading)
         self.bar = CoverageBar()
         layout.addWidget(self.bar)
+        self.details_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        layout.addLayout(self.details_row)
+        self.ring = CoverageRing()
+        self.ring.geometry_changed.connect(self._reflow)
+        self.details_row.addWidget(self.ring)
+        self.ring.hide()
+        details = QVBoxLayout()
+        self._details_layout = details
+        self.details_row.addLayout(details, 1)
         self.legend = QLabel()
         self.legend.setWordWrap(True)
-        layout.addWidget(self.legend)
+        details.addWidget(self.legend)
         self.denominator = QLabel()
         self.denominator.setWordWrap(True)
         self.denominator.setObjectName('Hint')
-        layout.addWidget(self.denominator)
+        details.addWidget(self.denominator)
         self.originals = QLabel()
         self.originals.setWordWrap(True)
         self.originals.setObjectName('Hint')
-        layout.addWidget(self.originals)
+        details.addWidget(self.originals)
         self.set_summary({})
+
+    def set_style(self, style):
+        if style not in {'bar', 'ring'}:
+            raise ValueError('Coverage chart style must be bar or ring')
+        self.chart_style = style
+        self.bar.setVisible(style == 'bar')
+        self.ring.setVisible(style == 'ring')
+        self._reflow()
+
+    def _reflow(self):
+        if not hasattr(self, 'originals') or self._updating_geometry:
+            return
+        self._updating_geometry = True
+        try:
+            horizontal = self.width() >= max(380, self.fontMetrics().height() * 19)
+            self.details_row.setDirection(QBoxLayout.Direction.LeftToRight if horizontal else QBoxLayout.Direction.TopToBottom)
+            self.ring.setMaximumWidth(self.ring.height() if horizontal else 16777215)
+            self._details_layout.invalidate()
+            self.details_row.invalidate()
+            self._content_layout.invalidate()
+            # A word-wrapped legend needs its height at the actual card width.
+            # The bar's former size hint must not compress a newly visible ring.
+            required = max(self._content_layout.minimumSize().height(),
+                           self._content_layout.totalHeightForWidth(max(1, self.width())))
+            changed = required != self.minimumHeight()
+            self.setMinimumHeight(required)
+            self.updateGeometry()
+            self._content_layout.activate()
+        finally:
+            self._updating_geometry = False
+        if changed:
+            self.geometry_changed.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow()
+
+    def heightForWidth(self, width):
+        # Parent grids use this value instead of minimumSizeHint for wrapped
+        # content. Never advertise a height below the active chart's minimum.
+        if not hasattr(self, '_content_layout'):
+            return super().heightForWidth(width)
+        return max(self.minimumHeight(), self._content_layout.totalHeightForWidth(max(1, width)))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange, QEvent.Type.StyleChange}:
+            self._reflow()
 
     def set_summary(self, summary, *, denominator='当日计划项目'):
         self.summary = dict(summary)
         total, values = coverage(summary)
         self.bar.set_summary(summary)
+        self.ring.set_summary(summary)
         self.heading.setText(f'已完成 {values["done"]} / {total} 项' if total else '没有可统计的计划项目')
         if summary.get('fixed_scheduled'):
             reported=total-values['unreported']
@@ -120,6 +189,68 @@ class CoverageChart(QWidget):
         text = '原有反馈：' + '；'.join(f'{ORIGINAL_LABELS.get(str(k), str(k))} {count(v)} 项' for k, v in originals.items() if count(v))
         self.originals.setText(text if text != '原有反馈：' else '')
         self.originals.setVisible(bool(self.originals.text()) and 'breakdown' not in summary)
+        self._reflow()
+
+
+class CoverageRing(QWidget):
+    """The same evidence segments as the bar; the centre shows count, never a grade."""
+    geometry_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.total, self.values, self.segments = 0, {}, []
+        self.summary = {}
+        self.empty_label = '暂无项目'
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._fit_font()
+
+    def _fit_font(self):
+        height=max(124, self.fontMetrics().height() * 6)
+        width=max(110, self.fontMetrics().horizontalAdvance('暂无项目') + 52)
+        changed=height!=self.minimumHeight() or width!=self.minimumWidth()
+        self.setFixedHeight(height)
+        self.setMinimumWidth(width)
+        if changed:self.geometry_changed.emit()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange}:
+            self._fit_font()
+
+    def set_summary(self, summary, *, empty_label='暂无项目'):
+        self.summary = dict(summary)
+        self.total, self.values = coverage(summary)
+        self.segments = display_segments(summary)
+        self.empty_label = empty_label
+        description = '；'.join(f"{row['label']} {row['count']} 项" for row in self.segments)
+        self.setAccessibleName((f'分母 {self.total} 项；' + description) if self.total else empty_label + '；不计算完成占比。')
+        self.setToolTip(self.accessibleName())
+        self.update()
+
+    def segment_angles(self):
+        if not self.total:
+            return []
+        return [(row, 360 * row['count'] / self.total) for row in self.segments]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        diameter = max(1, min(self.width(), self.height()) - 16)
+        thickness = max(10, diameter * .15)
+        rect = QRectF((self.width() - diameter) / 2 + thickness / 2,
+                      (self.height() - diameter) / 2 + thickness / 2,
+                      diameter - thickness, diameter - thickness)
+        painter.setPen(QPen(QColor(color('chart_track')), thickness))
+        painter.drawEllipse(rect)
+        position = 90.0
+        for row, angle in self.segment_angles():
+            painter.setPen(QPen(QColor(color(row['color'])), thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            painter.drawArc(rect, round(position * 16), -round(angle * 16))
+            position -= angle
+        painter.setPen(QColor(color('chart_label')))
+        text = f'{self.total}\n项' if self.total else '暂无\n项目' if self.empty_label == '暂无项目' else self.empty_label
+        painter.drawText(rect.adjusted(thickness, thickness, -thickness, -thickness), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+        painter.end()
 
 
 class VerticalCoverageBar(QWidget):
@@ -195,13 +326,15 @@ class WeekDaysChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.days, self.day_labels, self.bars = [], [], []
+        self.cards = []
+        self.cards_grid = None
         self.layout_style = 'columns'
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
 
     def set_style(self, style):
-        if style not in {'columns', 'rows'}:
-            raise ValueError('Weekly chart style must be columns or rows')
+        if style not in {'columns', 'rows', 'tiles'}:
+            raise ValueError('Weekly chart style must be columns, rows or tiles')
         if self.layout_style != style:
             self.layout_style = style
             self._render()
@@ -231,17 +364,25 @@ class WeekDaysChart(QWidget):
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
-        self.day_labels, self.bars = [], []
-        hint = QLabel('每天同高为 100%；按事项类别和实际结果分段，课程出勤与任务完成分别标明。未反馈保持未知。' if self.layout_style == 'columns'
-                      else '每行按事项类别和实际结果展示反馈；没有计划项目的日期不计算占比。')
+        self.day_labels, self.bars, self.cards = [], [], []
+        self.cards_grid = None
+        hints = {
+            'columns': '每天同高为 100%；按事项类别和实际结果分段，课程出勤与任务完成分别标明。未反馈保持未知。',
+            'rows': '每行按事项类别和实际结果展示反馈；没有计划项目的日期不计算占比。',
+            'tiles': '每张卡片表示一天。圆环按当日事项计数，中央是分母；无计划、空计划与未反馈分别保留，不把未知算作失败。',
+        }
+        hint = QLabel(hints[self.layout_style])
         hint.setWordWrap(True)
         hint.setObjectName('Hint')
         self.layout.addWidget(hint)
         if self.layout_style == 'columns':
             self._columns()
-        else:
+        elif self.layout_style == 'rows':
             self._rows()
+        else:
+            self._tiles()
         self.layout.addStretch()
 
     def _columns(self):
@@ -302,3 +443,59 @@ class WeekDaysChart(QWidget):
             self.layout.addWidget(row)
             self.day_labels.append(label)
             self.bars.append(bar)
+
+    def _tiles(self):
+        container = QWidget()
+        self.cards_grid = QGridLayout(container)
+        self.cards_grid.setContentsMargins(0, 6, 0, 6)
+        self.cards_grid.setSpacing(10)
+        for day in self.days:
+            card = QFrame()
+            card.setObjectName('PlanCard')
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(12, 10, 12, 10)
+            date = str(day.get('date', ''))
+            layout.addWidget(self._date_button(date))
+            total, _ = coverage(day.get('summary') or {})
+            has_plan = day.get('can_review', day.get('has_plan'))
+            ring = CoverageRing()
+            ring.set_summary(day.get('summary') or {}, empty_label='无计划' if not has_plan else '空计划')
+            layout.addWidget(ring)
+            label = QLabel(self._detail(day))
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setToolTip(ring.accessibleName())
+            layout.addWidget(label)
+            denominator = QLabel(f'分母：当日 {total} 项' if total else '没有计划分母，不计算占比')
+            denominator.setWordWrap(True)
+            denominator.setObjectName('Hint')
+            denominator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(denominator)
+            layout.addStretch()
+            self.cards.append(card)
+            self.bars.append(ring)
+            self.day_labels.append(label)
+        self.layout.addWidget(container)
+        self._reflow_tiles()
+
+    def _reflow_tiles(self):
+        if getattr(self, 'cards_grid', None) is None:
+            return
+        minimum = max(175, self.fontMetrics().horizontalAdvance('已反馈 · 状态待核对') + 35)
+        spacing = self.cards_grid.horizontalSpacing()
+        columns = max(1, min(4, (self.width() + spacing) // (minimum + spacing)))
+        while self.cards_grid.count():
+            self.cards_grid.takeAt(0)
+        for index, card in enumerate(self.cards):
+            self.cards_grid.addWidget(card, index // columns, index % columns)
+        for index in range(4):
+            self.cards_grid.setColumnStretch(index, 1 if index < columns else 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow_tiles()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in {QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange}:
+            self._reflow_tiles()

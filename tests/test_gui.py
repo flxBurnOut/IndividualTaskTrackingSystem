@@ -10,6 +10,7 @@ import uuid
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QDate, QTimer, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLineEdit, QLabel, QSpinBox
 from management.client import Client
 from management.gui import MainWindow, STYLESHEET
@@ -63,7 +64,12 @@ def create(client, title, kind="task", data=None, parent_id=None):
 
 
 def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, window, monkeypatch):
-    window.codex_connection.configure({'ai': {'enabled': True, 'execution_mode': 'desktop_shared'}})
+    # Exercise the display setting separately from connection permission. Avoid
+    # an unrelated automatic probe replacing the explicitly selected UI states.
+    monkeypatch.setattr(window.codex_connection, 'automatic', False)
+    settings = {'appearance': {'show_assistants': True},
+                'ai': {'enabled': True, 'execution_mode': 'desktop_shared'}}
+    window._apply_display_preferences(settings)
     for state in ('checking', 'desktop_closed', 'connecting', 'ready', 'disconnected', 'unsupported', 'error'):
         window.codex_connection._set_state(state)
         app.processEvents()
@@ -73,11 +79,23 @@ def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, win
         assert '退出 Codex' not in window.codex_connection_note.text()
     calls = []
     monkeypatch.setattr(window.bridge, 'command', lambda name, *args, **kwargs: calls.append(name))
+    connection_signature = window.codex_connection._signature
+    window._apply_display_preferences({**settings, 'appearance': {'show_assistants': False}})
+    app.processEvents()
+    assert not window.codex_connection_panel.isVisible()
+    assert window.codex_connection.required
+    assert window.codex_connection._signature == connection_signature
+    assert settings['ai'] == {'enabled': True, 'execution_mode': 'desktop_shared'}
+    assert calls == []  # Hiding the entry does not disable the configured agent.
+    window._apply_display_preferences(settings)
+    assert window.codex_connection_panel.isVisible()
     window.codex_connection_retry.click()
     assert calls == ['connect_codex']
 
-def test_empty_three_navigation_and_form_create(app, window):
-    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "项目与课程", "复盘"]
+def test_empty_five_navigation_and_form_create(app, window):
+    assert '个人事务管理 · Beta 测试版' in window.windowTitle()
+    assert any(label.text() == 'Beta 测试版' for label in window.findChildren(QLabel))
+    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert not window.today_page.has_plan
     assert Client(window.data_dir, autostart=False).query("state")["counts"] == {}
     form = EntityForm(window.bridge, window.capabilities, window)
@@ -135,21 +153,85 @@ def test_tree_pagination_and_search_keep_large_workspaces_accessible(app, window
     assert more.data(0, Qt.ItemDataRole.UserRole).get("_page") == 100
     tree._clicked(more, 0)
     wait(app, lambda: tree.topLevelItemCount() == 105 and not window.bridge.callbacks)
-    search = SearchDialog(window.bridge, window, lambda _: None)
+    opened = []
+    search = SearchDialog(window.bridge, window, opened.append)
     search.show()
     search.search.setText("分页合成任务")
     wait(app, lambda: search.results.count() == 30 and "105" in search.hint.text())
+    first_page = {search.results.item(i).data(Qt.ItemDataRole.UserRole)['id'] for i in range(search.results.count())}
+    search.next.click()
+    wait(app, lambda: not search.loading and search.offset == 30 and search.results.count() == 30)
+    assert not first_page & {search.results.item(i).data(Qt.ItemDataRole.UserRole)['id'] for i in range(search.results.count())}
+    search.previous.click()
+    wait(app, lambda: not search.loading and search.offset == 0 and search.results.count() == 30)
     search.search.setText("分页合成任务 003")
     wait(app, lambda: search.results.count() == 1 and "003" in search.results.item(0).text())
-    search.reject()
+    assert search.offset == 0 and not search.next.isEnabled()
+    item = search.results.item(0)
+    QTest.mouseClick(search.results.viewport(), Qt.MouseButton.LeftButton, pos=search.results.visualItemRect(item).center())
+    assert search.open_button.isEnabled() and not opened
+    search.open_button.click()
+    assert len(opened) == 1 and opened[0]['title'] == '分页合成任务 003'
+    assert not search.isVisible()
+
+
+def test_header_search_accepts_text_and_keyboard_without_retyping(app, window, monkeypatch):
+    client = Client(window.data_dir, autostart=False)
+    task = create(client, '合成：键盘可查找')
+    opened = []
+    monkeypatch.setattr(window, 'open_task', opened.append)
+    window.activateWindow()
+    app.setActiveWindow(window)
+    app.processEvents()
+    QTest.keyClick(window, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier)
+    assert window.search_input.hasFocus()
+    window.search_input.setText(task['title'])
+    QTest.keyClick(window.search_input, Qt.Key.Key_Return)
+    dialog = window.search_dialog
+    assert dialog is not None and dialog.search.text() == task['title']
+    try:
+        wait(app, lambda: not dialog.loading and dialog.results.count() == 1)
+        QTest.keyClick(dialog.search, Qt.Key.Key_Return)
+        assert opened == [task['id']]
+        assert window.search_dialog is None
+    finally:
+        if window.search_dialog is not None:
+            window.search_dialog.reject()
+
+
+def test_habits_and_assistant_have_independent_visible_entries(app, window, monkeypatch):
+    from types import SimpleNamespace
+    from management import gui_workflows
+    client = Client(window.data_dir, autostart=False)
+    before = client.state()['revision']
+    calls = []
+    class Habits:
+        def __init__(self, bridge, capabilities, parent, on_saved):
+            assert bridge is window.bridge and parent is window
+            self.habits = SimpleNamespace(show_reminders=lambda: calls.append('reminders'))
+        def exec(self): calls.append('habits')
+        def deleteLater(self): pass
+    monkeypatch.setattr(gui_workflows, 'HabitsDialog', Habits)
+    assert not window.habits_button.isHidden() and not window.assistant_button.isHidden()
+    window.habits_button.click()
+    window.today_page.habits_button.click()
+    window.open_settings(page='日常习惯')
+    window.open_settings(page='复盘时间')
+    assert calls == ['habits', 'habits', 'habits', 'reminders', 'habits']
+    monkeypatch.setattr(window, 'open_settings', lambda *args, **kwargs: calls.append(kwargs.get('page')))
+    window.assistant_button.click()
+    assert calls[-1] == 'Codex 协助'
+    assert client.state()['revision'] == before
 
 def test_search_rejects_late_response_for_old_text(app):
     from management.gui import SearchDialog
     class DeferredBridge:
         def __init__(self):
             self.pending = []
+            self.errors = []
         def query(self, name, callback, error=None, **params):
             self.pending.append(callback)
+            self.errors.append(error)
     bridge = DeferredBridge()
     search = SearchDialog(bridge, None, lambda _: None)
     search.search.setText("旧条件")
@@ -158,9 +240,42 @@ def test_search_rejects_late_response_for_old_text(app):
     search.load()
     bridge.pending[-1]({"items": [{"id": "new", "type": "task", "title": "新结果"}], "total": 1})
     bridge.pending[0]({"items": [{"id": "old", "type": "task", "title": "旧结果"}], "total": 1})
+    bridge.errors[0]({'message': '过期查询失败'})
     assert search.results.item(0).text() == "新结果"
+    assert '过期查询失败' not in search.hint.text()
+    search.search.setText('另一个条件')
+    assert search.results.count() == 0 and not search.open_button.isEnabled()
     search.timer.stop()
     search.reject()
+
+
+def test_search_previous_page_uses_returned_offsets_and_new_text_resets_history(app):
+    from management.gui import SearchDialog
+    class Bridge:
+        def __init__(self): self.queries = []
+        def query(self, name, callback, error=None, **params):
+            self.queries.append((params, callback))
+    bridge = Bridge()
+    search = SearchDialog(bridge, None, lambda _: None)
+    def deliver(next_offset):
+        params, callback = bridge.queries[-1]
+        callback({'items': [{'id': str(params['offset']), 'type': 'task', 'title': 'Synthetic result'}],
+                  'total': 80, 'next_offset': next_offset})
+    try:
+        search.search.setText('Synthetic')
+        search.load(); deliver(7)
+        search.next.click(); assert bridge.queries[-1][0]['offset'] == 7; deliver(13)
+        search.next.click(); assert bridge.queries[-1][0]['offset'] == 13; deliver(26)
+        search.previous.click(); assert bridge.queries[-1][0]['offset'] == 7; deliver(13)
+        search.previous.click(); assert bridge.queries[-1][0]['offset'] == 0; deliver(7)
+        assert not search.previous.isEnabled()
+        search.next.click(); deliver(13)
+        search.search.setText('A different condition')
+        assert search.offset == 0 and search.page_history == [] and not search.previous.isEnabled()
+        search.load()
+        assert bridge.queries[-1][0]['offset'] == 0
+    finally:
+        search.reject()
 
 
 def test_plan_conflict_keeps_draft_open(app, window):
@@ -186,14 +301,14 @@ def test_plan_conflict_keeps_draft_open(app, window):
     assert client.query("list", type="plan")["total"] == 0
     form.reject()
 
-def test_ten_extensions_keep_three_navigation_and_typed_fields(app, window):
+def test_ten_extensions_keep_five_navigation_and_typed_fields(app, window):
     client = Client(window.data_dir, autostart=False)
     for index in range(10):
         module = f"synthetic{index}"
         client.command("install_module", {"manifest": {"id": module, "version": 1, "types": [{"id": module + ".record", "label": f"合成类型 {index}", "section": "projects", "parent_types": [None], "fields": [{"id": "amount", "label": "计量", "type": "number"}]}]}})
     window.load_capabilities()
     wait(app, lambda: "synthetic9.record" in window.type_map)
-    assert len(window.nav_buttons) == 4
+    assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert len(window.create_menu.actions()) == 6
     assert all("合成类型" not in action.text() for action in window.create_menu.actions())
     form = EntityForm(window.bridge, window.capabilities, window, default_type="synthetic9.record")
@@ -294,6 +409,37 @@ def test_job_adoption_waits_for_full_selected_details(app):
     assert [name for name, _ in bridge.calls] == ["jobs", "job"]
     dialog.accept()
 
+
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_jobs_window_keeps_explanation_and_actions_readable_in_narrow_window(app, font_size):
+    from management.gui_workflows import JobsDialog
+    from management.gui_theme import apply_appearance, current_appearance
+    from management.gui_visual_profile import set_visual_style, visual_style
+    from test_ux_workflows_v2 import ControlledBridge
+    from PySide6.QtWidgets import QPushButton
+    previous, profile = current_appearance(), visual_style()
+    bridge = ControlledBridge(); dialog = None
+    try:
+        set_visual_style('glass'); apply_appearance(app, {'theme': 'dark', 'font_size': font_size})
+        dialog = JobsDialog(bridge); dialog.resize(620, 610); dialog.show(); dialog.timer.stop()
+        for _ in range(4): app.processEvents()
+        assert dialog.width() <= 620
+        for label in dialog.findChildren(QLabel):
+            if label.isVisibleTo(dialog) and label.text().strip():
+                needed = label.heightForWidth(label.width()) if label.wordWrap() else label.sizeHint().height()
+                assert label.height() + 1 >= needed, label.text()
+        for button in dialog.findChildren(QPushButton):
+            if button.isVisibleTo(dialog):
+                assert button.width() >= button.minimumSizeHint().width(), button.text()
+                assert button.height() >= button.minimumSizeHint().height(), button.text()
+                assert not button.visibleRegion().isEmpty()
+        report = os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR')
+        if report: assert dialog.grab().save(str(Path(report) / f'text-jobs-{font_size}.png'))
+        assert not bridge.commands
+    finally:
+        if dialog: dialog.close(); dialog.deleteLater()
+        set_visual_style(profile); apply_appearance(app, previous); app.processEvents()
 
 
 def test_long_write_allows_reads_and_revision_never_goes_backwards(app, tmp_path):

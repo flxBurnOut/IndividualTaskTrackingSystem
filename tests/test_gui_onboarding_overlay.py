@@ -321,3 +321,70 @@ def test_real_application_font_keeps_button_text_and_padding_inside_card(scene, 
             }
     finally:
         apply_appearance(overlay_app, previous)
+
+
+@pytest.mark.parametrize('font_size', [13, 20])
+def test_owned_dialog_spotlight_uses_physical_target_position_after_scroll_and_move(overlay_app, font_size):
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QDialog, QVBoxLayout, QCheckBox
+    previous = current_appearance()
+    owner = QWidget(); owner.resize(1100, 780); owner.move(65, 95); owner.show()
+    dialog = QDialog(owner); dialog.resize(720, 560); dialog.move(330, 170)
+    layout = QVBoxLayout(dialog)
+    scroll = QScrollArea(); scroll.setWidgetResizable(True); layout.addWidget(scroll)
+    content = QWidget(); body = QVBoxLayout(content)
+    controls = []
+    for i in range(4):
+        body.addSpacing(200)
+        field = QCheckBox('实际设置位置 ' + str(i + 1))
+        body.addWidget(field); controls.append(field)
+    body.addStretch(); scroll.setWidget(content)
+    overlay = None
+    try:
+        apply_appearance(overlay_app, {**previous, 'font_size': font_size})
+        dialog.show(); overlay_app.processEvents()
+        overlay = TutorialOverlay(dialog, [TourStep(field, '设置', '这里是正在介绍的设置。') for field in controls])
+        overlay.start()
+        for i, field in enumerate(controls):
+            if i:
+                overlay.next_button.click()
+            dialog.move(330 + i * 25, 170 + i * 19)
+            overlay_app.processEvents()
+            overlay._refresh_geometry()
+            # Independent screen-space oracle: the target and overlay are siblings
+            # below a native QDialog, whose QObject parent is another window.
+            local = field.mapToGlobal(QPoint()) - overlay.mapToGlobal(QPoint())
+            rect = QRect(local, field.size())
+            viewport = QRect(scroll.viewport().mapToGlobal(QPoint()) - overlay.mapToGlobal(QPoint()), scroll.viewport().size())
+            visible = rect.intersected(viewport).intersected(overlay.rect())
+            assert not visible.isEmpty()
+            assert overlay.spotlight_rect.contains(visible.center()), (i, rect, visible, overlay.spotlight_rect, field.mapTo(overlay, QPoint()))
+            assert overlay.spotlight_rect.intersects(rect)
+    finally:
+        if overlay:
+            overlay.stop()
+        dialog.close(); dialog.deleteLater(); owner.close(); owner.deleteLater()
+        overlay_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        apply_appearance(overlay_app, previous)
+
+
+def test_large_font_caption_uses_side_space_without_covering_control(scene, overlay_app):
+    from PySide6.QtWidgets import QCheckBox
+    previous = current_appearance()
+    host, _, _, create = scene
+    try:
+        apply_appearance(overlay_app, {**previous, 'font_size': 20})
+        host.resize(740, 500)
+        target = QCheckBox(host); target.setGeometry(170, 240, 25, 30); target.show()
+        overlay_app.processEvents()
+        overlay = create([TourStep(target, '填写已知信息', '勾选这个选项后再填写信息，未确认的信息可留空。')])
+        overlay.start(); overlay_app.processEvents()
+        visible = target.rect().translated(target.mapToGlobal(QPoint()) - overlay.mapToGlobal(QPoint()))
+        assert overlay.spotlight_rect.contains(visible)
+        assert not overlay.card.geometry().intersects(visible)
+        assert overlay.card.width() < round(450 * (20 / 13) * .9)
+        for button in (overlay.next_button, overlay.skip_button, overlay.disable_button):
+            assert button.isVisible() and overlay.card.rect().contains(button.geometry())
+        overlay.stop()
+    finally:
+        apply_appearance(overlay_app, previous)

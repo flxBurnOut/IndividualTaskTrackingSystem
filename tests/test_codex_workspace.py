@@ -31,6 +31,7 @@ def test_fresh_data_creates_guidance_and_connection_without_business_database(tm
     assert result["changed"] is True
     assert len(result["changed_files"]) == 4
     assert not (data / "database.sqlite3").exists()
+    assert 'Beta 测试版' in Path(result['readme_path']).read_text('utf-8')
     assert set(snapshots(data)) == {"AGENTS.md", "开始使用.md", str(Path(".codex") / "config.toml"),
                                    str(Path(".codex") / "management-instructions.md")}
     config = tomllib.loads(Path(result["config_path"]).read_text("utf-8"))["mcp_servers"]["personal_management"]

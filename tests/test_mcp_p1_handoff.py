@@ -156,6 +156,105 @@ def test_large_get_and_receipt_reconstruct_the_exact_original_view(business, vie
         assert c.execute('SELECT count(*) FROM context_operations').fetchone()[0] == 0
 
 
+@pytest.mark.parametrize('view', ['task_pool', 'actual_feedback'])
+def test_manual_task_and_feedback_reads_remain_available_and_lossless_over_mcp(business, view):
+    core, client = business
+    target = client.command('create', {'type': 'task', 'title': 'Synthetic manual task',
+                                      'data': {'notes': LONG}}, **guards(client))['result']['entity']
+    if view == 'actual_feedback':
+        client.command('record_feedback', {'target_id': target['id'], 'business_date': DAY,
+            'dimensions': {'completion': 'partial', 'actual_minutes': 12}, 'source_text': LONG}, **guards(client))
+    params = {'date': DAY, 'limit': 1, 'offset': 0}
+    original, before = client.query(view, **params), client.state()
+    assert size(original) > MAX_PAGE_BYTES
+    async def scenario():
+        async with MCPClient(create_server(core.root, client=client)) as sdk:
+            first = await call(sdk, 'query_business', {'name': view, 'params': params})
+            assert first['format'] == FORMAT
+            assert await collect(sdk, first) == original
+    asyncio.run(scenario())
+    assert client.state() == before
+    with core.store.connect() as c:
+        assert c.execute('SELECT count(*) FROM context_operations').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('mode', ['create', 'split'])
+def test_ordinary_mcp_task_batch_preview_execute_and_retry_share_original_guards(business, mode):
+    core, client = business
+    source = client.command('create', {'type': 'task', 'title': 'Synthetic original task',
+        'data': {'completion_gate': 'Original complete result'}}, **guards(client))['result']['entity'] if mode == 'split' else None
+    params = {'mode': mode, 'sequential': True, 'items': [
+        {'title': 'Synthetic first part', 'completion_gate': 'First verified result'},
+        {'title': 'Synthetic second part', 'completion_gate': 'Second verified result'}]}
+    if source:
+        params.update(source_id=source['id'], source_version=source['version'])
+    before = client.state()
+    async def scenario():
+        async with MCPClient(create_server(core.root, client=client)) as sdk:
+            preview = await call(sdk, 'query_business', {'name': 'preview_task_batch', 'params': params})
+            assert client.state() == before
+            assert preview['command'] == ('split_task' if source else 'create_task_batch')
+            assert preview['payload']['preview_token'] and preview['count'] == 2
+            request = {'name': preview['command'], 'payload': preview['payload'],
+                'request_id': str(uuid.uuid4()), 'epoch': preview['epoch'], 'expected_revision': preview['revision']}
+            receipt = await call(sdk, 'execute_command', request)
+            assert receipt['result']['count'] == 2
+            assert [item['title'] for item in receipt['result']['items']] == [row['title'] for row in params['items']]
+            assert all(item['parent_id'] == (source['id'] if source else None) for item in receipt['result']['items'])
+            replay = await call(sdk, 'execute_command', request)
+            assert replay['replayed'] is True and replay['result'] == receipt['result']
+            assert replay['revision'] == receipt['revision']
+    asyncio.run(scenario())
+    assert client.query('list', type='task')['total'] == (3 if source else 2)
+    if source:
+        assert client.query('get', id=source['id'])['entity'] == source
+    for kind in ('feedback', 'plan'):
+        assert client.query('list', type=kind)['total'] == 0
+
+
+def test_large_task_batch_preview_preserves_token_and_payload_for_ordinary_mcp_execution(business):
+    core, client = business
+    source = client.command('create', {'type': 'task', 'title': 'Original with detailed context',
+        'data': {'completion_gate': 'Preserve original full standard', 'notes': LONG}}, **guards(client))['result']['entity']
+    params = {'mode': 'split', 'source_id': source['id'], 'source_version': source['version'],
+              'sequential': False, 'items': [{'title': 'Part A', 'completion_gate': 'Explicit A'},
+                                          {'title': 'Part B', 'completion_gate': 'Explicit B'}]}
+    raw = client.query('preview_task_batch', **params)
+    before = client.state()
+    assert size(raw) > MAX_PAGE_BYTES
+    async def scenario():
+        async with MCPClient(create_server(core.root, client=client)) as sdk:
+            first = await call(sdk, 'query_business', {'name': 'preview_task_batch', 'params': params})
+            assert first['format'] == FORMAT and first['query_params'] == params
+            restored = await collect(sdk, first)
+            assert restored == raw
+            assert restored['payload']['preview_token'] == raw['payload']['preview_token']
+            assert client.state() == before
+            receipt = await call(sdk, 'execute_command', {'name': restored['command'], 'payload': restored['payload'],
+                'epoch': restored['epoch'], 'expected_revision': restored['revision'], 'request_id': str(uuid.uuid4())})
+            assert receipt['result']['count'] == 2
+    asyncio.run(scenario())
+    assert client.query('get', id=source['id'])['entity'] == source
+    with core.store.connect() as c:
+        assert c.execute('SELECT count(*) FROM context_operations').fetchone()[0] == 0
+
+
+def test_task_batch_preview_with_oversized_mcp_continuation_input_fails_explicitly_without_writes(business):
+    core, client = business
+    params = {'mode': 'create', 'items': [
+        {'title': 'Large first standard', 'completion_gate': 'A' * 6000},
+        {'title': 'Large second standard', 'completion_gate': 'B' * 6000}]}
+    before = client.state()
+    async def scenario():
+        async with MCPClient(create_server(core.root, client=client)) as sdk:
+            response = await sdk.call_tool('query_business', {'name': 'preview_task_batch', 'params': params})
+            error(response, 'business_page_budget')
+    asyncio.run(scenario())
+    assert client.state() == before and client.query('list', type='task')['total'] == 0
+    with core.store.connect() as c:
+        assert c.execute('SELECT count(*) FROM context_operations').fetchone()[0] == 0
+
+
 @pytest.mark.parametrize('case', ['archived', 'draft', 'cancelled', 'offset', 'parent', 'parent_null', 'default', 'extra_filters'])
 def test_large_lists_preserve_original_filters_order_and_business_page(business, case):
     core, client = business

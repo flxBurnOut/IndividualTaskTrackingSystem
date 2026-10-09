@@ -36,15 +36,15 @@ class _Watch:
 class OnboardingManager(QObject):
     """One overlay at a time, with progress scoped to the chosen data space.
 
-    Automatic introductions are offered only at a fresh Show event. Any input
-    during the readiness delay cancels that visit's offer, so a slow query cannot
-    interrupt someone who has already started editing.
+    Automatic introductions are offered only at a fresh Show event. The offer
+    waits through slow initialization and temporary loss of focus. Any input
+    during that wait cancels this visit, so a delayed query cannot interrupt
+    someone who has already started editing.
     """
 
     error = Signal(str)
     automatic_changed = Signal(bool)
     INITIAL_DELAY = 0.32
-    READINESS_LIMIT = 12.0
 
     def __init__(self, window: QWidget, data_dir):
         super().__init__(window)
@@ -95,13 +95,15 @@ class OnboardingManager(QObject):
             value = json.loads(self._path.read_text(encoding='utf-8'))
             if not isinstance(value, dict) or not isinstance(value.get('automatic'), bool):
                 raise ValueError('invalid tutorial preferences')
+            # Honor an explicit opt-out even if a newer app wrote the remaining
+            # progress schema. Unknown formats are never overwritten below.
+            self._automatic = value['automatic']
             if value.get('version') != 1:
                 self._write_allowed = False
                 raise ValueError('unsupported tutorial preferences version')
             seen = value.get('seen', {})
             if not isinstance(seen, dict):
                 raise ValueError('invalid tutorial progress')
-            self._automatic = value['automatic']
             self._seen = {key: status for key, status in seen.items()
                           if isinstance(key, str) and len(key) <= 160
                           and status in ('completed', 'skipped')}
@@ -208,7 +210,7 @@ class OnboardingManager(QObject):
             pending = entry.pending_since
             if pending is None:
                 continue
-            if not self._visible(entry) or now - pending > self.READINESS_LIMIT:
+            if not self._visible(entry):
                 entry.pending_since = None
                 continue
             if (now - pending >= self.INITIAL_DELAY and self._active_host(entry)
@@ -345,7 +347,11 @@ class OnboardingManager(QObject):
         elif kind in (QEvent.Type.Hide, QEvent.Type.Close, QEvent.Type.WindowDeactivate):
             for entry in entries:
                 if watched is _widget(entry.trigger) or watched is _widget(entry.host):
-                    entry.pending_since = None
+                    # Losing focus while startup queries finish is not a user
+                    # dismissal. Keep an unstarted offer; never re-arm one that
+                    # input, a skipped guide, or another guide already canceled.
+                    if kind != QEvent.Type.WindowDeactivate:
+                        entry.pending_since = None
                     if self._active_key == entry.key:
                         self._interrupt()
         return False

@@ -74,6 +74,7 @@ def raw(live, path, payload=None, *, headers=None, token=None):
     {**service_contract(), 'protocol_version': 99},
     {**service_contract(), 'protocol_version': True},
     {**service_contract(), 'capabilities': []},
+    {**service_contract(), 'capabilities': ['release_handshake','idle_update_shutdown']},
 ])
 @pytest.mark.parametrize('autostart', [True, False])
 def test_skewed_or_legacy_live_service_is_rejected_without_bootstrap(live, contract, autostart):
@@ -84,6 +85,10 @@ def test_skewed_or_legacy_live_service_is_rejected_without_bootstrap(live, contr
         client.__init__(live.core.root, autostart=autostart)
     assert error.value.code == 'service_version_mismatch'
     assert '未执行' in error.value.message and 'MCP' in error.value.message
+    assert '先保存并关闭 Beta 主窗口' in error.value.message
+    assert '等待完成后，在 Beta 托盘选择“退出 Beta 软件与后台”' in error.value.message
+    assert '确认 Beta 后台退出后' in error.value.message and '启动个人事务管理Beta.vbs' in error.value.message
+    assert '仅重新打开窗口不会替换仍在运行的旧后台' in error.value.message
     assert client.runtime is None and client.epoch is None and client.revision is None
     assert live.paths == ['/v1/query/state'] and not live.starts
     assert live.core.query('state') == before
@@ -134,6 +139,25 @@ def test_changed_service_version_does_not_send_cached_write(live):
     assert (client.epoch, client.revision) == before
     assert not any('/commands/' in path for path in live.paths) and not live.starts
     assert live.core.query('list')['total'] == 0
+
+
+@pytest.mark.parametrize('channel', [None, 'stable'])
+def test_same_version_wrong_channel_service_rejects_beta_client(live, channel):
+    live.transform['state'] = lambda value: {**value, 'service_contract': {**service_contract(), 'channel': channel}}
+    with pytest.raises(ClientError) as error:
+        Client(live.core.root, autostart=False)
+    assert error.value.code == 'service_version_mismatch'
+    assert live.paths == ['/v1/query/state'] and not live.starts
+
+
+@pytest.mark.parametrize('channel', ['', 'stable'])
+@pytest.mark.parametrize('route', ['commands/create', 'maintenance/shutdown-if-idle'])
+def test_same_version_non_beta_entrance_cannot_write_or_stop_beta(live, channel, route):
+    from management.runtime_contract import CHANNEL_HEADER
+    before = live.core.query('state')
+    status, value = raw(live, route, headers=client_headers() | {CHANNEL_HEADER: channel})
+    assert status == 400 and value['error']['code'] == 'client_version_mismatch'
+    assert live.core.query('state') == before and not live.server.stopping.is_set()
 
 
 def test_shutdown_is_authenticated_and_has_no_business_payload(live):
@@ -297,7 +321,7 @@ def test_client_reports_update_pending_without_bootstrap_loop(tmp_path):
     (tmp_path / 'update_pending.json').write_text('{}', encoding='utf-8')
     with pytest.raises(ClientError) as error:
         Client(tmp_path)
-    assert error.value.code == 'update_pending' and '主动打开软件' in error.value.message
+    assert error.value.code == 'update_pending' and '主动打开 Beta 软件' in error.value.message
 
 
 def test_resume_token_is_bound_to_marker_and_data_space(tmp_path):

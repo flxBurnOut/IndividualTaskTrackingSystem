@@ -11,7 +11,7 @@ import pytest
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
-from management.gui_instance import WindowInstance, pipe_name, window_running
+from management.gui_instance import WindowInstance, notify_window, pipe_name, window_running
 from management.gui_tray import ServiceTray
 from management.gui_shutdown import request_exit
 from management.runtime import OwnerLock
@@ -70,6 +70,9 @@ def online(jobs=None):
 
 def test_status_shows_real_running_queued_and_pending_review_counts(tray):
     item, bridge = tray
+    assert 'Beta 测试版' in item.open_action.text()
+    assert 'Beta' in item.exit_action.text() and 'Beta' in item.version.text()
+    assert 'Beta 测试版' in item.icon.tooltip
     assert bridge.reads[0][0] == 'runtime_status'
     bridge.reads[-1][1](online({'running': 2, 'queued': 3, 'awaiting_review': 4}))
     assert '2 项执行中，3 项排队' in item.status.text()
@@ -174,7 +177,8 @@ def test_gui_exit_preserves_unsaved_edit_and_uncertain_write(app):
         window.close()
 
 
-def test_single_window_pipe_is_scoped_and_rejects_unrecognized_commands(app, tmp_path):
+@pytest.mark.parametrize('command', ['show', 'update', 'exit'])
+def test_single_window_pipe_is_scoped_and_rejects_unrecognized_commands(app, tmp_path, command):
     first = WindowInstance(tmp_path / 'one')
     duplicate = WindowInstance(tmp_path / 'one')
     other = WindowInstance(tmp_path / 'two')
@@ -185,7 +189,7 @@ def test_single_window_pipe_is_scoped_and_rejects_unrecognized_commands(app, tmp
         assert window_running(tmp_path / 'one')
         assert pipe_name(tmp_path / 'one') != pipe_name(tmp_path / 'two')
         program = "from PySide6.QtCore import QCoreApplication; from management.gui_instance import notify_window; import sys; app=QCoreApplication([]); print(notify_window(sys.argv[1],sys.argv[2]),flush=True)"
-        child = subprocess.Popen([sys.executable, '-c', program, str(tmp_path / 'one'), 'show'],
+        child = subprocess.Popen([sys.executable, '-c', program, str(tmp_path / 'one'), command],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         deadline = time.monotonic() + 5
@@ -195,7 +199,7 @@ def test_single_window_pipe_is_scoped_and_rejects_unrecognized_commands(app, tmp
         output, errors = child.communicate(timeout=3)
         assert child.returncode == 0 and output.strip() == 'True', errors
         app.processEvents()
-        assert seen == ['show']
+        assert seen == [command]
     finally:
         first.close()
         other.close()
@@ -211,3 +215,9 @@ def test_tray_process_lock_has_single_owner(tmp_path):
     finally:
         lock.release()
     assert not tray_runtime.observer_running(tmp_path)
+
+
+@pytest.mark.parametrize('command', ['visual-classic', 'visual-glass', 'visual-future', 'show\nexit'])
+def test_window_protocol_rejects_retired_unknown_or_combined_commands(tmp_path, command):
+    with pytest.raises(ValueError, match='Unsupported window request'):
+        notify_window(tmp_path, command)

@@ -1,8 +1,9 @@
 """Today is only the selected day's plan, fixed events and attention items."""
 from __future__ import annotations
 from PySide6.QtCore import QDate, Qt, Signal
-from PySide6.QtWidgets import QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget, QSizePolicy
+from PySide6.QtWidgets import QDateEdit, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget, QSizePolicy, QLayout
 from .gui_workspace import CountProgress, clear_layout, make_button, plain_label
+from .gui_layout import ActionRow, ReadingLabel
 
 
 class TodayPage(QWidget):
@@ -24,19 +25,24 @@ class TodayPage(QWidget):
         self.pending_targets = set()
         self.generation = 0
         self.has_plan = False
+        self.assistants_visible = False
         self.review_result = None
         self.today_result = None
         self.warning_result = None
         self.warning_offset = 0
         self.warning_date = None
         self.show_all_reminders = False
+        self._rendered_plan = None
+        self._rendered_tasks = None
+        self._rendered_events = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(20)
         self.date_heading = plain_label("", "TodayDateHeading")
         font = self.date_heading.font(); font.setPointSize(22); font.setBold(True); self.date_heading.setFont(font)
         outer.addWidget(self.date_heading)
-        row = QHBoxLayout()
+        self.compact_controls = ActionRow(self)
+        row = self.compact_controls
         previous = make_button("‹", lambda: self.date.setDate(self.date.date().addDays(-1)))
         previous.setFixedWidth(35)
         row.addWidget(previous)
@@ -48,17 +54,19 @@ class TodayPage(QWidget):
         following = make_button("›", lambda: self.date.setDate(self.date.date().addDays(1)))
         following.setFixedWidth(35)
         row.addWidget(following)
-        row.addWidget(make_button("回到今天", lambda: self.date.setDate(QDate.currentDate())))
+        today_button = make_button("回到今天", lambda: self.date.setDate(QDate.currentDate()))
+        row.addWidget(today_button)
         self.timetable_button = make_button("每周课表", lambda: on_timetable(self.date_iso()) if on_timetable else None)
         row.addWidget(self.timetable_button)
-        row.addStretch()
-        self.manual_button = make_button("手动安排", lambda: self.on_manual(self.date_iso()) if self.on_manual else None)
-        self.manual_button.setObjectName("Prominent")
+        self.manual_button = make_button("安排这一天", lambda: self.on_manual(self.date_iso()) if self.on_manual else None, True)
         self.manual_button.setMinimumHeight(44)
         row.addWidget(self.manual_button)
-        self.plan_button = make_button("生成计划", self.request_plan, True)
+        self.plan_button = make_button("请助手给建议", self.request_plan)
+        self.plan_button.hide()
         row.addWidget(self.plan_button)
-        outer.addLayout(row)
+        self._date_controls = [previous, self.date, following, today_button, self.timetable_button]
+        self._plan_controls = [self.manual_button, self.plan_button]
+        outer.addWidget(self.compact_controls)
         self.habits_button=make_button('日常习惯 · 查看提醒、自动待办与安排偏好',lambda:on_habits() if on_habits else None)
         self.habits_button.setObjectName('HabitsSummary');self.habits_button.setMinimumHeight(44);outer.addWidget(self.habits_button)
         self.scroll = QScrollArea()
@@ -66,6 +74,7 @@ class TodayPage(QWidget):
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         body = QWidget()
         self.body = QVBoxLayout(body)
+        self.body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.body.setContentsMargins(0, 0, 10, 10)
         self.body.setSpacing(22)
         self.plan_box = QFrame()
@@ -87,11 +96,39 @@ class TodayPage(QWidget):
         self.attention_layout.setContentsMargins(0, 0, 0, 0)
         self.attention_layout.setSpacing(9)
         self.body.addWidget(self.attention_box)
+        for section in (self.plan_box, self.events_box, self.tasks_box, self.attention_box):
+            section.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.body.addStretch()
         self.scroll.setWidget(body)
         outer.addWidget(self.scroll, 1)
+        self.body.setAlignment(Qt.AlignmentFlag.AlignTop)
+        for section in (self.plan_box, self.events_box, self.tasks_box, self.attention_box):
+            # Preferred sections grow to heightForWidth after text wraps; a
+            # maximum policy would cap them at an unwrapped sizeHint.
+            policy = section.sizePolicy()
+            policy.setHeightForWidth(True)
+            section.setSizePolicy(policy)
+            section.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.update_date_heading()
         self.render_plan(None)
+        self.render_attention()
+
+    def apply_visual_style(self, selected=None):
+        """Older callers may request a profile; the current layout stays intact."""
+
+    def _compact_actions(self, target, widgets):
+        row = ActionRow()
+        for widget in widgets:
+            row.addWidget(widget)
+        target.addWidget(row)
+        return row
+
+    def _reading_label(self, text, name):
+        label = ReadingLabel(text, name)
+        policy = label.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+        label.setSizePolicy(policy)
+        return label
 
     def update_date_heading(self):
         day = self.date.date()
@@ -99,6 +136,11 @@ class TodayPage(QWidget):
 
     def date_iso(self):
         return self.date.date().toString("yyyy-MM-dd")
+
+    def set_assistants_visible(self,visible):
+        self.assistants_visible=bool(visible)
+        self.plan_button.setVisible(self.assistants_visible)
+        self.render_plan(self.review_result)
 
     def set_date(self, date):
         parsed = QDate.fromString(date, "yyyy-MM-dd") if isinstance(date, str) else date
@@ -129,8 +171,9 @@ class TodayPage(QWidget):
             self.has_plan = bool(result.get("has_plan"))
             needs_review = not result.get("can_review", self.has_plan) or (result.get("summary") or {}).get("pending_review", (result.get("summary") or {}).get("unreported", 0)) > 0
             self.review_attention.emit(needs_review and self.date.date() <= QDate.currentDate())
-            self.plan_button.setText("调整计划" if self.has_plan else "生成计划")
-            self.plan_button.setVisible(self.has_plan or result.get("has_fixed_schedule",False))
+            self.manual_button.setText("编辑安排" if self.has_plan else "安排这一天")
+            self.plan_button.setText("请助手调整" if self.has_plan else "请助手给建议")
+            self.plan_button.setVisible(self.assistants_visible)
             self.render_plan(result)
             if self.today_result:self.render_events(self.today_result.get("events",[]))
         def today_loaded(result):
@@ -168,16 +211,34 @@ class TodayPage(QWidget):
             self.on_plan(self.date_iso(), self.has_plan)
 
     def render_plan(self, result):
+        self._rendered_plan = result
         clear_layout(self.plan_layout)
+        empty = not result or not result.get('can_review', result.get('has_plan'))
+        name = 'TodayPlanEmpty' if empty else 'PlanCard'
+        if self.plan_box.objectName() != name:
+            self.plan_box.setObjectName(name)
+            self.plan_box.style().unpolish(self.plan_box)
+            self.plan_box.style().polish(self.plan_box)
+        if empty:
+            self.plan_layout.setContentsMargins(0, 8, 0, 12)
+        else:
+            self.plan_layout.setContentsMargins(24, 23, 24, 23)
         if not result:
             self.plan_layout.addWidget(plain_label("今天的安排", "SectionHeading"))
             self.plan_layout.addWidget(plain_label("正在读取当天计划…", "Quiet"))
             return
         if not result.get("can_review", result.get("has_plan")):
-            self.plan_layout.addWidget(plain_label("还没有这一天的计划", "CardTitle"))
-            self.plan_layout.addWidget(plain_label("先说明今天能投入的时间，以及最需要完成的事情。\nCodex 会结合已登记的固定安排，给出可以核对的计划。", "Body"))
+            # Keep wrapped labels at the width used by the parent layout's
+            # height-for-width calculation. AlignLeft on the *layout item*
+            # shrinks the widget after height calculation and clips new lines;
+            # the label's text is already left-aligned independently.
+            self.plan_layout.addWidget(self._reading_label("还没有这一天的计划", "CardTitle"))
+            self.plan_layout.addWidget(self._reading_label("从任务池选择要做的事情，按先后排好再保存。\n未定日期的任务也可以加入；没有确定的钟点可以留空。", "Body"))
             self.plan_layout.addSpacing(5)
-            self.plan_layout.addWidget(make_button("让 Codex 安排", self.request_plan, True), alignment=Qt.AlignmentFlag.AlignLeft)
+            manual = make_button("安排这一天", lambda:self.on_manual(self.date_iso()) if self.on_manual else None, True)
+            actions = [manual]
+            if self.assistants_visible: actions.append(make_button('请助手给建议', self.request_plan))
+            self._compact_actions(self.plan_layout, actions)
             return
         plan = result.get("plan") or {}
         header = QHBoxLayout()
@@ -195,7 +256,10 @@ class TodayPage(QWidget):
         summary = result.get("summary", {})
         if items:
             self.progress = CountProgress()
-            self.progress.title.setText("执行反馈 · 出勤不代表学习完成")
+            has_fixed = (summary.get('fixed_scheduled') or result.get('has_fixed_schedule')
+                         or any(item.get('fixed_schedule') for item in items))
+            self.progress.title.setText("执行反馈 · 出勤不代表学习完成" if has_fixed
+                                        else "执行反馈 · 按任务完成标准记录")
             self.progress.set_counts(summary)
             self.plan_layout.addSpacing(7)
             self.plan_layout.addWidget(self.progress)
@@ -266,6 +330,7 @@ class TodayPage(QWidget):
         self.bridge.command("submit_daily_review", payload, saved, failed, **options)
 
     def render_events(self, events):
+        self._rendered_events = events
         clear_layout(self.events_layout)
         integrated=bool(self.review_result and self.review_result.get('has_fixed_schedule'))
         self.events_box.setVisible(not integrated)
@@ -293,11 +358,12 @@ class TodayPage(QWidget):
             self.events_layout.addWidget(row)
 
     def render_tasks(self, result):
+        self._rendered_tasks = result
         clear_layout(self.tasks_layout)
         self.tasks_layout.addWidget(plain_label("当天候选待办", "SectionHeading"))
         self.tasks_layout.addWidget(plain_label("这里只列已安排到这天、到期或逾期的未完成任务。是否今天处理由你决定；加入日计划后，才进入当天复盘。", "Quiet"))
         if not result.get("items"):
-            self.tasks_layout.addWidget(plain_label("没有尚未排入当天计划的日期相关任务。其他课程任务仍可从项目与课程查看。", "Quiet"))
+            self.tasks_layout.addWidget(plain_label("没有尚未排入当天计划的日期相关任务。点击“安排这一天”可从全部任务中选择，包括未定日期的事项。", "Quiet"))
         day = result.get("date") or self.date_iso()
         snapshot = result.get("plan")
         group_label = None
@@ -305,17 +371,32 @@ class TodayPage(QWidget):
             owner = task.get("owner_label") or "未归属"
             if owner != group_label:
                 group_label = owner; self.tasks_layout.addWidget(plain_label(owner, "SectionHeading"))
-            row = QFrame(); row.setObjectName("TaskRow"); inner = QHBoxLayout(row); inner.setContentsMargins(16, 13, 16, 13)
-            words = QVBoxLayout(); title = make_button(task.get("display_title") or task["title"], lambda _, identifier=task["id"]: self.on_task(identifier) if self.on_task else None); title.setObjectName("TextLink"); title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred); title.setToolTip(task.get("display_title") or task["title"]); words.addWidget(title)
-            words.addWidget(plain_label(" · ".join(x for x in (task.get("candidate_date"), task.get("reason") or "日期相关待办") if x), "Quiet"))
-            if task.get("data", {}).get("completion_gate"): words.addWidget(plain_label(str(task["data"]["completion_gate"]), "Quiet"))
-            inner.addLayout(words, 1)
-            add = make_button("加入这天计划", lambda _, item=task, d=day, p=snapshot: self.add_task(item, d, p))
-            add.setEnabled((day, task["id"]) not in self.pending_targets); inner.addWidget(add); self.tasks_layout.addWidget(row)
+            row = QFrame(); row.setObjectName('TimelineRow')
+            inner = QVBoxLayout(row); inner.setContentsMargins(0, 10, 0, 10)
+            content = QWidget(); words = QVBoxLayout(content); words.setContentsMargins(0, 0, 0, 0); words.setSpacing(4)
+            inner.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            words.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred); policy.setHeightForWidth(True); content.setSizePolicy(policy)
+            title = self._reading_label(task.get('display_title') or task['title'], 'SectionHeading')
+            title.setToolTip(task.get('display_title') or task['title'])
+            words.addWidget(title)
+            words.addWidget(self._reading_label(' · '.join(x for x in (task.get('candidate_date'), task.get('reason') or '日期相关待办') if x), 'Quiet'))
+            if task.get('data', {}).get('completion_gate'):
+                words.addWidget(self._reading_label(str(task['data']['completion_gate']), 'Quiet'))
+            add = make_button('加入这天计划', lambda _, item=task, d=day, p=snapshot: self.add_task(item, d, p))
+            add.setEnabled((day, task['id']) not in self.pending_targets)
+            inner.addWidget(content)
+            actions = []
+            if self.on_task:
+                actions.append(make_button('查看', lambda _, identifier=task['id']: self.on_task(identifier)))
+            actions.append(add)
+            self._compact_actions(inner, actions)
+            self.tasks_layout.addWidget(row)
         if self.tasks_offset or result.get("next_offset") is not None:
-            row = QHBoxLayout(); row.addWidget(plain_label(f"候选待办 {self.tasks_offset + 1}–{self.tasks_offset + len(result.get('items', []))} / {result.get('total', 0)} 项", "Quiet"), 1)
-            previous = make_button("上一页待办", lambda: self.set_tasks_page(max(0, self.tasks_offset - 10))); previous.setEnabled(self.tasks_offset > 0); row.addWidget(previous)
-            following = make_button("更多待办", lambda: self.set_tasks_page(result.get("next_offset"))); following.setEnabled(result.get("next_offset") is not None); row.addWidget(following); self.tasks_layout.addLayout(row)
+            hint = self._reading_label(f"候选待办 {self.tasks_offset + 1}–{self.tasks_offset + len(result.get('items', []))} / {result.get('total', 0)} 项", 'Quiet')
+            previous = make_button('上一页待办', lambda: self.set_tasks_page(max(0, self.tasks_offset - 10))); previous.setEnabled(self.tasks_offset > 0)
+            following = make_button('更多待办', lambda: self.set_tasks_page(result.get('next_offset'))); following.setEnabled(result.get('next_offset') is not None)
+            self._compact_actions(self.tasks_layout, [hint, previous, following])
 
     def set_tasks_page(self, offset):
         if offset is not None: self.tasks_offset = offset; self.refresh()
@@ -343,13 +424,19 @@ class TodayPage(QWidget):
         self.dialogs.append(dialog); dialog.finished.connect(lambda _: self.dialogs.remove(dialog) if dialog in self.dialogs else None); dialog.open()
 
     def warning_card(self, item, past=False):
-        card = QFrame(); card.setObjectName("AttentionCard" if past else "CurrentWarningCard")
-        layout = QVBoxLayout(card); layout.setContentsMargins(17, 13, 17, 13)
-        title = item.get("title") or item.get("message") or "需要核对"
-        owner = item.get("owner_label")
-        layout.addWidget(plain_label((owner + " · " if owner and owner not in title else "") + str(title), "AttentionTitle" if past else "CurrentWarningTitle"))
-        detail = item.get("reason") or item.get("message") or item.get("description") or ""
-        if detail and detail != title: layout.addWidget(plain_label(str(detail), "AttentionText"))
+        card = QFrame(); card.setObjectName('TimelineRow')
+        layout = QVBoxLayout(card); layout.setContentsMargins(0, 9, 0, 9); layout.setSpacing(4)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        title = item.get('display_title') or item.get('title') or item.get('message') or '需要核对'
+        owner = item.get('owner_label')
+        heading = self._reading_label((owner + ' · ' if owner and owner not in title else '') + str(title), 'AttentionTitle' if past else 'CurrentWarningTitle')
+        actions = [heading]
+        if self.on_task and item.get('id'):
+            actions.append(make_button('查看', lambda _, identifier=item['id']: self.on_task(identifier)))
+        self._compact_actions(layout, actions)
+        detail = item.get('reason') or item.get('message') or item.get('description') or ''
+        if detail and detail != title:
+            layout.addWidget(self._reading_label(str(detail), 'AttentionText'))
         return card
 
     def render_attention(self):
@@ -367,32 +454,46 @@ class TodayPage(QWidget):
             for item in notices: self.attention_layout.addWidget(self.warning_card(item))
             total = result.get("total", 0)
             if total > 3:
-                row = QHBoxLayout(); row.addWidget(plain_label(f"当前警戒 {self.warning_offset + 1}–{self.warning_offset + len(notices)} / {total} 条", "Quiet"), 1)
-                previous = make_button("上一页警戒", lambda: self.set_warning_page(max(0, self.warning_offset - 3))); previous.setEnabled(self.warning_offset > 0); row.addWidget(previous)
-                following = make_button("更多警戒", lambda: self.set_warning_page(result.get("next_offset"))); following.setEnabled(result.get("next_offset") is not None); row.addWidget(following); self.attention_layout.addLayout(row)
+                hint = self._reading_label(f"当前警戒 {self.warning_offset + 1}–{self.warning_offset + len(notices)} / {total} 条", 'Quiet')
+                previous = make_button("上一页警戒", lambda: self.set_warning_page(max(0, self.warning_offset - 3))); previous.setEnabled(self.warning_offset > 0)
+                following = make_button("更多警戒", lambda: self.set_warning_page(result.get("next_offset"))); following.setEnabled(result.get("next_offset") is not None)
+                self._compact_actions(self.attention_layout, [hint, previous, following])
         if past_count:
             toggle = make_button(f"已过节点的警戒（{past_count}） · " + ("收起" if self.past_expanded else "展开"), self.toggle_past_warnings)
-            toggle.setObjectName("CompletedTasksToggle"); self.attention_layout.addWidget(toggle)
+            toggle.setObjectName("CompletedTasksToggle")
+            self.attention_layout.addWidget(toggle, alignment=Qt.AlignmentFlag.AlignLeft)
             if self.past_expanded:
                 self.attention_layout.addWidget(plain_label("仅按节点时间折叠，未将这些事项判为完成。", "Quiet"))
                 if self.past_warnings is None: self.attention_layout.addWidget(plain_label("正在读取历史警戒…", "Quiet"))
                 else:
                     for item in self.past_warnings.get("items", []): self.attention_layout.addWidget(self.warning_card(item, True))
                     if self.past_warning_offset or self.past_warnings.get("next_offset") is not None:
-                        row = QHBoxLayout(); previous = make_button("上一页历史", lambda: self.page_past_warnings(max(0, self.past_warning_offset-5))); previous.setEnabled(self.past_warning_offset>0); row.addWidget(previous)
-                        following = make_button("下一页历史", lambda: self.page_past_warnings(self.past_warnings.get("next_offset"))); following.setEnabled(self.past_warnings.get("next_offset") is not None); row.addWidget(following); self.attention_layout.addLayout(row)
+                        previous = make_button("上一页历史", lambda: self.page_past_warnings(max(0, self.past_warning_offset-5))); previous.setEnabled(self.past_warning_offset>0)
+                        following = make_button("下一页历史", lambda: self.page_past_warnings(self.past_warnings.get("next_offset"))); following.setEnabled(self.past_warnings.get("next_offset") is not None)
+                        self._compact_actions(self.attention_layout, [previous, following])
         for item in unknowns[:2]:
             text = item if isinstance(item, str) else item.get("message", item.get("reason", "部分时间信息尚待确认"))
             if text: self.attention_layout.addWidget(plain_label("待确认 · " + str(text), "Quiet"))
         for reminder in (reminders if self.show_all_reminders else reminders[:3]):
-            data = reminder.get("data", {}); card = QFrame(); card.setObjectName("AttentionCard"); layout = QVBoxLayout(card); layout.setContentsMargins(17, 13, 17, 13)
-            heading = reminder.get("title", "复盘提醒")
-            if data.get("business_date") and data["business_date"] != self.date_iso(): heading += " · " + data["business_date"]
-            layout.addWidget(plain_label(heading, "AttentionTitle")); layout.addWidget(plain_label(data.get("content", ""), "AttentionText")); actions = QHBoxLayout(); mode = data.get("review_mode")
-            if mode in ("daily", "weekly"):
-                day = data.get("business_date") or self.date_iso(); actions.addWidget(make_button("查看每周回顾" if mode == "weekly" else "前往每日复盘", lambda checked=False, d=day, m=mode: self.on_review(d, m) if self.on_review else None))
-            actions.addStretch(); actions.addWidget(make_button("知道了", lambda checked=False, item=reminder: self.mark_reminder_seen(item))); layout.addLayout(actions); self.attention_layout.addWidget(card)
-        if len(reminders)>3 and not self.show_all_reminders: self.attention_layout.addWidget(make_button(f"展开其余 {len(reminders)-3} 条近期提醒", self.expand_reminders))
+            data = reminder.get('data', {})
+            card = QFrame(); card.setObjectName('TimelineRow')
+            layout = QVBoxLayout(card); layout.setContentsMargins(0, 9, 0, 9); layout.setSpacing(5)
+            layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            heading = reminder.get('title', '复盘提醒')
+            if data.get('business_date') and data['business_date'] != self.date_iso(): heading += ' · ' + data['business_date']
+            layout.addWidget(self._reading_label(heading, 'AttentionTitle'))
+            if data.get('content'):
+                layout.addWidget(self._reading_label(data['content'], 'AttentionText'))
+            actions = []
+            mode = data.get('review_mode')
+            if mode in ('daily', 'weekly'):
+                day = data.get('business_date') or self.date_iso()
+                actions.append(make_button('查看每周回顾' if mode == 'weekly' else '前往每日复盘', lambda checked=False, d=day, m=mode: self.on_review(d, m) if self.on_review else None))
+            actions.append(make_button('知道了', lambda checked=False, item=reminder: self.mark_reminder_seen(item)))
+            self._compact_actions(layout, actions)
+            self.attention_layout.addWidget(card)
+        if len(reminders)>3 and not self.show_all_reminders:
+            self.attention_layout.addWidget(make_button(f"展开其余 {len(reminders)-3} 条近期提醒", self.expand_reminders), alignment=Qt.AlignmentFlag.AlignLeft)
 
     def toggle_past_warnings(self):
         self.past_expanded = not self.past_expanded

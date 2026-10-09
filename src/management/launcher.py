@@ -10,17 +10,17 @@ def choose_data_dir():
     app = QApplication.instance() or QApplication([])
     configure_application(app)
     dialog = QDialog()
-    dialog.setWindowTitle('选择数据空间')
+    dialog.setWindowTitle('Beta 测试版 · 选择数据空间')
     dialog.resize(570, 260)
     layout = QVBoxLayout(dialog)
-    intro = QLabel('软件和业务数据分开保存。选择已有空间会直接打开；选择新目录会创建空空间。')
+    intro = QLabel('请选择本 Beta 工作目录 .beta-data 下的独立测试空间。选择已有空间会直接打开；选择新目录会创建空空间。')
     intro.setWordWrap(True)
     layout.addWidget(intro)
     path = QLineEdit(str(default_data_dir()))
     layout.addWidget(path)
     browse = QPushButton('选择目录…')
     def select():
-        value = QFileDialog.getExistingDirectory(dialog, '选择数据目录')
+        value = QFileDialog.getExistingDirectory(dialog, '选择 Beta 数据目录')
         if value:
             path.setText(value)
     browse.clicked.connect(select)
@@ -33,6 +33,12 @@ def choose_data_dir():
     buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
     def accept():
         selected = Path(path.text()).expanduser().absolute()
+        from .data_space import BetaIsolationError, require_beta_dir
+        try:
+            selected = require_beta_dir(selected)
+        except BetaIsolationError as error:
+            status.setText(str(error))
+            return
         if (selected / 'restore_pending.json').exists():
             status.setText('此目录的恢复尚未完成，请从原空间重新恢复到新的目录。')
             return

@@ -6,13 +6,13 @@ import time
 import uuid
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
-from PySide6.QtCore import QDate, QPoint, Qt, QTimer
+from PySide6.QtCore import QDate, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCalendarWidget, QDateEdit, QDialog, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 from management.core import Core
 from management.gui_forms import EntityForm, FieldEditor, label_type
-from management.gui_charts import CoverageBar, VerticalCoverageBar, WeekDaysChart
+from management.gui_charts import CoverageBar, CoverageChart, CoverageRing, VerticalCoverageBar, WeekDaysChart
 from management.gui_calendar import install_calendar
 from management.gui_review import ReviewPage
 from management.schemas import BusinessError
@@ -20,6 +20,15 @@ from management.schemas import BusinessError
 
 @pytest.fixture(scope='session')
 def app():
+    # Windows' offscreen platform needs fonts loaded explicitly for layout evidence.
+    from pathlib import Path
+    from PySide6.QtGui import QFontDatabase
+    instance = QApplication.instance() or QApplication([])
+    if instance.platformName() == 'offscreen' and os.name == 'nt':
+        for name in ('msyh.ttc', 'msyhbd.ttc'):
+            path = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / name
+            if path.is_file():
+                QFontDatabase.addApplicationFont(str(path))
     return QApplication.instance() or QApplication([])
 
 
@@ -328,6 +337,223 @@ def test_rows_columns_switch_preserves_day_data_and_navigation(app):
         assert chart.layout_style=='columns'
     finally:
         chart.close()
+
+
+def test_ring_keeps_denominator_unknown_and_attendance_separate(app):
+    chart=CoverageChart()
+    summary={'total':4,'done':1,'unreported':2,'other_reported':1,'fixed_scheduled':1,
+             'breakdown':[{'key':'task:done','kind':'task','result':'done','count':1},
+                          {'key':'course:attended','kind':'course_attendance','result':'attended','count':1},
+                          {'key':'task:unreported','kind':'task','result':'unreported','count':2}]}
+    try:
+        chart.set_summary(summary,denominator='四个虚构事项')
+        wording=[label.text() for label in (chart.heading,chart.legend,chart.denominator)]
+        chart.set_style('ring')
+        assert chart.summary==chart.ring.summary==summary
+        assert chart.ring.values['incomplete']==0 and chart.ring.values['unreported']==2
+        assert sum(angle for _,angle in chart.ring.segment_angles())==pytest.approx(360)
+        assert next(angle for row,angle in chart.ring.segment_angles() if row['result']=='unreported')==180
+        assert wording==[label.text() for label in (chart.heading,chart.legend,chart.denominator)]
+        assert '课程 · 已参加' in chart.legend.text() and '已反馈 2 / 4' in chart.heading.text()
+        chart.set_summary({})
+        assert chart.ring.segment_angles()==[] and '不计算' in chart.ring.accessibleName()
+        assert '不按 0% 完成处理' in chart.denominator.text()
+        chart.resize(420,360);chart.show();app.processEvents()
+        assert not chart.grab().isNull()
+    finally:chart.close()
+
+
+def test_weekly_circle_cards_keep_missing_empty_unreported_and_navigation(app):
+    chart=WeekDaysChart();original=days();selected=[]
+    chart.date_selected.connect(selected.append)
+    try:
+        chart.set_days(original);chart.set_style('tiles');chart.resize(460,900);chart.show();app.processEvents()
+        assert chart.days==original and len(chart.cards)==7
+        assert all(isinstance(bar,CoverageRing) for bar in chart.bars)
+        assert chart.bars[2].empty_label=='无计划' and chart.bars[3].empty_label=='空计划'
+        assert chart.bars[2].segment_angles()==chart.bars[3].segment_angles()==[]
+        assert '缺计划' in chart.day_labels[2].text() and '空计划' in chart.day_labels[3].text()
+        assert '未反馈 4' in chart.day_labels[4].text() and '未完成' not in chart.day_labels[4].text()
+        assert chart.bars[6].values['done']==3
+        chart.cards[0].findChild(QPushButton).click()
+        assert selected==['2030-01-07']
+        chart.set_style('columns');assert chart.days==original
+    finally:chart.close()
+
+
+def test_chart_restyling_preserves_unsaved_review_choices_without_requests(app):
+    from test_review_ui_v2 import ControlledBridge,daily,load
+    bridge=ControlledBridge();page=ReviewPage(bridge);requested=[]
+    page.chart_settings_requested.connect(requested.append)
+    try:
+        load(page,bridge,daily());button=page.item_buttons['task-a']['done'];button.click()
+        before=copy.deepcopy(page._states);queries=len(bridge.queries)
+        page.set_chart_preferences({'review_daily_style':'ring','review_weekly_style':'ring','weekly_style':'tiles'})
+        assert page.item_buttons['task-a']['done'] is button and button.isChecked()
+        assert page._states==before and page._pending
+        assert len(bridge.queries)==queries and bridge.commands==[]
+        assert page.daily_chart.chart_style==page.week_chart.chart_style=='ring' and page.week_days.layout_style=='tiles'
+        next(b for b in page.findChildren(QPushButton) if b.accessibleName()=='设置每日复盘图表样式').click()
+        assert requested==['review_daily_style']
+    finally:page.close()
+
+
+def test_dashboard_charts_restyle_locally_and_do_not_label_all_open_tasks_as_failure(app):
+    from management.gui_dashboard import DashboardPage
+    from test_review_ui_v2 import ControlledBridge
+    bridge=ControlledBridge();page=DashboardPage(bridge);requested=[]
+    page.chart_settings_requested.connect(requested.append)
+    sample={'date_label':'2030 年 1 月 7 日','weekday':'星期一','date':'2030-01-07',
+        'week_label':'演示周','week_start':'2030-01-07','week_end':'2030-01-13','periods':[],
+        'plan':{'has_plan':True,'summary':{'total':2,'done':0,'unreported':2}},
+        'warnings':{'counts':{'current':0,'past':0},'items':[]},
+        'tasks':{'total':5,'done':1,'open':4},'days':[],'owners':[]}
+    try:
+        page.render(sample)
+        page.set_chart_preferences({'dashboard_today_style':'ring','dashboard_tasks_style':'ring'})
+        assert not bridge.queries and not bridge.commands
+        assert page.charts['plan'].ring.values['unreported']==2
+        assert page.charts['tasks'].ring.total==5 and page.charts['tasks'].ring.values['incomplete']==0
+        assert '待办（含待反馈）' in page.charts['tasks'].legend.text()
+        assert '待办不等于失败' in page.charts['tasks'].denominator.text()
+        next(b for b in page.findChildren(QPushButton) if b.accessibleName()=='设置任务概况图表样式').click()
+        assert requested==['dashboard_tasks_style']
+    finally:page.close()
+
+
+@pytest.mark.parametrize('theme',['light','dark'])
+def test_circle_cards_fit_narrow_scroll_area_at_large_font(app,theme):
+    from management.gui_theme import apply_appearance,current_appearance
+    previous=current_appearance();scroll=QScrollArea();chart=WeekDaysChart()
+    try:
+        apply_appearance(app,{**previous,'theme':theme,'font_size':20})
+        chart.set_style('tiles');chart.set_days(days());scroll.setWidgetResizable(True);scroll.setWidget(chart)
+        scroll.resize(420,600);scroll.show();app.processEvents()
+        assert scroll.horizontalScrollBar().maximum()==0
+        assert chart.bars[2].minimumWidth()<=chart.cards[2].width()
+        assert not scroll.grab().isNull()
+    finally:
+        scroll.close();scroll.deleteLater();app.processEvents();apply_appearance(app,previous)
+
+
+@pytest.mark.parametrize('theme,font_size',[('light',13),('dark',20)])
+@pytest.mark.parametrize('width',[720,1120])
+def test_dashboard_switching_chart_style_updates_parent_height_without_clipping(app,theme,font_size,width):
+    from management.gui_dashboard import DashboardPage
+    from management.gui_theme import apply_appearance,current_appearance
+    from test_review_ui_v2 import ControlledBridge
+    previous=current_appearance();page=DashboardPage(ControlledBridge())
+    sample={'date_label':'2030 年 1 月 7 日','weekday':'星期一','date':'2030-01-07',
+        'week_label':'演示周','week_start':'2030-01-07','week_end':'2030-01-13','periods':[],
+        'plan':{'has_plan':False,'summary':{'total':0,'done':0,'unreported':0}},
+        'warnings':{'counts':{'current':0,'past':0},'items':[]},
+        'tasks':{'total':1,'done':0,'open':1},'days':[
+            {'weekday':'周'+'一二三四五六日'[index],'date':f'2030-01-{7+index:02d}',
+             'is_today':index==0,'events':[],'event_count':0} for index in range(7)],'owners':[]}
+    def rect_in(widget,ancestor):
+        return QRect(widget.mapTo(ancestor,QPoint(0,0)),widget.size())
+    def settle_layout():
+        app.processEvents()
+        wait(app,lambda:not page._layout_pending and not page._relayout_active and not page._layout_timer.isActive())
+    def assert_sections_do_not_overlap():
+        body=page.widget()
+        heading=next(label for label in page.findChildren(QLabel) if label.text()=='本周固定日程')
+        cards=[rect_in(card,body) for card in page.metric_cards]
+        assert all(page.metric_panel.rect().contains(rect_in(card,page.metric_panel)) for card in page.metric_cards), (page.metric_panel.rect(),page.metric_panel.minimumHeight(),[(rect_in(card,page.metric_panel),card.minimumHeight(),card.minimumSizeHint()) for card in page.metric_cards],page.metric_grid.minimumSize(),page.metric_grid.totalHeightForWidth(page.metric_panel.width()))
+        assert all(card.bottom()<rect_in(heading,body).top() for card in cards)
+        regions=cards+[rect_in(card,body) for card in page.week_cards]
+        assert all(not first.intersects(second) for index,first in enumerate(regions) for second in regions[index+1:])
+    try:
+        apply_appearance(app,{**previous,'theme':theme,'font_size':font_size})
+        page.resize(width,760);page.render(sample);page.show();settle_layout()
+        page.set_chart_preferences({'dashboard_today_style':'bar','dashboard_tasks_style':'bar'})
+        settle_layout()
+        page.set_chart_preferences({'dashboard_today_style':'ring','dashboard_tasks_style':'ring'})
+        settle_layout()
+        ring_heights={key:chart.minimumHeight() for key,chart in page.charts.items()}
+        for chart in page.charts.values():
+            ring=rect_in(chart.ring,chart);card=chart.parentWidget()
+            assert chart.rect().contains(ring)
+            assert card.rect().contains(rect_in(chart.ring,card))
+            for label in (chart.legend,chart.denominator):
+                assert chart.rect().contains(rect_in(label,chart))
+                assert not ring.intersects(rect_in(label,chart))
+        assert_sections_do_not_overlap()
+        page.refresh();page.bridge.deliver('dashboard',sample);settle_layout()
+        assert_sections_do_not_overlap()
+        apply_appearance(app,{**previous,'theme':theme,'font_size':20 if font_size==13 else 13});settle_layout()
+        assert_sections_do_not_overlap()
+        apply_appearance(app,{**previous,'theme':theme,'font_size':font_size});settle_layout()
+        page.set_chart_preferences({'dashboard_today_style':'bar','dashboard_tasks_style':'bar'})
+        settle_layout()
+        assert_sections_do_not_overlap()
+        for key,chart in page.charts.items():
+            assert chart.ring.isHidden() and not chart.bar.isHidden()
+            assert chart.minimumHeight()<ring_heights[key]
+            assert chart.rect().contains(rect_in(chart.bar,chart))
+    finally:
+        page.close();page.deleteLater();app.processEvents();apply_appearance(app,previous)
+
+
+def test_dashboard_font_change_reflows_cards_without_resizing_window(app):
+    from management.gui_dashboard import DashboardPage
+    from management.gui_theme import apply_appearance,current_appearance
+    from test_review_ui_v2 import ControlledBridge
+    previous=current_appearance();page=DashboardPage(ControlledBridge())
+    try:
+        apply_appearance(app,{**previous,'font_size':13})
+        page.resize(850,700);page.show();app.processEvents()
+        assert page.metric_grid.getItemPosition(1)[:2]==(0,1)
+        apply_appearance(app,{**previous,'font_size':20});app.processEvents()
+        assert page.metric_grid.getItemPosition(1)[:2]==(1,0)
+    finally:
+        page.close();page.deleteLater();app.processEvents();apply_appearance(app,previous)
+
+
+def test_dashboard_details_have_local_actions_and_reflow_without_business_changes(app):
+    from management.gui_dashboard import DashboardPage
+    from management.gui_theme import apply_appearance, current_appearance
+    from test_review_ui_v2 import ControlledBridge
+    from PySide6.QtWidgets import QPushButton, QProgressBar
+    previous=current_appearance()
+    opened=[];bridge=ControlledBridge()
+    page=DashboardPage(bridge,on_task=opened.append,on_projects=opened.append)
+    sample={'date':'2030-01-07','date_label':'2030 年 1 月 7 日','weekday':'星期一',
+        'week_label':'演示周','week_start':'2030-01-07','week_end':'2030-01-13','periods':[],
+        'plan':{'has_plan':False,'summary':{'total':0,'done':0,'unreported':0}},
+        'warnings':{'counts':{'current':52,'past':0},'items':[
+            {'id':'task-sample','title':'检查虚构活动的准备材料','reason':'明天到期','owner_label':'虚构项目'}], 'next_offset':5},
+        'tasks':{'total':8,'done':2,'open':6},'days':[],
+        'owners':[{'id':'course-sample','label':'虚构课程','total':8,'done':2,'open':6}]}
+    try:
+        apply_appearance(app,{**previous,'font_size':13})
+        page.resize(1200,850);page.show();page.render(sample);app.processEvents()
+        wait(app,lambda:not page._layout_pending)
+        assert page.metric_cards[1].width()<page.metric_panel.width()*.6
+        assert page.details_grid.getItemPosition(1)[:2]==(0,1)
+        assert page.attention_section.width()<page.viewport().width()*.7
+        assert page.all_alerts.width()<=page.all_alerts.sizeHint().width()+2
+        assert page.owner_open.width()<=page.owner_open.sizeHint().width()+2
+        assert all(bar.width()<=280 for bar in page.owner_section.findChildren(QProgressBar))
+        assert page.owner_open.isVisible() and page.owner_open.height()>=page.owner_open.sizeHint().height()
+        for bar in page.owner_section.findChildren(QProgressBar):
+            assert bar.isVisible() and bar.geometry().bottom()<page.owner_section.height()
+            assert bar.height()==6
+        assert page.owner_rows.count()==1
+        next(button for button in page.alert_box.findChildren(QPushButton) if button.text().startswith('查看事项')).click()
+        assert opened==['task-sample']
+        apply_appearance(app,{**previous,'font_size':20});page.resize(760,850);app.processEvents()
+        assert page.details_grid.getItemPosition(1)[:2]==(1,0)
+        assert page.horizontalScrollBar().maximum()==0
+        assert not getattr(bridge,'commands',[])
+        apply_appearance(app,{**previous,'theme':'dark','font_size':20});app.processEvents()
+        assert page.alert_box.objectName()=='ContentSection'
+        assert page.details_grid.getItemPosition(1)[:2]==(1,0)
+        assert sample['warnings']['counts']['current']==52
+        assert not getattr(bridge,'commands',[])
+    finally:
+        page.close();page.deleteLater();app.processEvents()
+        apply_appearance(app,previous)
 
 
 def test_calendar_installation_is_idempotent_preserves_date_bounds_and_optional_unknown(app):

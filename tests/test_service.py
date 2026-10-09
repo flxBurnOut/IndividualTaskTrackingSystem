@@ -83,6 +83,32 @@ def test_http_body_limits_and_valid_headers(service):
         assert status == 400 and value['error']['code'] == 'validation'
 
 
+def test_two_backends_keep_process_database_receipt_and_exit_independent(tmp_path):
+    roots = [tmp_path / 'isolated-one', tmp_path / 'isolated-two']
+    clients = []
+    try:
+        clients = [Client(root) for root in roots]
+        a, b = clients
+        assert a.runtime['pid'] != b.runtime['pid']
+        assert a.runtime['port'] != b.runtime['port']
+        assert a.runtime['token'] != b.runtime['token']
+        assert a.epoch != b.epoch
+        before_b = b.state()
+        receipt = a.command('create', {'type': 'task', 'title': 'Synthetic isolated record'}, request_id='isolated-shared-request-01')
+        assert receipt['revision'] == 1 and b.state() == before_b
+        assert b.query('list', type='task')['total'] == 0
+        a.stop_service()
+        deadline = time.monotonic() + 10
+        while psutil.pid_exists(a.runtime['pid']) and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert not psutil.pid_exists(a.runtime['pid'])
+        assert b.state() == before_b
+        assert b.command('create', {'type': 'task', 'title': 'Still available'}, request_id='isolated-shared-request-01')['revision'] == 1
+    finally:
+        for root in roots:
+            stop_owned_service(root)
+
+
 def wait_job(client, id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -232,7 +258,7 @@ def test_scheduler_two_rules_same_day_remind_once_without_creating_checkins(tmp_
     assert {n['data']['schedule_id'] for n in notices} == {a['id'], b['id']}
     assert {n['data']['business_date'] for n in notices} == {'2030-02-05'}
     assert all(n['data']['review_mode'] == 'daily' and n['data']['target_id'] is None for n in notices)
-    expected = '完成或未完成' if has_plan else 'Codex'
+    expected = '完成或未完成' if has_plan else '记录实际情况'
     assert all(expected in n['data']['content'] for n in notices)
     assert core.query('list', type='feedback')['total'] == 0
     with core.store.connect() as c:
@@ -251,6 +277,22 @@ def test_scheduled_weekly_review_only_reminds_without_saving_empty_report(tmp_pa
     assert core.query('list', type='review')['total'] == 0
     assert core.query('list', type='checkin')['total'] == 0
     assert core.query('list', type='feedback')['total'] == 0
+
+
+@pytest.mark.parametrize('workflow', ['checkin', 'weekly_review'])
+def test_review_reminder_without_ai_points_to_manual_feedback_and_notes(tmp_path, workflow):
+    core = Core(tmp_path / 'manual-reminder-synthetic')
+    assert core.query('settings')['settings']['ai']['enabled'] is False
+    add_schedule(core, 'Synthetic manual reminder', workflow=workflow)
+    Background(core, threading.Event()).tick(dt.datetime(2030, 2, 5, 2, tzinfo=dt.timezone.utc))
+    notices = core.query('list', type='notification')['items']
+    assert len(notices) == 1
+    text = notices[0]['data']['content']
+    assert '记录实际情况' in text and '文字小结' in text and 'Codex' not in text
+    assert notices[0]['data']['business_date'] == '2030-02-05'
+    assert core.query('jobs')['items'] == []
+    for kind in ('plan', 'feedback', 'review', 'checkin'):
+        assert core.query('list', type=kind)['total'] == 0
 
 
 def test_restore_epoch_cancels_jobs_and_disables_replay(tmp_path):

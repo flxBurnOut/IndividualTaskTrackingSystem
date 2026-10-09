@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (
     QLabel, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QDateEdit,
     QProxyStyle, QStyle, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QTextBrowser, QSizePolicy,
 )
-from .gui_forms import label_type, label_status, DeleteTaskDialog
+from .gui_forms import label_type, label_status, DeleteTaskDialog, EntityPicker, EntityForm
 from .gui_calendar import install_calendar
 from .gui_theme import color, bind_theme
+from .gui_layout import ActionRow
 from .gui_sources import AddSourceDialog, RefileSourceDialog, SourceContentDialog, extraction_label, source_origin
 
 BASE_TYPES = ("task", "project", "course", "activity", "domain", "goal")
@@ -21,8 +22,8 @@ CONTAINERS = {"domain", "project", "course", "activity", "phase", "task", "note"
 TYPE_MARKS = {"domain": "域", "project": "项", "course": "课", "activity": "活", "goal": "目", "phase": "阶", "milestone": "里", "topic": "知", "task": "·", "note": "记"}
 
 
-def make_button(text, callback=None, primary=False):
-    result = QPushButton(text)
+def make_button(text, callback=None, primary=False, *, parent=None):
+    result = QPushButton(text, parent)
     if callback:
         result.clicked.connect(callback)
     if primary:
@@ -337,10 +338,106 @@ class NoteReader(QTextBrowser):
         return None
 
 
-class TaskDetailDialog(QDialog):
-    def __init__(self, bridge, entity, parent=None, on_edit=None, on_open=None, on_saved=None, business_date=None, on_codex=None):
+class TaskDependenciesDialog(QDialog):
+    """Edit the same directed links used by the shared planning validator."""
+    def __init__(self, bridge, entity, parent=None, on_saved=None):
         super().__init__(parent)
         self.bridge, self.entity, self.on_saved = bridge, entity, on_saved
+        self.offset, self.history, self.next_offset = 0, [], None
+        self.pending, self.closed, self.generation = False, False, 0
+        self.finished.connect(lambda _: setattr(self, 'closed', True))
+        self.destroyed.connect(lambda *_: setattr(self, 'closed', True))
+        self.setWindowTitle('任务前后依赖'); self.resize(670, 500)
+        layout = QVBoxLayout(self)
+        layout.addWidget(plain_label(entity['title'], 'DialogHeading'))
+        layout.addWidget(plain_label('前置任务需要先完成；后续任务依赖当前任务。调整关系不会改变任何完成记录，也不会自动移动已有计划。', 'Quiet'))
+        self.actions = QWidget(); actions = QHBoxLayout(self.actions); actions.setContentsMargins(0, 0, 0, 0)
+        actions.addWidget(make_button('添加前置任务', lambda: self.choose('before')))
+        actions.addWidget(make_button('添加后续任务', lambda: self.choose('after')))
+        layout.addWidget(self.actions)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        self.rows = QWidget(); self.rows_layout = QVBoxLayout(self.rows); scroll.setWidget(self.rows); layout.addWidget(scroll, 1)
+        self.status = plain_label('', 'Quiet'); layout.addWidget(self.status)
+        pages = QHBoxLayout(); self.previous = make_button('上一页', self.previous_page); self.following = make_button('下一页', self.next_page)
+        pages.addWidget(self.previous); pages.addWidget(self.following); pages.addStretch()
+        self.reload_button = make_button('重新读取', self.load); pages.addWidget(self.reload_button)
+        pages.addWidget(make_button('关闭', self.accept)); layout.addLayout(pages)
+        self.load()
+
+    def set_busy(self, busy):
+        self.pending = busy
+        self.actions.setEnabled(not busy); self.rows.setEnabled(not busy)
+        self.previous.setEnabled(not busy and bool(self.history))
+        self.following.setEnabled(not busy and self.next_offset is not None)
+        self.reload_button.setEnabled(not busy)
+
+    def load(self):
+        if self.closed or self.pending: return
+        self.generation += 1; generation = self.generation
+        self.set_busy(True); self.status.setText('正在读取依赖…')
+        def loaded(result):
+            if self.closed or generation != self.generation: return
+            self.snapshot_epoch = result.get('epoch', self.bridge.epoch)
+            self.snapshot_revision = result.get('revision', self.bridge.revision)
+            data = result.get('dependencies') or {}; items = data.get('items', [])
+            self.next_offset = data.get('next_offset'); clear_layout(self.rows_layout)
+            for link in items:
+                before = link['source_id'] == self.entity['id']
+                row = QHBoxLayout()
+                row.addWidget(plain_label(('先完成：' if before else '完成本项后：') + link['target_title' if before else 'source_title']), 1)
+                row.addWidget(make_button('解除依赖', lambda _, item=link: self.remove(item)))
+                self.rows_layout.addLayout(row)
+            if not items: self.rows_layout.addWidget(plain_label('本页没有依赖。' if self.offset else '没有设置前置或后续任务。', 'Quiet'))
+            self.rows_layout.addStretch()
+            self.status.setText(f"本页 {len(items)} 项，共 {data.get('total', len(items))} 项依赖。")
+            self.set_busy(False)
+        self.bridge.query('object_workspace', loaded, self.failed, id=self.entity['id'], dependencies_offset=self.offset, dependencies_limit=30, limit=1, files_limit=1)
+
+    def failed(self, error):
+        if self.closed: return
+        self.set_busy(False); self.status.setText(error.get('message', str(error)))
+
+    def choose(self, direction):
+        if self.pending: return
+        picker = EntityPicker(self.bridge, self, allowed_types=['task'], exclude=[self.entity['id']])
+        try:
+            if picker.exec() == QDialog.DialogCode.Accepted:
+                self.add(picker.selected, direction)
+        finally: picker.deleteLater()
+
+    def add(self, other, direction):
+        if self.pending or not other or other.get('type') != 'task' or other['id'] == self.entity['id']: return
+        source, target = (self.entity, other) if direction == 'before' else (other, self.entity)
+        self.write('link', {'source_id': source['id'], 'target_id': target['id'], 'kind': 'depends_on'})
+
+    def remove(self, link):
+        if not self.pending: self.write('unlink', {'id': link['id']})
+
+    def write(self, command, payload):
+        self.set_busy(True); self.status.setText('正在保存依赖…')
+        def saved(receipt):
+            if self.on_saved: self.on_saved(receipt)
+            if self.closed: return
+            self.offset, self.history = 0, []
+            self.set_busy(False); self.load()
+        self.bridge.command(command, payload, saved, self.failed, epoch=self.snapshot_epoch, expected_revision=self.snapshot_revision)
+
+    def next_page(self):
+        if self.next_offset is not None and not self.pending:
+            self.history.append(self.offset); self.offset = self.next_offset; self.load()
+
+    def previous_page(self):
+        if self.history and not self.pending:
+            self.offset = self.history.pop(); self.load()
+
+
+class TaskDetailDialog(QDialog):
+    def __init__(self, bridge, entity, parent=None, on_edit=None, on_open=None, on_saved=None, business_date=None, on_codex=None, assistants_visible=True):
+        super().__init__(parent)
+        self.bridge, self.entity, self.on_saved = bridge, entity, on_saved
+        self.on_edit, self.on_open = on_edit, on_open
+        self.children_offset, self.children_history, self.children_next = 0, [], None
+        self.children_generation = 0
         self.completion_saving = False
         self.completion_epoch, self.completion_revision = bridge.epoch, bridge.revision
         self.completion_date = business_date or QDate.currentDate().toString("yyyy-MM-dd")
@@ -382,6 +479,20 @@ class TaskDetailDialog(QDialog):
                     content = plain_label(str(data[key])); content.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 details_layout.addWidget(content)
         details_layout.addStretch()
+        if entity['type'] == 'task' and not entity.get('archived'):
+            child_section = QWidget(); child_layout = QVBoxLayout(child_section); child_layout.setContentsMargins(0, 0, 0, 0)
+            self.children_note = plain_label('正在读取子任务…', 'Quiet'); child_layout.addWidget(self.children_note)
+            self.child_tasks = QTreeWidget(); self.child_tasks.setRootIsDecorated(False)
+            self.child_tasks.setHeaderLabels(['子任务', '完成标准']); self.child_tasks.setColumnWidth(0, 250)
+            self.child_tasks.setMinimumHeight(130); self.child_tasks.setMaximumHeight(210)
+            self.child_tasks.itemDoubleClicked.connect(self.open_child); child_layout.addWidget(self.child_tasks)
+            child_actions = QHBoxLayout()
+            self.children_previous = make_button('上一页子任务', self.previous_children); child_actions.addWidget(self.children_previous)
+            self.children_more = make_button('下一页子任务', self.next_children); child_actions.addWidget(self.children_more)
+            child_actions.addWidget(make_button('打开子任务', self.open_child)); child_actions.addStretch(); child_layout.addLayout(child_actions)
+            details_layout.insertWidget(details_layout.count() - 1, child_section)
+            self.children_section = child_section
+            self.load_children()
         if entity["type"] == "task" and not entity.get("archived"):
             quick = QHBoxLayout()
             self.complete_button = make_button("标记未完成" if (entity.get("completion_state") == "done" if entity.get("completion_state") is not None else entity.get("status") == "done") else "标记完成", self.mark_complete, True)
@@ -397,6 +508,11 @@ class TaskDetailDialog(QDialog):
             self.join_plan_button.setEnabled(False); entry.addWidget(self.join_plan_button); entry.addStretch(); layout.addLayout(entry)
             self.plan_note = plain_label("正在读取当天安排…", "Quiet"); layout.addWidget(self.plan_note)
             self.plan_date.dateChanged.connect(self.load_plan); self.load_plan()
+            details_layout.insertWidget(details_layout.count() - 1, make_button('查看与设置前后依赖', self.open_dependencies))
+            from .gui_task_batch import can_split_task
+            self.split_button = make_button('拆分为独立子任务…', self.split_task)
+            self.split_button.setEnabled(can_split_task(entity))
+            details_layout.insertWidget(details_layout.count() - 1, self.split_button)
         elif entity["type"] == "milestone":
             layout.addWidget(plain_label("这里记录交付或检查点，不直接算作每日任务。长期要求和学习建议应先核对来源，再决定怎样安排。", "Quiet"))
             if has_preparation_date(entity):
@@ -409,7 +525,10 @@ class TaskDetailDialog(QDialog):
         self.edit_button = make_button("编辑笔记" if entity["type"] == "note" else "编辑说明与日期" if entity["type"] == "milestone" else "编辑", lambda: (self.accept(), on_edit(self.entity)) if on_edit else None, True)
         self.edit_button.setEnabled(on_edit is not None and not entity.get("archived"))
         row.addWidget(self.edit_button)
-        if entity["type"] == "note" and on_codex: row.addWidget(make_button("与 Codex 整理", lambda: (self.accept(), on_codex(entity))))
+        self.assistant_button = None
+        if entity["type"] == "note" and on_codex:
+            self.assistant_button = make_button("请助手整理", lambda: (self.accept(), on_codex(entity)), parent=self)
+            row.addWidget(self.assistant_button); self.assistant_button.setVisible(assistants_visible)
         if entity["type"] == "task":
             self.delete_button = make_button("恢复任务" if entity.get("archived") else "删除任务", self.delete_task)
             self.delete_button.setObjectName("DeleteTask")
@@ -417,6 +536,82 @@ class TaskDetailDialog(QDialog):
         row.addStretch()
         row.addWidget(make_button("关闭", self.accept))
         layout.addLayout(row)
+
+    def set_assistants_visible(self, visible):
+        if self.assistant_button: self.assistant_button.setVisible(bool(visible))
+
+    def load_children(self):
+        if self.closed or self.entity['type'] != 'task' or self.entity.get('archived'): return
+        self.children_generation += 1; generation = self.children_generation
+        self.children_previous.setEnabled(False); self.children_more.setEnabled(False)
+        def loaded(result):
+            if self.closed or generation != self.children_generation: return
+            self.child_tasks.clear()
+            for entity in result.get('items', []):
+                item = QTreeWidgetItem([entity['title'], str(entity.get('data', {}).get('completion_gate') or '尚未填写')])
+                item.setData(0, Qt.ItemDataRole.UserRole, entity)
+                for column in range(2): item.setToolTip(column, item.text(column))
+                self.child_tasks.addTopLevelItem(item)
+            self.children_next = result.get('next_offset')
+            total = result.get('total', len(result.get('items', [])))
+            self.children_note.setText(f'子任务 · 共 {total} 项。每项有独立完成记录；完成全部子任务不会自动确认原任务完成。' if total else '尚无子任务。可以把大任务拆成有独立完成标准的步骤。')
+            self.child_tasks.setVisible(bool(total))
+            self.children_previous.setEnabled(bool(self.children_history)); self.children_more.setEnabled(self.children_next is not None)
+            if self.child_tasks.topLevelItemCount(): self.child_tasks.setCurrentItem(self.child_tasks.topLevelItem(0))
+        def failed(error):
+            if not self.closed and generation == self.children_generation: self.children_note.setText('子任务读取失败：' + error.get('message', str(error)))
+        self.bridge.query('list', loaded, failed, type='task', parent_id=self.entity['id'], limit=20, offset=self.children_offset)
+
+    def next_children(self):
+        if self.children_more.isEnabled() and self.children_next is not None:
+            self.children_history.append(self.children_offset); self.children_offset = self.children_next; self.load_children()
+
+    def previous_children(self):
+        if self.children_previous.isEnabled() and self.children_history:
+            self.children_offset = self.children_history.pop(); self.load_children()
+
+    def open_child(self, *_):
+        item = self.child_tasks.currentItem()
+        if item: self.open_child_id(item.data(0, Qt.ItemDataRole.UserRole)['id'])
+
+    def open_child_id(self, identifier):
+        if self.closed: return
+        if self.on_open: self.on_open(identifier); return
+        def loaded(result):
+            if self.closed: return
+            dialog = TaskDetailDialog(self.bridge, result['entity'], self, self.on_edit, on_saved=self.child_saved, business_date=self.completion_date)
+            self.dialogs.append(dialog)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.finished.connect(lambda *_:self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+            dialog.open()
+        self.bridge.query('get', loaded, lambda error: self.children_note.setText(error.get('message', str(error))) if not self.closed else None, id=identifier, display=True)
+
+    def child_saved(self, receipt):
+        if not self.closed:
+            self.completion_epoch = receipt.get('epoch', self.bridge.epoch)
+            self.completion_revision = receipt.get('revision', self.bridge.revision)
+            self.children_offset, self.children_history = 0, []
+            self.load_children()
+        if self.on_saved: self.on_saved(receipt)
+
+    def split_task(self):
+        from .gui_task_batch import TaskBatchDialog, can_split_task
+        if self.closed or self.completion_saving or self.saving_plan or not can_split_task(self.entity): return
+        dialog = TaskBatchDialog(self.bridge, self, source=self.entity, on_saved=self.child_saved, on_open=self.open_child_id)
+        self.dialogs.append(dialog)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.finished.connect(lambda *_:self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+        dialog.open()
+
+    def open_dependencies(self):
+        def saved(receipt):
+            if not self.closed:
+                self.completion_epoch = receipt.get('epoch', self.bridge.epoch)
+                self.completion_revision = receipt.get('revision', self.bridge.revision)
+                self.load_plan()
+            if self.on_saved: self.on_saved(receipt)
+        dialog = TaskDependenciesDialog(self.bridge, self.entity, self, saved)
+        self.dialogs.append(dialog); dialog.open()
 
     def mark_complete(self):
         if self.closed or self.completion_saving: return
@@ -497,7 +692,12 @@ class WorkspacePage(QWidget):
         self.setAcceptDrops(True)
         self.dialogs = set()
         self.current_entity = None
+        self.assistants_visible = True
+        self.assistant_buttons = []
+        self.last_result = None
         self.files_offset, self.files_history = 0, []
+        self.content_offsets = {'children': 0, 'assessments': 0, 'events': 0}
+        self.content_history = {key: [] for key in self.content_offsets}
         self.generation = 0
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -540,6 +740,22 @@ class WorkspacePage(QWidget):
         layout.addWidget(split)
         self.empty()
 
+    def set_assistants_visible(self, visible):
+        self.assistants_visible = bool(visible)
+        for button in self.assistant_buttons:
+            button.setVisible(self.assistants_visible)
+        for dialog in self.dialogs:
+            if hasattr(dialog, 'set_assistants_visible'):
+                dialog.set_assistants_visible(self.assistants_visible)
+
+    def assistant_action(self, text, callback):
+        # The action row may not yet be attached to the page. Parenting before
+        # setVisible prevents Qt from briefly showing a native button window.
+        button = make_button(text, callback, parent=self.content)
+        button.setVisible(self.assistants_visible)
+        self.assistant_buttons.append(button)
+        return button
+
     def set_sidebar_collapsed(self, collapsed):
         self.sidebar_collapsed = bool(collapsed)
         self.directory_panel.setVisible(not self.sidebar_collapsed)
@@ -577,7 +793,7 @@ class WorkspacePage(QWidget):
     def open_object(self, entity):
         if entity.get("type") in {"task", "note", "milestone", "topic"}:
             def loaded(result):
-                dialog = TaskDetailDialog(self.bridge, result["entity"], self, self.on_edit, on_saved=self.saved, on_codex=self.discuss_note if self.on_codex else None)
+                dialog = TaskDetailDialog(self.bridge, result["entity"], self, self.on_edit, on_saved=self.saved, on_codex=self.discuss_note if self.on_codex else None, assistants_visible=self.assistants_visible)
                 self.dialogs.add(dialog)
                 dialog.finished.connect(lambda _: self.dialogs.discard(dialog))
                 dialog.open()
@@ -585,6 +801,8 @@ class WorkspacePage(QWidget):
             return
         if not self.current_entity or self.current_entity["id"] != entity["id"]:
             self.files_offset, self.files_history = 0, []
+            self.content_offsets = {key: 0 for key in self.content_offsets}
+            self.content_history = {key: [] for key in self.content_offsets}
             self.completed_tasks_expanded=False
         self.current_entity = entity
         self.load_workspace(entity["id"])
@@ -592,7 +810,8 @@ class WorkspacePage(QWidget):
     def load_workspace(self, identifier):
         self.generation += 1
         generation = self.generation
-        self.bridge.query("object_workspace", lambda result: self.render(result) if generation == self.generation else None, self.show_error, id=identifier, files_offset=self.files_offset, separate_tasks=True)
+        self.bridge.query("object_workspace", lambda result: self.render(result) if generation == self.generation else None, self.show_error, id=identifier, files_offset=self.files_offset, separate_tasks=True,
+                          offset=self.content_offsets['children'], assessments_offset=self.content_offsets['assessments'], events_offset=self.content_offsets['events'])
 
     def section_header(self, title, action=None, label=None):
         row = QHBoxLayout()
@@ -602,32 +821,36 @@ class WorkspacePage(QWidget):
         self.content_layout.addLayout(row)
 
     def render(self, result):
+        self.last_result = result
         entity = result["entity"]
         self.current_entity = entity
+        self.assistant_buttons = []
         clear_layout(self.content_layout)
         names = self.tree.breadcrumb(entity["id"])
         self.content_layout.addWidget(plain_label(" / ".join(names[:-1]) or "项目与课程", "Eyebrow"))
-        header = QHBoxLayout()
+        header = QVBoxLayout()
         heading = QVBoxLayout()
         heading.addWidget(plain_label(entity["title"], "PageTitle"))
         heading.addWidget(plain_label(self.type_map.get(entity["type"], {}).get("label", label_type(entity["type"])), "Quiet"))
-        header.addLayout(heading, 1)
+        header.addLayout(heading)
+        header_actions = ActionRow()
+        header.addWidget(header_actions)
         edit_button = make_button("编辑", lambda: self.on_edit(entity))
         edit_button.setEnabled(not self.type_map.get(entity["type"], {}).get("read_only", False))
-        header.addWidget(edit_button)
+        header_actions.addWidget(edit_button)
         if entity['type'] in {'domain','project','course','activity','phase','task','goal'}:
             from .gui_library import open_library
             folder=make_button('打开文件夹')
             folder.clicked.connect(lambda _,b=folder,i=entity['id']:open_library(self.bridge,self,b,i,self.show_error))
-            header.addWidget(folder)
-        if entity["type"] == "event" and has_preparation_date(entity): header.addWidget(make_button(preparation_label(entity), lambda: self.open_recurring(entity)))
+            header_actions.addWidget(folder)
+        if entity["type"] == "event" and has_preparation_date(entity): header_actions.addWidget(make_button(preparation_label(entity), lambda: self.open_recurring(entity)))
         add = make_button("＋ 添加")
         menu = QMenu(add)
         kinds = ["task", "project", "activity", "goal", "note"]
         if entity["type"] in {"project", "phase"}:
             kinds += ["phase", "milestone"]
         if entity["type"] == "course":
-            kinds += ["topic", "milestone"]
+            kinds += ["topic", "milestone", "assessment"]
         if entity["type"] == "domain":
             kinds += ["domain", "course"]
         for kind in dict.fromkeys(kinds):
@@ -645,7 +868,7 @@ class WorkspacePage(QWidget):
             menu.addSeparator()
             menu.addAction("添加资料或通知…", self.attach_file)
         add.setMenu(menu)
-        header.addWidget(add)
+        header_actions.addWidget(add)
         self.content_layout.addLayout(header)
         description = entity.get("data", {}).get("purpose") or entity.get("data", {}).get("notes") or entity.get("data", {}).get("description")
         if description:
@@ -715,8 +938,9 @@ class WorkspacePage(QWidget):
             for record in topics:self.content_layout.addWidget(make_button(record["title"], lambda _, item=record: self.open_object(item)))
         notes = [record for record in records if record["type"] == "note"]
         if notes or entity["type"] == "course":
-            self.section_header("课程笔记" if entity["type"] == "course" else "笔记", (lambda: self.on_codex(entity, intent="course_notes")) if self.on_codex else None, "整理课件笔记")
-            if not notes:self.content_layout.addWidget(plain_label("添加课件后，可在课程对话中说“这是课件，整理笔记”。整理结果核对后再保存。", "Quiet"))
+            self.section_header("课程笔记" if entity["type"] == "course" else "笔记", (lambda: self.on_create('note', entity)) if self.on_create else None, "＋ 新建笔记")
+            if self.on_codex: self.content_layout.addWidget(self.assistant_action('请助手整理课件笔记', lambda: self.on_codex(entity, intent='course_notes')), alignment=Qt.AlignmentFlag.AlignLeft)
+            if not notes:self.content_layout.addWidget(plain_label("可以直接新建笔记，记录正文与来源；添加课件后可打开资料边读边整理。", "Quiet"))
             for note in notes:
                 card = QFrame(); card.setObjectName("FileRow"); inner = QHBoxLayout(card); words = QVBoxLayout()
                 title = make_button(note["title"], lambda _, item=note: self.open_object(item)); title.setObjectName("TextLink"); words.addWidget(title)
@@ -725,9 +949,7 @@ class WorkspacePage(QWidget):
                 words.addWidget(plain_label(excerpt[:150] + ("…" if len(excerpt)>150 else ""), "Quiet")); inner.addLayout(words, 1)
                 if self.on_edit:inner.addWidget(make_button("编辑笔记", lambda _, item=note: self.on_edit(item)))
                 self.content_layout.addWidget(card)
-        children_total = result.get("children_total")
-        if result.get("next_offset") is not None:
-            self.content_layout.addWidget(plain_label(f"本页展示 {len(children)} 项下级内容；其余内容可在左侧展开目录分页查看。", "Quiet"))
+        self.content_pager('children', result.get('children_total', len(children)), len(children), result.get('next_offset'), '下级内容')
         if entity["type"] == "course":
             self.course_information(result.get("course_info", {}))
         can_attach = entity["type"] in {"domain", "project", "course", "activity", "phase", "task", "goal"}
@@ -758,6 +980,12 @@ class WorkspacePage(QWidget):
             if data.get("source_kind"):
                 inner.addWidget(make_button("查看提取", lambda _, item=file: self.view_source(item)))
             inner.addWidget(make_button("打开" if is_reference else "打开原文件", lambda _, identifier=file["id"]: self.open_file(identifier)))
+            create = make_button('从资料建立…')
+            create_menu = QMenu(create)
+            for kind, title in [('task', '任务'), ('event', '日程')]:
+                if kind in self.type_map:
+                    create_menu.addAction(title, lambda checked=False, k=kind, item=file: self.create_from_source(item, k))
+            create.setMenu(create_menu); inner.addWidget(create)
             if file.get('type')=='asset' and data.get('sha256') and not is_reference:
                 inner.addWidget(make_button('移动原件…', lambda _, item=file: self.refile_source(item)))
             self.content_layout.addWidget(row)
@@ -775,17 +1003,51 @@ class WorkspacePage(QWidget):
         elif result.get("files_has_more"):
             self.content_layout.addWidget(plain_label("还有文件未显示，请稍后刷新以继续读取。", "Quiet"))
         self.content_layout.addSpacing(4)
-        footer = QHBoxLayout()
+        footer = ActionRow()
         if self.on_codex:
             if entity["type"] == "course":
-                footer.addWidget(make_button("整理课程信息", lambda: self.on_codex(entity, organize=True), True))
-            footer.addWidget(make_button("与 Codex 讨论", lambda: self.on_codex(entity)))
+                footer.addWidget(self.assistant_action("请助手整理课程信息", lambda: self.on_codex(entity, organize=True)))
+            footer.addWidget(self.assistant_action("与助手讨论", lambda: self.on_codex(entity)))
         archive = make_button("归档这个" + self.type_map.get(entity["type"], {}).get("label", label_type(entity["type"])), lambda: self.archive(entity))
         archive.setObjectName("QuietButton")
         footer.addStretch()
         footer.addWidget(archive)
-        self.content_layout.addLayout(footer)
+        self.content_layout.addWidget(footer)
         self.content_layout.addStretch()
+
+    def content_pager(self, key, total, count, next_offset, label):
+        offset = self.content_offsets[key]
+        if not offset and next_offset is None: return
+        row = QHBoxLayout()
+        row.addWidget(plain_label(f'{label}：本页 {count} 项，共 {total} 项', 'Quiet'), 1)
+        previous = make_button('上一页' + label, lambda: self.content_page(key, None))
+        previous.setEnabled(bool(self.content_history[key])); row.addWidget(previous)
+        following = make_button('下一页' + label, lambda: self.content_page(key, next_offset))
+        following.setEnabled(next_offset is not None); row.addWidget(following)
+        self.content_layout.addLayout(row)
+
+    def content_page(self, key, offset):
+        if offset is None:
+            if not self.content_history[key]: return
+            self.content_offsets[key] = self.content_history[key].pop()
+        else:
+            self.content_history[key].append(self.content_offsets[key]); self.content_offsets[key] = offset
+        self.load_workspace(self.current_entity['id'])
+
+    def create_from_source(self, source, kind):
+        if not self.current_entity or kind not in self.type_map: return
+        data = source.get('data', {})
+        origin = data.get('source_url') or data.get('original_name') or data.get('local_path') or data.get('source_name')
+        reference = f"来源资料：{source['title']}\n资料编号：{source['id']}"
+        if origin: reference += '\n原始位置：' + str(origin)
+        initial = {'data': {'source_text': reference}}
+        owner = self.current_entity
+        if kind == 'event': initial['data']['owner_id'] = owner['id']
+        dialog = EntityForm(self.bridge, {'types': [self.type_map[kind]]}, self, default_type=kind,
+                            parent_entity=None if kind == 'event' else owner, initial_payload=initial, on_saved=self.saved)
+        dialog.form_hint.setText('已保留资料标题、编号和原始位置。请核对内容，补充页码或段落；只填写已经确认的任务或日程。')
+        dialog.more_fields.setChecked(True)
+        self.dialogs.add(dialog); dialog.finished.connect(lambda _: self.dialogs.discard(dialog)); dialog.open()
 
     def next_files(self, offset):
         if offset is not None:
@@ -800,11 +1062,13 @@ class WorkspacePage(QWidget):
 
     def course_information(self, info):
         for key, title in [("assessments", "评分规则"), ("events", "固定与每周安排")]:
-            self.section_header(title)
+            kind = 'assessment' if key == 'assessments' else 'event'
+            owner = self.current_entity
+            self.section_header(title, (lambda _, k=kind, e=owner: self.on_create(k, e)) if self.on_create else None, '＋ 添加评分项目' if key == 'assessments' else '＋ 添加日程')
             if key == "assessments": self.content_layout.addWidget(plain_label("评分规则说明课程如何计分，不是待完成任务。实际备考或项目准备请放在上方「实际任务」。", "Quiet"))
             rows = info.get(key, [])
             if not rows:
-                self.content_layout.addWidget(plain_label("尚未登记。添加课程资料后，可点击「整理课程信息」核对提取建议。", "Quiet"))
+                self.content_layout.addWidget(plain_label("尚未登记。可以直接添加已确认的信息，未知的日期或权重保留为空。", "Quiet"))
             for item in rows:
                 data = item.get("data", {})
                 row = QFrame(); row.setObjectName("FileRow"); inner = QHBoxLayout(row)
@@ -829,7 +1093,7 @@ class WorkspacePage(QWidget):
                 inner.addLayout(actions)
                 self.content_layout.addWidget(row)
             total = info.get(key + "_total", len(rows))
-            if total > len(rows): self.content_layout.addWidget(plain_label(f"已显示 {len(rows)} / {total} 项，其余可通过课程讨论按需读取。", "Quiet"))
+            self.content_pager(key, total, len(rows), info.get(key + '_next_offset'), '评分项目' if key == 'assessments' else '日程')
 
     def discuss_note(self, note):
         if not self.on_codex: return

@@ -5,6 +5,7 @@ import tomllib
 from typing import Any
 from pathlib import Path
 from .schemas import BusinessError
+from .branding import APP_NAME
 
 SERVER_NAME = 'personal_management_discussion'
 CONTRACT = 'desktop_mcp_v3'
@@ -36,7 +37,7 @@ def create_server(data_dir, conversation_id, epoch, *, client=None):
     from mcp.types import ToolAnnotations
     from .client import Client
     client=client or Client(data_dir, entrance='mcp')
-    server=RoutedMCPServer('personal-management-discussion',instructions=(
+    server=RoutedMCPServer('personal-management-discussion', title=APP_NAME + ' · 事项讨论', instructions=(
         '每轮先 begin_discussion 读取本事项的最新事实；提交候选后用自然中文回答。'
         '候选需用户在软件确认才会生效。不得通过脚本或其他工具改库。'),log_level='WARNING')
     routing = DiscussionRouting(server, client)

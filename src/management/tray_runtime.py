@@ -19,6 +19,8 @@ def tray_enabled():
 
 
 def gui_args(data_dir, *, tray=False, show_update=False):
+    from .data_space import require_beta_dir
+    data_dir = require_beta_dir(data_dir)
     if getattr(sys, 'frozen', False):
         executable = Path(sys.executable).with_name('PersonalManagement.exe')
         if not executable.is_file():
@@ -35,7 +37,8 @@ def gui_args(data_dir, *, tray=False, show_update=False):
 
 
 def launch_gui(data_dir, *, tray=False, show_update=False):
-    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1',
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,
                'stderr': subprocess.DEVNULL, 'close_fds': True, 'env': env}
     if os.name == 'nt':
@@ -44,6 +47,8 @@ def launch_gui(data_dir, *, tray=False, show_update=False):
 
 
 def observer_running(data_dir):
+    from .data_space import require_beta_dir
+    data_dir = require_beta_dir(data_dir)
     lock = OwnerLock(Path(data_dir) / 'tray.lock')
     if not lock.acquire():
         return True
