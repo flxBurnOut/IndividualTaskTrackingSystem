@@ -11,11 +11,9 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QVBoxLayout
 from management.appearance import ACCENT_LABELS, DEFAULT_APPEARANCE, normalize_appearance
 from management.core import Core
 from management.gui_materials import AppCanvas
-from management.gui_theme import (DARK as CLASSIC_DARK, LIGHT as CLASSIC_LIGHT,
-                                  apply_appearance, classic_palette_tokens, color,
+from management.gui_theme import (apply_appearance, color,
                                   current_appearance, stylesheet)
 from management.gui_theme_glass import DARK, LIGHT, palette_tokens
-from management.gui_visual_profile import set_visual_style, visual_style
 from management.schemas import BusinessError
 
 
@@ -51,13 +49,11 @@ def test_accent_persists_through_core_and_partial_updates(tmp_path):
     assert restored == {**saved['appearance'], 'accent': 'default'}
 
 
-def test_legacy_appearance_retains_default_profile_palette():
+def test_legacy_appearance_retains_default_palette():
     legacy = normalize_appearance({'theme': 'dark', 'font_size': 16})
     assert legacy['accent'] == 'default'
     assert palette_tokens('light') == LIGHT
     assert palette_tokens('dark') == DARK
-    assert classic_palette_tokens('light') == CLASSIC_LIGHT
-    assert classic_palette_tokens('dark') == CLASSIC_DARK
     assert normalize_appearance({'font_size': 18}, current={**legacy, 'accent': 'rose'})['accent'] == 'rose'
 
 
@@ -72,11 +68,10 @@ def contrast(first, second):
 
 
 @pytest.mark.parametrize('theme', ['light', 'dark'])
-@pytest.mark.parametrize('get_palette', [palette_tokens, classic_palette_tokens])
-def test_accent_text_contrast_and_result_semantics(theme, get_palette):
-    baseline = get_palette(theme)
+def test_accent_text_contrast_and_result_semantics(theme):
+    baseline = palette_tokens(theme)
     for accent in ACCENT_LABELS.keys() - {'default'}:
-        tokens = get_palette(theme, accent)
+        tokens = palette_tokens(theme, accent)
         # These pairs are actually used by primary/calendar buttons, selected
         # fields/navigation and selected tabs/text links, including hover.
         for foreground, background in (
@@ -96,17 +91,14 @@ def test_accent_text_contrast_and_result_semantics(theme, get_palette):
 def accent_app():
     app = QApplication.instance() or QApplication([])
     app.setStyle('Fusion')
-    old_style, old_appearance = visual_style(), current_appearance()
+    old_appearance = current_appearance()
     yield app
-    set_visual_style(old_style)
     apply_appearance(app, old_appearance)
     app.processEvents()
 
 
-@pytest.mark.parametrize('profile', ['glass', 'classic'])
 @pytest.mark.parametrize('theme', ['light', 'dark'])
-def test_accent_repaints_open_controls_without_losing_edits(accent_app, profile, theme):
-    set_visual_style(profile)
+def test_accent_repaints_open_controls_without_losing_edits(accent_app, theme):
     config = {**DEFAULT_APPEARANCE, 'theme': theme, 'accent': 'blue'}
     apply_appearance(accent_app, config)
     host = AppCanvas()
@@ -135,8 +127,7 @@ def test_accent_repaints_open_controls_without_losing_edits(accent_app, profile,
         assert accent_app.palette().color(QPalette.ColorRole.Highlight).name() == color('selection')
         assert host.backdrop().cacheKey() != old_backdrop.cacheKey()
         assert host._backdrop_key != old_key
-        if profile == 'glass':
-            assert host.backdrop().toImage() != old_image
+        assert host.backdrop().toImage() != old_image
         assert host.backdrop().cacheKey() == host.backdrop().cacheKey()
         assert color('primary') in stylesheet({**config, 'accent': 'violet'})
     finally:

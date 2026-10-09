@@ -52,11 +52,11 @@ def test_dashboard_week_heading_matches_fixed_events_scope(app):
 
 
 @pytest.mark.parametrize('font_size', [13, 20])
-def test_dashboard_long_owner_warning_and_event_text_survives_resize(app, font_size):
+@pytest.mark.parametrize('theme', ['light', 'dark'])
+def test_dashboard_long_owner_warning_and_event_text_survives_resize(app, font_size, theme):
     from management.gui_theme import apply_appearance, current_appearance
-    from management.gui_visual_profile import set_visual_style, visual_style
-    original, profile = current_appearance(), visual_style()
-    set_visual_style('glass'); apply_appearance(app, {**original, 'font_size': font_size})
+    original = current_appearance()
+    apply_appearance(app, {**original, 'font_size': font_size, 'theme': theme})
     bridge, opened = ControlledBridge(), []
     page = DashboardPage(bridge, on_projects=opened.append, on_task=opened.append)
     page.resize(1400, 900); page.show(); app.processEvents()
@@ -101,7 +101,7 @@ def test_dashboard_long_owner_warning_and_event_text_survives_resize(app, font_s
         assert bridge.commands == []
     finally:
         page.close(); page.deleteLater(); app.processEvents()
-        set_visual_style(profile); apply_appearance(app, original)
+        apply_appearance(app, original)
 
 
 @pytest.mark.parametrize('fixed',[False,True])
@@ -188,13 +188,13 @@ def test_clock_business_day_uses_configured_zone(monkeypatch):
 
 
 @pytest.mark.parametrize('font_size', [13, 20])
-def test_glass_today_actions_keep_content_width_and_wrap_without_wide_cards(app, font_size):
+@pytest.mark.parametrize('theme', ['light', 'dark'])
+def test_today_actions_keep_content_width_and_wrap_without_wide_cards(app, font_size, theme):
     from PySide6.QtWidgets import QFrame
     from management.gui_layout import ActionRow
     from management.gui_theme import apply_appearance, current_appearance
-    from management.gui_visual_profile import visual_style, set_visual_style
-    old_style, old_appearance = visual_style(), current_appearance()
-    set_visual_style('glass'); apply_appearance(app, {'font_size': font_size})
+    old_appearance = current_appearance()
+    apply_appearance(app, {'font_size': font_size, 'theme': theme})
     bridge = ControlledBridge(); opened = []
     page = TodayPage(bridge, on_task=opened.append)
     page.resize(1400, 900)
@@ -274,13 +274,14 @@ def test_glass_today_actions_keep_content_width_and_wrap_without_wide_cards(app,
     finally:
         page.close(); page.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
-        set_visual_style(old_style); apply_appearance(app, old_appearance)
+        apply_appearance(app, old_appearance)
 
 
-def test_today_visual_switch_reuses_controls_and_preserves_pending_state_and_input(app):
+def test_today_legacy_profile_request_preserves_current_controls_pending_state_and_input(app):
     from PySide6.QtWidgets import QFrame, QLineEdit
+    from management.gui_theme import apply_appearance, current_appearance
     from management.gui_visual_profile import visual_style, set_visual_style
-    old_style = visual_style(); set_visual_style('glass')
+    old_appearance = current_appearance()
     bridge = ControlledBridge(); page = TodayPage(bridge)
     draft = QLineEdit('Unsaved synthetic draft', page)
     controls = page.date, page.manual_button, page.plan_button, page.habits_button
@@ -294,17 +295,20 @@ def test_today_visual_switch_reuses_controls_and_preserves_pending_state_and_inp
         {'id': 'candidate-one', 'title': 'Candidate', 'owner_label': 'Project', 'data': {}}], 'total': 1})
     page.pending_targets.add((day, 'candidate-one'))
     try:
-        for profile in ('classic', 'glass', 'classic'):
-            set_visual_style(profile); page.apply_visual_style(profile)
+        for theme, font_size in (('light', 13), ('dark', 20), ('light', 13)):
+            set_visual_style('classic'); page.apply_visual_style('classic')
+            apply_appearance(app, {**old_appearance, 'theme': theme, 'font_size': font_size})
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
+            assert visual_style() == 'glass'
             assert (page.date, page.manual_button, page.plan_button, page.habits_button) == controls
             assert page.date_iso() == day and draft.text() == 'Unsaved synthetic draft'
             assert page.pending_targets == {(day, 'candidate-one')} and page.assistants_visible
-            assert bool(page.tasks_box.findChildren(QFrame, 'TaskRow')) is (profile == 'classic')
-            assert page.plan_box.objectName() == ('PlanCard' if profile == 'classic' else 'TodayPlanEmpty')
-            assert page.classic_controls.isHidden() is (profile == 'glass')
+            assert not page.tasks_box.findChildren(QFrame, 'TaskRow')
+            assert page.plan_box.objectName() == 'TodayPlanEmpty'
+            assert not hasattr(page, 'classic_controls')
+            assert not page.compact_controls.isHidden()
         assert bridge.commands == [] and bridge.queries == []
     finally:
         page.close(); page.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
-        set_visual_style(old_style)
+        apply_appearance(app, old_appearance)

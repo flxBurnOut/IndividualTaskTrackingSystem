@@ -513,11 +513,10 @@ def test_dashboard_font_change_reflows_cards_without_resizing_window(app):
 def test_dashboard_details_have_local_actions_and_reflow_without_business_changes(app):
     from management.gui_dashboard import DashboardPage
     from management.gui_theme import apply_appearance, current_appearance
-    from management.gui_visual_profile import set_visual_style, visual_style
     from test_review_ui_v2 import ControlledBridge
     from PySide6.QtWidgets import QPushButton, QProgressBar
-    previous, old_style=current_appearance(),visual_style()
-    set_visual_style('glass');opened=[];bridge=ControlledBridge()
+    previous=current_appearance()
+    opened=[];bridge=ControlledBridge()
     page=DashboardPage(bridge,on_task=opened.append,on_projects=opened.append)
     sample={'date':'2030-01-07','date_label':'2030 年 1 月 7 日','weekday':'星期一',
         'week_label':'演示周','week_start':'2030-01-07','week_end':'2030-01-13','periods':[],
@@ -547,13 +546,14 @@ def test_dashboard_details_have_local_actions_and_reflow_without_business_change
         assert page.details_grid.getItemPosition(1)[:2]==(1,0)
         assert page.horizontalScrollBar().maximum()==0
         assert not getattr(bridge,'commands',[])
-        set_visual_style('classic');apply_appearance(app,previous);app.processEvents()
-        assert page.alert_box.objectName()=='CurrentWarningCard'
+        apply_appearance(app,{**previous,'theme':'dark','font_size':20});app.processEvents()
+        assert page.alert_box.objectName()=='ContentSection'
         assert page.details_grid.getItemPosition(1)[:2]==(1,0)
         assert sample['warnings']['counts']['current']==52
+        assert not getattr(bridge,'commands',[])
     finally:
         page.close();page.deleteLater();app.processEvents()
-        set_visual_style(old_style);apply_appearance(app,previous)
+        apply_appearance(app,previous)
 
 
 def test_calendar_installation_is_idempotent_preserves_date_bounds_and_optional_unknown(app):

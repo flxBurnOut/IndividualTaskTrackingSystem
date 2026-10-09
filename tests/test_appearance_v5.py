@@ -540,10 +540,9 @@ def test_enabling_codex_explains_when_panel_entries_are_still_hidden(settings):
     assert not any(call['name'] in {'connect_codex', 'create_ai_job'} for call in bridge.commands)
 
 
-def test_visual_profile_switch_keeps_open_drafts_business_state_and_native_window(app, tmp_path):
+def test_retired_visual_request_keeps_current_ui_drafts_and_native_window(app, tmp_path):
     from PySide6.QtCore import Qt
     from management.gui_visual_profile import visual_style, set_visual_style
-    from management.gui_theme import stylesheet, _classic_stylesheet
     previous = visual_style()
     core = Core(tmp_path / 'visual-profile-preservation')
     window = MainWindow(core.root, client_factory=lambda _: LocalClient(core))
@@ -570,12 +569,8 @@ def test_visual_profile_switch_keeps_open_drafts_business_state_and_native_windo
             assert window.windowFlags() == flags
             assert not (window.windowFlags() & Qt.WindowType.FramelessWindowHint)
             assert core.query('state') == before
-            assert visual_style() == style
-            if style == 'classic':
-                assert stylesheet(current_appearance()) == _classic_stylesheet(current_appearance())
-                assert window.nav_buttons['tasks'].icon().isNull()
-            else:
-                assert not window.nav_buttons['tasks'].icon().isNull()
+            assert visual_style() == 'glass'
+            assert not window.nav_buttons['tasks'].icon().isNull()
         assert not (core.root / 'ui-visual.json').exists()
     finally:
         if dialog:

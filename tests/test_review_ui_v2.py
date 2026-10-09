@@ -762,7 +762,7 @@ def test_glass_review_actions_fit_content_wrap_and_remain_reachable(app, tmp_pat
         app.processEvents()
 
 
-def test_review_visual_roundtrip_preserves_controls_choices_open_editor_and_callbacks(app):
+def test_review_appearance_changes_and_legacy_requests_preserve_current_layout_and_drafts(app):
     from management.gui_theme import apply_appearance, current_appearance
     from management.gui_visual_profile import set_visual_style, visual_style
     previous, previous_style = current_appearance(), visual_style()
@@ -780,8 +780,11 @@ def test_review_visual_roundtrip_preserves_controls_choices_open_editor_and_call
         original_choices = {key: dict(value) for key, value in widget.item_buttons.items()}
         references = (widget.feedback_button, widget.notes_button, widget.confirm_button,
                       widget.date_editor, widget.daily_tab, widget.weekly_tab, widget.rows)
-        assert widget.scroll.widget() is widget.rows
-        classic_button_width = widget.feedback_history_button.width()
+        assert visual_style() == 'glass'
+        assert widget.scroll.widget() is widget.daily_body
+        assert widget.week_scroll.widget() is widget.weekly_body
+        assert not any(hasattr(widget, name) for name in
+                       ('classic_header', 'classic_manual_actions', 'classic_confirm_actions'))
         widget.notes_button.click()
         editor = widget.dialogs[-1]
         editor.text.setPlainText('Synthetic unsaved reflection; never submit during a visual switch.')
@@ -800,9 +803,12 @@ def test_review_visual_roundtrip_preserves_controls_choices_open_editor_and_call
             assert editor.isVisible() and editor.dirty and editor.text.toPlainText().startswith('Synthetic unsaved')
             assert len(bridge.queries) == queries and bridge.commands == []
             assert widget.scroll.isVisible() and widget.scroll.findChildren(QScrollArea) == []
-            assert widget.scroll.widget() is (widget.daily_body if selected == 'glass' else widget.rows)
-            if selected == 'classic':
-                assert widget.feedback_history_button.width() == classic_button_width
+            assert visual_style() == 'glass'
+            assert widget.scroll.widget() is widget.daily_body
+            assert widget.week_scroll.widget() is widget.weekly_body
+            _assert_review_flow(widget.daily_actions,
+                                [widget.feedback_button, widget.notes_button,
+                                 widget.feedback_history_button, widget.codex_button])
             for button in (widget.daily_chart_button, widget.week_chart_button, widget.week_days_button):
                 button.click()
             assert requested[-3:] == ['review_daily_style', 'review_weekly_style', 'weekly_style']

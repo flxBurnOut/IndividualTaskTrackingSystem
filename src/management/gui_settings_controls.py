@@ -6,13 +6,12 @@ from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushBu
 
 from .appearance import ACCENT_LABELS
 from .gui_layout import ActionRow
-from .gui_theme import bind_theme, classic_palette_tokens
+from .gui_theme import bind_theme
 from .gui_theme_glass import palette_tokens
-from .gui_visual_profile import visual_style
 
 
 def preview_tokens(theme, accent):
-    return (classic_palette_tokens if visual_style() == 'classic' else palette_tokens)(theme, accent)
+    return palette_tokens(theme, accent)
 
 
 class SelectableText(QTextBrowser):

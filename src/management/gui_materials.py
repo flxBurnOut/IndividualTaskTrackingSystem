@@ -16,7 +16,6 @@ from PySide6.QtWidgets import QFrame, QPushButton, QStackedWidget, QStyle, QStyl
 from shiboken6 import isValid
 
 from .gui_theme import bind_theme, color, current_appearance
-from .gui_visual_profile import visual_style
 
 
 def reduce_motion() -> bool:
@@ -37,10 +36,6 @@ def reduce_motion() -> bool:
         except (AttributeError, ImportError, OSError):
             pass
     return False
-
-
-def _glass() -> bool:
-    return visual_style() != 'classic'
 
 
 def _alpha(value, opacity):
@@ -102,7 +97,7 @@ class AppCanvas(QWidget):
         accent = appearance.get('accent', 'default')
         ratio = self.devicePixelRatioF()
         key = (self.width(), self.height(), ratio, dark, accent, color('window'),
-               color('primary'), visual_style())
+               color('primary'))
         if self._backdrop is not None and self._backdrop_key == key:
             return self._backdrop
         width, height = max(1, self.width()), max(1, self.height())
@@ -110,36 +105,33 @@ class AppCanvas(QWidget):
         pixmap.setDevicePixelRatio(ratio)
         pixmap.fill(QColor(color('window')))
         painter = QPainter(pixmap)
-        if _glass():
-            base = QLinearGradient(0, 0, width * .8, height)
-            top, bottom = QColor(color('canvas_top')), QColor(color('canvas_bottom'))
-            base.setColorAt(0, top)
-            base.setColorAt(.55, _blend(top, bottom, .55))
-            base.setColorAt(1, bottom)
-            painter.fillRect(QRectF(0, 0, width, height), base)
-            for x, y, radius, tint, opacity in (
-                (.10, .18, .70, '#9a9290' if dark else '#d9dce7', .06 if dark else .28),
-                (.90, .74, .67, (color('primary') if accent != 'default' else
-                                 '#947d88' if dark else '#e9dbd4'), .07 if dark else .25),
-                (.58, -.10, .57, '#b1aba7' if dark else '#ffffff', .03 if dark else .50),
-            ):
-                glow = QRadialGradient(QPointF(width * x, height * y), max(width, height) * radius)
-                glow.setColorAt(0, _alpha(tint, opacity))
-                glow.setColorAt(1, _alpha(tint, 0))
-                painter.fillRect(QRectF(0, 0, width, height), glow)
-            # A broad silver/graphite pool behind the floating sidebar provides
-            # something visible for its translucent material to transmit.
-            pool = QRadialGradient(QPointF(width * .055, height * .67), max(height * .53, width * .23))
-            pool.setColorAt(0, _alpha('#b4a6a6' if dark else '#aeb6c4', .20 if dark else .48))
-            pool.setColorAt(1, _alpha('#b4a6a6' if dark else '#aeb6c4', 0))
-            painter.fillRect(QRectF(0, 0, width, height), pool)
+        base = QLinearGradient(0, 0, width * .8, height)
+        top, bottom = QColor(color('canvas_top')), QColor(color('canvas_bottom'))
+        base.setColorAt(0, top)
+        base.setColorAt(.55, _blend(top, bottom, .55))
+        base.setColorAt(1, bottom)
+        painter.fillRect(QRectF(0, 0, width, height), base)
+        for x, y, radius, tint, opacity in (
+            (.10, .18, .70, '#9a9290' if dark else '#d9dce7', .06 if dark else .28),
+            (.90, .74, .67, (color('primary') if accent != 'default' else
+                             '#947d88' if dark else '#e9dbd4'), .07 if dark else .25),
+            (.58, -.10, .57, '#b1aba7' if dark else '#ffffff', .03 if dark else .50),
+        ):
+            glow = QRadialGradient(QPointF(width * x, height * y), max(width, height) * radius)
+            glow.setColorAt(0, _alpha(tint, opacity))
+            glow.setColorAt(1, _alpha(tint, 0))
+            painter.fillRect(QRectF(0, 0, width, height), glow)
+        # A broad silver/graphite pool behind the floating sidebar provides
+        # something visible for its translucent material to transmit.
+        pool = QRadialGradient(QPointF(width * .055, height * .67), max(height * .53, width * .23))
+        pool.setColorAt(0, _alpha('#b4a6a6' if dark else '#aeb6c4', .20 if dark else .48))
+        pool.setColorAt(1, _alpha('#b4a6a6' if dark else '#aeb6c4', 0))
+        painter.fillRect(QRectF(0, 0, width, height), pool)
         painter.end()
         self._backdrop, self._backdrop_key = pixmap, key
         return pixmap
 
     def paintEvent(self, event):
-        if not _glass():
-            return super().paintEvent(event)
         painter = QPainter(self)
         painter.drawPixmap(QPointF(), self.backdrop())
         painter.end()
@@ -160,8 +152,6 @@ class GlassPanel(QFrame):
         self.update()
 
     def paintEvent(self, event):
-        if not _glass():
-            return super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
@@ -239,7 +229,7 @@ class NavigationButton(QPushButton):
         self._state = state
         self.animation.stop()
         target = self._target_fill()
-        if animate and _glass() and not reduce_motion() and self.isVisible():
+        if animate and not reduce_motion() and self.isVisible():
             self._start_fill = QColor(self._fill)
             self._end_fill = target
             self.animation.setStartValue(0.0)
@@ -250,7 +240,7 @@ class NavigationButton(QPushButton):
             self.update()
 
     def _frame(self, value):
-        if not _glass() or reduce_motion():
+        if reduce_motion():
             self.animation.stop()
             self._fill = self._target_fill()
             self.update()
@@ -283,8 +273,6 @@ class NavigationButton(QPushButton):
         return result
 
     def paintEvent(self, event):
-        if not _glass():
-            return super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
@@ -380,7 +368,7 @@ class PageTransition(QObject):
         self.stop()
         stack = self._stack()
         if (stack is None or not isValid(stack) or not stack.isVisible()
-                or stack.currentWidget() is None or not _glass() or reduce_motion()):
+                or stack.currentWidget() is None or reduce_motion()):
             return
         host = stack.window()
         previous = self._host() if self._host is not None else None
@@ -414,7 +402,7 @@ class PageTransition(QObject):
         stack, page = self._stack(), self._pending_page()
         if (stack is None or not isValid(stack) or page is None or not isValid(page)
                 or stack.currentWidget() is not page or not stack.isVisible()
-                or not _glass() or reduce_motion()):
+                or reduce_motion()):
             self.stop()
             return
         self._prepare_veil(stack)
@@ -425,7 +413,7 @@ class PageTransition(QObject):
         self.animation.start()
 
     def _frame(self, value):
-        if not _glass() or reduce_motion():
+        if reduce_motion():
             self.stop()
             return
         if isValid(self._veil):
@@ -543,7 +531,7 @@ class AnimatedTabBar(QTabBar):
 
     def _selection_changed(self, index):
         previous = self._selected
-        if (not _glass() or reduce_motion() or not self.isVisible()
+        if (reduce_motion() or not self.isVisible()
                 or previous < 0 or index < 0 or previous == index):
             self.stop()
             return
@@ -568,14 +556,14 @@ class AnimatedTabBar(QTabBar):
         self.update()
 
     def _frame(self, value):
-        if not _glass() or reduce_motion():
+        if reduce_motion():
             self.stop()
             return
         self._progress = float(value)
         self.update()
 
     def paintEvent(self, event):
-        if not _glass() or reduce_motion() or self._before.isNull():
+        if reduce_motion() or self._before.isNull():
             if not self._before.isNull():
                 self.stop()
             return super().paintEvent(event)

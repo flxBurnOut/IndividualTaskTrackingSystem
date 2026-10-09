@@ -22,8 +22,8 @@ CONTAINERS = {"domain", "project", "course", "activity", "phase", "task", "note"
 TYPE_MARKS = {"domain": "域", "project": "项", "course": "课", "activity": "活", "goal": "目", "phase": "阶", "milestone": "里", "topic": "知", "task": "·", "note": "记"}
 
 
-def make_button(text, callback=None, primary=False):
-    result = QPushButton(text)
+def make_button(text, callback=None, primary=False, *, parent=None):
+    result = QPushButton(text, parent)
     if callback:
         result.clicked.connect(callback)
     if primary:
@@ -527,7 +527,7 @@ class TaskDetailDialog(QDialog):
         row.addWidget(self.edit_button)
         self.assistant_button = None
         if entity["type"] == "note" and on_codex:
-            self.assistant_button = make_button("请助手整理", lambda: (self.accept(), on_codex(entity)))
+            self.assistant_button = make_button("请助手整理", lambda: (self.accept(), on_codex(entity)), parent=self)
             row.addWidget(self.assistant_button); self.assistant_button.setVisible(assistants_visible)
         if entity["type"] == "task":
             self.delete_button = make_button("恢复任务" if entity.get("archived") else "删除任务", self.delete_task)
@@ -749,7 +749,9 @@ class WorkspacePage(QWidget):
                 dialog.set_assistants_visible(self.assistants_visible)
 
     def assistant_action(self, text, callback):
-        button = make_button(text, callback)
+        # The action row may not yet be attached to the page. Parenting before
+        # setVisible prevents Qt from briefly showing a native button window.
+        button = make_button(text, callback, parent=self.content)
         button.setVisible(self.assistants_visible)
         self.assistant_buttons.append(button)
         return button

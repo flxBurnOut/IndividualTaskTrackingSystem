@@ -26,7 +26,6 @@ from .branding import APP_NAME
 NAVIGATION = [("dashboard", "总览"), ("today", "今天"), ("tasks", "任务"), ("projects", "项目与课程"), ("reviews", "复盘")]
 from .appearance import normalize_appearance, assistants_visible
 from .gui_theme import apply_appearance, current_appearance, stylesheet, bind_theme
-from .gui_visual_profile import visual_style, set_visual_style
 from .gui_materials import AppCanvas, GlassPanel, NavigationButton, PageTransition
 from .gui_icons import symbol_icon
 
@@ -367,23 +366,22 @@ class MainWindow(QMainWindow):
         self.nav_buttons["dashboard"].setChecked(True)
 
     def refresh_global_metrics(self):
-        modern = visual_style() == 'glass'
-        self.navigation_sidebar.setObjectName('GlassSidebar' if modern else 'Sidebar')
-        self.header_panel.setObjectName('GlassToolbar' if modern else '')
-        self.shell_layout.setContentsMargins(*(12, 12, 12, 0) if modern else (0, 0, 0, 0))
-        self.shell_layout.setSpacing(10 if modern else 0)
-        self.sidebar_layout.setContentsMargins(*(12, 20, 12, 16) if modern else (15, 25, 15, 19))
-        self.sidebar_layout.setSpacing(5 if modern else 8)
-        self.main_layout.setContentsMargins(*(12, 0, 2, 12) if modern else (31, 26, 30, 17))
-        self.main_layout.setSpacing(22 if modern else 20)
-        self.header_layout.setContentsMargins(*(18, 13, 18, 13) if modern else (0, 0, 0, 0))
+        self.navigation_sidebar.setObjectName('GlassSidebar')
+        self.header_panel.setObjectName('GlassToolbar')
+        self.shell_layout.setContentsMargins(12, 12, 12, 0)
+        self.shell_layout.setSpacing(10)
+        self.sidebar_layout.setContentsMargins(12, 20, 12, 16)
+        self.sidebar_layout.setSpacing(5)
+        self.main_layout.setContentsMargins(12, 0, 2, 12)
+        self.main_layout.setSpacing(22)
+        self.header_layout.setContentsMargins(18, 13, 18, 13)
         self.navigation_sidebar.style().unpolish(self.navigation_sidebar)
         self.navigation_sidebar.style().polish(self.navigation_sidebar)
         self.header_panel.style().unpolish(self.header_panel)
         self.header_panel.style().polish(self.header_panel)
         brand = self.navigation_sidebar.findChild(QLabel, 'Brand')
-        base_width = 204 if modern else 182
-        widths = [max(base_width, round(base_width * current_appearance()['font_size'] / 13)), *(button.fontMetrics().horizontalAdvance(button.text()) + (78 if modern else 60) for button in self.nav_buttons.values())]
+        base_width = 204
+        widths = [max(base_width, round(base_width * current_appearance()['font_size'] / 13)), *(button.fontMetrics().horizontalAdvance(button.text()) + 78 for button in self.nav_buttons.values())]
         if brand is not None:
             widths.append(brand.fontMetrics().horizontalAdvance(brand.text()) + 46)
         self.navigation_sidebar.setFixedWidth(max(widths))
@@ -391,24 +389,22 @@ class MainWindow(QMainWindow):
 
     def refresh_navigation_icons(self):
         from .gui_theme import color
-        modern = visual_style() == 'glass'
         size = max(18, round(19 * current_appearance()['font_size'] / 13))
         for key, button in self.nav_buttons.items():
-            button.setIcon(symbol_icon(key, color('primary') if button.isChecked() else color('muted'), size) if modern else QIcon())
+            button.setIcon(symbol_icon(key, color('primary') if button.isChecked() else color('muted'), size))
             button.setIconSize(QSize(size, size))
         for button, name in ((self.habits_button, 'habits'), (self.assistant_button, 'assistant'),
                              (self.guide_button, 'help'), (self.settings_button, 'settings'),
                              (self.update_button, 'update')):
-            button.setIcon(symbol_icon(name, color('muted'), size) if modern else QIcon())
+            button.setIcon(symbol_icon(name, color('muted'), size))
             button.setIconSize(QSize(size, size))
-        self.new_button.setIcon(symbol_icon('plus', color('primary_text'), size) if modern else QIcon())
-        self.new_button.setText('新建' if modern else '＋ 新建')
-        self.search_symbol.setVisible(modern)
-        self.search_symbol.setIcon(symbol_icon('search', color('muted'), 16) if modern else QIcon())
+        self.new_button.setIcon(symbol_icon('plus', color('primary_text'), size))
+        self.new_button.setText('新建')
+        self.search_symbol.setVisible(True)
+        self.search_symbol.setIcon(symbol_icon('search', color('muted'), 16))
 
-    def apply_visual_style(self, selected):
-        """Change presentation in place; never rebuild editors or touch Core."""
-        set_visual_style(selected)
+    def apply_visual_style(self, selected=None):
+        """Refresh presentation in place without replacing open editors."""
         apply_appearance(QApplication.instance(), current_appearance())
         for page in (self.today_page,self.review_page):
             if hasattr(page,'apply_visual_style'):
@@ -739,8 +735,6 @@ class MainWindow(QMainWindow):
         elif command == 'exit':
             from .gui_shutdown import request_exit
             request_exit(self)
-        elif command in {'visual-classic', 'visual-glass'}:
-            self.apply_visual_style(command.removeprefix('visual-'))
 
     def focus_search(self):
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
@@ -842,7 +836,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def run(data_dir, argv=None, *, show_update=False, ui_style=None):
+def run(data_dir, argv=None, *, show_update=False):
     from .branding import set_windows_identity, configure_application
     from .data_space import require_beta_dir
     data_dir = require_beta_dir(data_dir)
@@ -852,11 +846,9 @@ def run(data_dir, argv=None, *, show_update=False, ui_style=None):
     from .gui_instance import WindowInstance, notify_window
     instance = WindowInstance(data_dir, app)
     if not instance.acquire():
-        command = 'visual-' + ui_style if ui_style else 'update' if show_update else 'show'
+        command = 'update' if show_update else 'show'
         if not notify_window(data_dir, command):
-            message = ('当前 Beta 窗口尚未响应界面切换。请先保存并关闭 Beta 主窗口，再运行此切换入口；无需退出后台。'
-                       if ui_style else '已有 Beta 窗口正在启动或退出，请稍后重试。')
-            QMessageBox.information(None, APP_NAME, message)
+            QMessageBox.information(None, APP_NAME, '已有 Beta 窗口正在启动或退出，请稍后重试。')
         return 0
     manager = install_gui_gc(app)
     app.setStyle("Fusion")

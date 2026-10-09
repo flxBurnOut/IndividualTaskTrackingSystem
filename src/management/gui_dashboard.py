@@ -5,7 +5,6 @@ from PySide6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QBoxLayout,QFrame,
 from .gui_workspace import plain_label,make_button,clear_layout
 from .gui_charts import CoverageChart
 from .chart_preferences import normalize_chart_preferences
-from .gui_visual_profile import visual_style
 from .gui_layout import ActionRow, ReadingLabel
 
 
@@ -57,7 +56,6 @@ class DashboardPage(QScrollArea):
         self.owner_heading=QVBoxLayout();self.owner_heading.addWidget(plain_label('课程与项目进度','SectionHeading'))
         self.owner_open=make_button('查看课程与项目',lambda:self.on_projects(None) if self.on_projects else None);self.owner_heading.addWidget(self.owner_open);owners.addLayout(self.owner_heading)
         self.owner_rows=QVBoxLayout();self.owner_rows.setSpacing(16);owners.addLayout(self.owner_rows);owners.addStretch();self.body.addStretch()
-        self._detail_profile=None
         from .gui_theme import bind_theme
         bind_theme(self,self.apply_visual_style)
 
@@ -104,49 +102,34 @@ class DashboardPage(QScrollArea):
     def reflow_metrics(self):
         if not hasattr(self,'metric_cards'):return
         from .gui_theme import current_appearance
-        from .gui_visual_profile import visual_style
-        modern=visual_style()=='glass'
         minimum=max(round(270*current_appearance()['font_size']/13),self.fontMetrics().horizontalAdvance('今日计划  图表样式…')+80)
-        if modern:
-            minimum=max(minimum,round(340*current_appearance()['font_size']/13))
-        maximum_columns=2 if modern else 3
+        minimum=max(minimum,round(340*current_appearance()['font_size']/13))
+        maximum_columns=2
         columns=maximum_columns if self.viewport().width()>=minimum*maximum_columns else 1
         while self.metric_grid.count():self.metric_grid.takeAt(0)
-        if modern:
-            plan,warning,tasks=self.metric_cards
-            self.metric_grid.addWidget(plan,0,0)
-            self.metric_grid.addWidget(tasks,0 if columns==2 else 1,1 if columns==2 else 0)
-            self.metric_grid.addWidget(warning,1 if columns==2 else 2,0,1,columns,Qt.AlignmentFlag.AlignLeft)
-            warning.layout().setDirection(QBoxLayout.Direction.LeftToRight)
-            warning.setObjectName('WarningSummary');warning.layout().setContentsMargins(0,2,0,2)
-            warning.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Preferred)
-            self.metrics['warnings'][0].setObjectName('SectionHeading')
-            self.metrics['warnings'][1].setVisible(False)
-        else:
-            self.metric_cards[1].layout().setDirection(QBoxLayout.Direction.TopToBottom)
-            self.metric_cards[1].setObjectName('CurrentWarningCard');self.metric_cards[1].layout().setContentsMargins(16,14,16,14)
-            self.metric_cards[1].setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Preferred)
-            self.metrics['warnings'][0].setObjectName('DashboardMetric');self.metrics['warnings'][1].setVisible(True)
-            for index,card in enumerate(self.metric_cards):self.metric_grid.addWidget(card,index//columns,index%columns)
+        plan,warning,tasks=self.metric_cards
+        self.metric_grid.addWidget(plan,0,0)
+        self.metric_grid.addWidget(tasks,0 if columns==2 else 1,1 if columns==2 else 0)
+        self.metric_grid.addWidget(warning,1 if columns==2 else 2,0,1,columns,Qt.AlignmentFlag.AlignLeft)
+        warning.layout().setDirection(QBoxLayout.Direction.LeftToRight)
+        warning.setObjectName('WarningSummary');warning.layout().setContentsMargins(0,2,0,2)
+        warning.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Preferred)
+        self.metrics['warnings'][0].setObjectName('SectionHeading')
+        self.metrics['warnings'][1].setVisible(False)
         for index in range(3):self.metric_grid.setColumnStretch(index,1 if index<columns else 0)
         self._relayout_metric_cards()
 
     def apply_visual_style(self):
         if not hasattr(self,'owner_section'):return
-        modern=visual_style()=='glass'
-        self.owner_heading.setDirection(QBoxLayout.Direction.TopToBottom if modern else QBoxLayout.Direction.LeftToRight)
-        self.owner_heading.setStretch(0,0 if modern else 1)
-        self.alert_box.setObjectName('ContentSection' if modern else 'CurrentWarningCard')
-        self.alert_box.layout().setContentsMargins(*(0,0,0,0) if modern else (16,14,16,14))
+        self.owner_heading.setDirection(QBoxLayout.Direction.TopToBottom)
+        self.owner_heading.setStretch(0,0)
+        self.alert_box.setObjectName('ContentSection')
+        self.alert_box.layout().setContentsMargins(0,0,0,0)
         for widget,layout in ((self.all_alerts,self.alert_box.layout()),(self.past_toggle,self.attention_section.layout()),(self.owner_open,self.owner_heading)):
-            widget.setSizePolicy(QSizePolicy.Policy.Maximum if modern else QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Fixed)
-            layout.setAlignment(widget,Qt.AlignmentFlag.AlignLeft if modern else Qt.AlignmentFlag(0))
-            widget.setObjectName('QuietButton' if modern else '')
+            widget.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Fixed)
+            layout.setAlignment(widget,Qt.AlignmentFlag.AlignLeft)
+            widget.setObjectName('QuietButton')
         self.reflow_details()
-        if self._detail_profile!=modern:
-            self._detail_profile=modern
-            if self.result:
-                self._render_detail_rows(self.result)
         self.reflow_metrics()
         for widget in (self.alert_box,self.metric_cards[1],self.metrics['warnings'][0]):
             widget.style().unpolish(widget);widget.style().polish(widget);widget.update()
@@ -154,7 +137,7 @@ class DashboardPage(QScrollArea):
     def reflow_details(self):
         if not hasattr(self,'owner_section'):return
         from .gui_theme import current_appearance
-        columns=2 if visual_style()=='glass' and self.viewport().width()>=round(920*current_appearance()['font_size']/13) else 1
+        columns=2 if self.viewport().width()>=round(920*current_appearance()['font_size']/13) else 1
         while self.details_grid.count():self.details_grid.takeAt(0)
         # Let the grid supply each section's full height-for-width geometry.
         # AlignTop clamps a nested widget to its unwrapped sizeHint; the
@@ -212,22 +195,18 @@ class DashboardPage(QScrollArea):
         if not counts['past']:self.past_toggle.setChecked(False);self.past_box.hide()
         clear_layout(self.owner_rows)
         for owner in r['owners']:
-            modern=visual_style()=='glass'
-            row=QVBoxLayout() if modern else QHBoxLayout()
+            row=QVBoxLayout()
             button=make_button(owner['label'],lambda _,o=owner['id']:self.on_projects(o) if self.on_projects else None)
             summary=plain_label(str(owner['done'])+' / '+str(owner['total'])+' 已完成','Quiet')
-            if modern:
-                # Owner names are user text, not short action captions. Keeping
-                # them in a capped single-line button silently cut off the name.
-                row.addWidget(ReadingLabel(owner['label'],'SectionHeading'))
-                button.setText('查看');button.setObjectName('OwnerOpen')
-                button.setAccessibleName('查看课程或项目：'+owner['label'])
-                actions=ActionRow();actions.addWidget(summary);actions.addWidget(button)
-                row.addWidget(actions)
-            else:row.addWidget(button,2)
+            # Owner names are user text, not short action captions. Keeping
+            # them in a capped single-line button silently cut off the name.
+            row.addWidget(ReadingLabel(owner['label'],'SectionHeading'))
+            button.setText('查看');button.setObjectName('OwnerOpen')
+            button.setAccessibleName('查看课程或项目：'+owner['label'])
+            actions=ActionRow();actions.addWidget(summary);actions.addWidget(button)
+            row.addWidget(actions)
             bar=QProgressBar();bar.setRange(0,max(1,owner['total']));bar.setValue(owner['done']);bar.setTextVisible(False);bar.setMaximumHeight(9)
-            if modern:bar.setObjectName('OwnerProgress');bar.setFixedHeight(6);bar.setMaximumWidth(280);row.addWidget(bar)
-            else:row.addWidget(bar,3);row.addWidget(summary)
+            bar.setObjectName('OwnerProgress');bar.setFixedHeight(6);bar.setMaximumWidth(280);row.addWidget(bar)
             self.owner_rows.addLayout(row)
 
     def reflow_week(self):
@@ -253,21 +232,15 @@ class DashboardPage(QScrollArea):
             self.reflow_details()
 
     def warning_row(self,layout,item):
-        if visual_style()=='glass':
-            row=QVBoxLayout();row.setSpacing(4)
-            title=item.get('display_title') or item['title']
-            caption=ReadingLabel(title,'SectionHeading');row.addWidget(caption)
-            if item.get('owner_label') and item['owner_label'] not in title:row.addWidget(ReadingLabel(item['owner_label'],'Quiet'))
-            row.addWidget(ReadingLabel(item.get('reason',''),'Body'))
-            if self.on_task:
-                button=make_button('查看事项  ›',lambda _,i=item['id']:self.on_task(i));button.setObjectName('QuietButton')
-                button.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Fixed);row.addWidget(button,0,Qt.AlignmentFlag.AlignLeft)
-            row.addSpacing(10);layout.addLayout(row)
-            return
-        row=QHBoxLayout();content=QVBoxLayout();title=item.get('display_title') or item['title'];owner=item.get('owner_label')
-        content.addWidget(plain_label((owner+' · ' if owner and owner not in title else '')+title,'SectionHeading'));content.addWidget(plain_label(item.get('reason',''),'Body'));row.addLayout(content,1)
-        if self.on_task:row.addWidget(make_button('查看',lambda _,i=item['id']:self.on_task(i)))
-        layout.addLayout(row)
+        row=QVBoxLayout();row.setSpacing(4)
+        title=item.get('display_title') or item['title']
+        caption=ReadingLabel(title,'SectionHeading');row.addWidget(caption)
+        if item.get('owner_label') and item['owner_label'] not in title:row.addWidget(ReadingLabel(item['owner_label'],'Quiet'))
+        row.addWidget(ReadingLabel(item.get('reason',''),'Body'))
+        if self.on_task:
+            button=make_button('查看事项  ›',lambda _,i=item['id']:self.on_task(i));button.setObjectName('QuietButton')
+            button.setSizePolicy(QSizePolicy.Policy.Maximum,QSizePolicy.Policy.Fixed);row.addWidget(button,0,Qt.AlignmentFlag.AlignLeft)
+        row.addSpacing(10);layout.addLayout(row)
 
     def load_past(self,*_,offset=0):
         self.past_generation+=1;request=self.past_generation

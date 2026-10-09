@@ -105,9 +105,8 @@ def text_in(widget):
     return "\n".join(label.text() for label in widget.findChildren(QLabel)) + "\n" + "\n".join(button.text() for button in widget.findChildren(QPushButton))
 
 
-def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tmp_path):
+def test_light_and_dark_appearance_share_data_and_live_editor(app_v2, shell, tmp_path):
     from management.gui_theme import apply_appearance, current_appearance
-    from management.gui_visual_profile import visual_style
     from management.gui_workflows import HabitsDialog
     client = Client(shell.data_dir, autostart=False)
     day = QDate.currentDate().toString('yyyy-MM-dd')
@@ -129,7 +128,7 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
     client.command('settings', {'settings': {'charts': {'dashboard_today_style': 'ring', 'dashboard_tasks_style': 'ring'}}})
     shell.load_display_preferences()
     wait(app_v2, lambda: not shell.bridge.callbacks)
-    previous_style, previous_appearance = visual_style(), current_appearance()
+    previous_appearance = current_appearance()
     polling = shell.poll.isActive()
     # These screenshots preview unsaved themes. A periodic service read would
     # correctly restore saved appearance halfway through the synthetic preview.
@@ -139,8 +138,7 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
     report = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(tmp_path)))
     habits = None
     try:
-        for style, theme in (('glass', 'light'), ('glass', 'dark'), ('classic', 'light')):
-            shell.apply_visual_style(style)
+        for theme in ('light', 'dark'):
             apply_appearance(app_v2, {**previous_appearance, 'theme': theme, 'font_size': 13})
             shell.resize(1390, 900)
             for section in ('dashboard', 'today', 'tasks', 'projects', 'reviews'):
@@ -154,7 +152,7 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
                 wait(app_v2, lambda: not shell.page_transition.is_active())
                 app_v2.processEvents();shell.repaint()
                 assert current_appearance()['theme']==theme
-                assert shell.grab().save(str(report / f'visual-{style}-{section}-{theme}.png'))
+                assert shell.grab().save(str(report / f'visual-glass-{section}-{theme}.png'))
                 if section=='dashboard':
                     owners=shell.dashboard_page.owner_section
                     wait(app_v2,lambda:owners.height()>=owners.minimumSizeHint().height())
@@ -163,7 +161,7 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
                     assert shell.dashboard_page.owner_open.geometry().bottom()<owners.height()
                     shell.dashboard_page.verticalScrollBar().setValue(shell.dashboard_page.verticalScrollBar().maximum())
                     app_v2.processEvents()
-                    assert shell.grab().save(str(report / f'visual-{style}-dashboard-details-{theme}.png'))
+                    assert shell.grab().save(str(report / f'visual-glass-dashboard-details-{theme}.png'))
                     shell.dashboard_page.verticalScrollBar().setValue(0)
                 if section=='today':
                     shell.today_page.date.setDate(QDate.currentDate().addDays(1))
@@ -186,15 +184,14 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
                                'hidden':widget.isHidden(),'y':widget.y(),'height':widget.height(),
                                'minimum':widget.minimumHeight(),'hint':widget.sizeHint().height()}
                               for widget in sections]
-                    if style=='glass':
-                        first=next(widget for widget in sections if not widget.isHidden())
-                        assert first.y()<=page.body.contentsMargins().top()+4,geometry
-                        assert page.plan_box.height()<=page.plan_box.sizeHint().height()+4,geometry
+                    first=next(widget for widget in sections if not widget.isHidden())
+                    assert first.y()<=page.body.contentsMargins().top()+4,geometry
+                    assert page.plan_box.height()<=page.plan_box.sizeHint().height()+4,geometry
                     apply_appearance(app_v2, {**previous_appearance, 'theme': theme, 'font_size': 13})
                     wait(app_v2,sections_ready)
                     app_v2.processEvents();shell.repaint()
                     assert current_appearance()['theme']==theme
-                    assert shell.grab().save(str(report / f'visual-{style}-today-empty-{theme}.png'))
+                    assert shell.grab().save(str(report / f'visual-glass-today-empty-{theme}.png'))
                     shell.today_page.date.setDate(QDate.currentDate())
             habits = HabitsDialog(shell.bridge, shell.capabilities, shell)
             habits.open()
@@ -202,20 +199,22 @@ def test_glass_and_classic_profiles_share_data_and_live_editor(app_v2, shell, tm
             apply_appearance(app_v2, {**previous_appearance, 'theme': theme, 'font_size': 13})
             app_v2.processEvents();habits.repaint()
             assert current_appearance()['theme']==theme
-            assert habits.grab().save(str(report / f'visual-{style}-habits-{theme}.png'))
+            assert habits.grab().save(str(report / f'visual-glass-habits-{theme}.png'))
             habits.close(); habits.deleteLater(); habits = None
         shell.navigate('tasks')
-        shell.tasks_page.quick_input.setText('Unsaved text survives private switching')
-        shell.activate_from_tray('visual-glass')
-        shell.activate_from_tray('visual-classic')
-        assert shell.tasks_page.quick_input.text() == 'Unsaved text survives private switching'
+        quick_input = shell.tasks_page.quick_input
+        quick_input.setText('Unsaved text survives appearance changes')
+        for theme, size in (('light', 20), ('dark', 13)):
+            apply_appearance(app_v2, {**previous_appearance, 'theme': theme, 'font_size': size})
+            app_v2.processEvents()
+            assert shell.tasks_page.quick_input is quick_input
+            assert quick_input.text() == 'Unsaved text survives appearance changes'
         assert client.state()['revision'] == before['revision']
         assert client.state()['epoch'] == before['epoch']
     finally:
         if habits:
             habits.close(); habits.deleteLater()
         shell.tasks_page.quick_input.clear()
-        shell.apply_visual_style(previous_style)
         apply_appearance(app_v2, previous_appearance)
         if polling:
             shell.poll.start()

@@ -177,7 +177,7 @@ def test_gui_exit_preserves_unsaved_edit_and_uncertain_write(app):
         window.close()
 
 
-@pytest.mark.parametrize('command', ['show', 'visual-classic', 'visual-glass'])
+@pytest.mark.parametrize('command', ['show', 'update', 'exit'])
 def test_single_window_pipe_is_scoped_and_rejects_unrecognized_commands(app, tmp_path, command):
     first = WindowInstance(tmp_path / 'one')
     duplicate = WindowInstance(tmp_path / 'one')
@@ -217,7 +217,7 @@ def test_tray_process_lock_has_single_owner(tmp_path):
     assert not tray_runtime.observer_running(tmp_path)
 
 
-@pytest.mark.parametrize('command', ['visual-future', 'visual-classic\nexit'])
-def test_visual_window_protocol_rejects_unknown_or_combined_commands(tmp_path, command):
+@pytest.mark.parametrize('command', ['visual-classic', 'visual-glass', 'visual-future', 'show\nexit'])
+def test_window_protocol_rejects_retired_unknown_or_combined_commands(tmp_path, command):
     with pytest.raises(ValueError, match='Unsupported window request'):
         notify_window(tmp_path, command)

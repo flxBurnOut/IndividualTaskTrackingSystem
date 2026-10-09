@@ -868,13 +868,11 @@ class HabitsDialog(QDialog):
 
     def fit_fields(self):
         fit_input_fields(self)
-        from .gui_visual_profile import visual_style
-        modern = visual_style() == 'glass'
         scale = max(1, self.fontMetrics().height() / 18)
         for field in (self.daily_time, self.weekly_time, self.weekly_day):
-            field.setMaximumWidth(max(round(120 * scale), field.sizeHint().width()) if modern else 16777215)
-        self.review_timezone.setMaximumWidth(round(280 * scale) if modern else 16777215)
-        self.reminder_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint if modern else QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            field.setMaximumWidth(max(round(120 * scale), field.sizeHint().width()))
+        self.review_timezone.setMaximumWidth(round(280 * scale))
+        self.reminder_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
         self.habits.widget().updateGeometry()
 
     def _finished(self, *_):

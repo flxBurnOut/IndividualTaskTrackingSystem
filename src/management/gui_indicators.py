@@ -15,7 +15,6 @@ from shiboken6 import isValid
 
 from .gui_materials import reduce_motion
 from .gui_theme import bind_theme, color
-from .gui_visual_profile import visual_style
 
 
 class _Chevron(QWidget):
@@ -29,8 +28,6 @@ class _Chevron(QWidget):
         self.angle = 0.0
 
     def paintEvent(self, event):
-        if visual_style() != 'glass':
-            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         ink = QColor(color('muted' if self.parentWidget().isEnabled() else 'disabled_text'))
@@ -84,7 +81,7 @@ class ControlIndicator(QObject):
         self.animation.stop()
         control = self.control()
         if (control is not None and isValid(control) and control.isVisible()
-                and visual_style() == 'glass' and not reduce_motion()):
+                and not reduce_motion()):
             self.animation.setStartValue(self.arrow.angle)
             self.animation.setEndValue(self._target())
             self.animation.start()
@@ -93,7 +90,7 @@ class ControlIndicator(QObject):
             self.arrow.update()
 
     def _frame(self, angle):
-        if visual_style() != 'glass' or reduce_motion():
+        if reduce_motion():
             self.animation.stop()
             angle = self._target()
         self.arrow.angle = float(angle)
@@ -119,7 +116,7 @@ class ControlIndicator(QObject):
             rect = control.style().subControlRect(QStyle.ComplexControl.CC_ComboBox, option,
                                                   QStyle.SubControl.SC_ComboBoxArrow, control)
         self.arrow.setGeometry(rect)
-        self.arrow.setVisible(visual_style() == 'glass' and control.isVisible())
+        self.arrow.setVisible(control.isVisible())
         self.arrow.raise_()
         self.arrow.update()
 

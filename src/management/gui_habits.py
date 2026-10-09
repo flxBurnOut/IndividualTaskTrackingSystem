@@ -9,7 +9,6 @@ from .gui_recurring import RecurringDialog,text_label,action
 from .gui_forms import label_type
 from .gui_layout import ActionRow
 from .gui_theme import bind_theme
-from .gui_visual_profile import visual_style
 
 
 HABIT_CHOICES = {
@@ -90,15 +89,15 @@ class HabitEditor(QDialog):
     def fit_fields(self):
         from .gui_workflows import fit_input_fields
         fit_input_fields(self)
-        modern=visual_style()=='glass';scale=max(1,self.fontMetrics().height()/18)
-        self.title.setMaximumWidth(round(460*scale) if modern else 16777215)
+        scale=max(1,self.fontMetrics().height()/18)
+        self.title.setMaximumWidth(round(460*scale))
         for field in (self.first,self.last):
-            field.setMaximumWidth(max(round(220*scale),field.fontMetrics().horizontalAdvance(field.placeholderText())+32) if modern else 16777215)
+            field.setMaximumWidth(max(round(220*scale),field.fontMetrics().horizontalAdvance(field.placeholderText())+32))
         for field in self.fields.values():
             if isinstance(field,QSpinBox):
-                field.setMaximumWidth(max(round(170*scale),field.sizeHint().width()) if modern else 16777215)
+                field.setMaximumWidth(max(round(170*scale),field.sizeHint().width()))
             elif isinstance(field,QLineEdit):
-                field.setMaximumWidth(round(140*scale) if modern else 16777215)
+                field.setMaximumWidth(round(140*scale))
         self.editor_scroll.widget().updateGeometry()
 
     def changed(self,*_):self.dirty=True
@@ -210,16 +209,15 @@ class HabitsPanel(QScrollArea):
         return row
 
     def apply_visual_style(self):
-        modern=visual_style()=='glass'
         for section in self.sections:
-            section.setObjectName('ContentSection' if modern else 'ProgressCard')
-            section.layout().setContentsMargins(*( (2,12,2,18) if modern else (16,14,16,14)))
+            section.setObjectName('ContentSection')
+            section.layout().setContentsMargins(2,12,2,18)
             section.style().unpolish(section);section.style().polish(section)
         self.reflow_sections()
 
     def reflow_sections(self):
         if not hasattr(self,'rules_box'):return
-        wide=visual_style()=='glass' and self.viewport().width()>=round(820*max(1,self.fontMetrics().height()/18))
+        wide=self.viewport().width()>=round(820*max(1,self.fontMetrics().height()/18))
         key=(wide,self.reminder_toggle.isChecked())
         if getattr(self,'_section_layout',None)==key:return
         self._section_layout=key

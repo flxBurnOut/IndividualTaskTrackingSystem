@@ -10,7 +10,6 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication,QComboBox,QLineEdit,QPushButton,QVBoxLayout,QWidget
 from management.appearance import DEFAULT_APPEARANCE
 from management.gui_theme import apply_appearance,color,current_appearance
-from management.gui_visual_profile import set_visual_style,visual_style
 from management import gui_indicators
 
 
@@ -25,8 +24,8 @@ def wait_for(predicate,timeout=2):
 @pytest.fixture
 def scene(monkeypatch):
     app=QApplication.instance() or QApplication([]);app.setStyle('Fusion')
-    old_config,old_profile=current_appearance(),visual_style()
-    set_visual_style('glass');apply_appearance(app,DEFAULT_APPEARANCE)
+    old_config=current_appearance()
+    apply_appearance(app,DEFAULT_APPEARANCE)
     monkeypatch.setattr(gui_indicators,'reduce_motion',lambda:False)
     host=QWidget();layout=QVBoxLayout(host)
     combo=QComboBox();combo.addItems(['First','Second','Third'])
@@ -36,7 +35,7 @@ def scene(monkeypatch):
     host.resize(340,200);host.show();app.processEvents()
     yield app,host,combo,draft,disclosure
     combo.hidePopup();host.close();host.deleteLater();app.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()
-    set_visual_style(old_profile);apply_appearance(app,old_config)
+    apply_appearance(app,old_config)
 
 
 def ink_pixels(indicator,role):
@@ -89,7 +88,7 @@ def test_disclosure_arrow_animates_without_intercepting_native_click_or_keyboard
     assert draft.text()=='Unsaved input'
 
 
-def test_indicator_respects_reduce_motion_classic_and_dynamic_controls(scene,monkeypatch):
+def test_indicator_respects_reduce_motion_and_dynamic_controls(scene,monkeypatch):
     app,host,combo,draft,button=scene
     indicator=combo._management_indicator
     monkeypatch.setattr(gui_indicators,'reduce_motion',lambda:True)
@@ -98,12 +97,6 @@ def test_indicator_respects_reduce_motion_classic_and_dynamic_controls(scene,mon
     assert indicator.animation.state()==QAbstractAnimation.State.Stopped
     combo.hidePopup();app.processEvents()
     assert indicator.arrow.angle==0
-    set_visual_style('classic');apply_appearance(app,current_appearance());app.processEvents()
-    assert not indicator.arrow.isVisible()
-    combo.showPopup();app.processEvents()
-    assert combo.view().isVisible()
-    combo.hidePopup()
-    set_visual_style('glass');apply_appearance(app,current_appearance())
     late=QComboBox();late.addItems(['Late','Other']);host.layout().addWidget(late);app.processEvents()
     assert late._management_indicator.arrow.isVisible()
     assert combo._management_indicator is indicator

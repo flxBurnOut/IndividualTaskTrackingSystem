@@ -1,11 +1,11 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
-from PySide6.QtWidgets import QApplication,QFrame,QPushButton,QLabel
-from PySide6.QtCore import QCoreApplication,QEvent
+from PySide6.QtWidgets import QApplication,QFrame,QPushButton,QLabel,QWidget,QStackedWidget
+from PySide6.QtCore import QCoreApplication,QEvent,QObject
 from management.core import Core
 from management.gui_task_list import TaskListPanel
-from management.gui_workspace import WorkspacePage
+from management.gui_workspace import WorkspacePage,TaskDetailDialog
 from management.schemas import TYPES
 from test_ux_workflows_v2 import QueuedCoreBridge,ControlledBridge,wait
 from test_plan_assistance_v8 import cmd,task
@@ -13,6 +13,74 @@ from test_plan_assistance_v8 import cmd,task
 
 @pytest.fixture(scope='session')
 def app():return QApplication.instance() or QApplication([])
+
+
+@pytest.mark.parametrize('assistants_visible', [True, False])
+def test_workspace_refresh_never_shows_controls_as_top_level_windows(app, tmp_path, assistants_visible):
+    """Observe Show events: an end-of-render snapshot misses the native flash."""
+    core = Core(tmp_path)
+    project = cmd(core, 'create', {'type': 'project', 'title': 'Synthetic project'})['entity']
+    course = cmd(core, 'create', {'type': 'course', 'title': 'Synthetic course'})['entity']
+    note = cmd(core, 'create', {'type': 'note', 'title': 'Synthetic note',
+                              'parent_id': project['id'], 'data': {'content': 'Unsaved by browsing'}})['entity']
+    before = core.query('state')
+    bridge = QueuedCoreBridge(core)
+    host = QStackedWidget()
+    blank = QWidget()
+    page = WorkspacePage(bridge, on_create=lambda *_: None, on_edit=lambda *_: None,
+                         on_codex=lambda *_args, **_kwargs: None)
+    page.set_types(TYPES)
+    page.set_assistants_visible(assistants_visible)
+    host.addWidget(blank); host.addWidget(page)
+    host.resize(1100, 800); host.show()
+    app.processEvents()
+
+    class WindowShows(QObject):
+        def __init__(self):
+            super().__init__()
+            self.unexpected = []
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Show and isinstance(watched, QWidget) and watched.isWindow():
+                self.unexpected.append({
+                    'class': type(watched).__name__,
+                    'text': watched.text() if isinstance(watched, QPushButton) else watched.windowTitle(),
+                    'in_top_levels': watched in QApplication.topLevelWidgets(),
+                })
+            return False
+
+    observer = WindowShows()
+    app.installEventFilter(observer)
+    detail = None
+    try:
+        # Replay sidebar visits and each asynchronous subtree replacement.
+        for entity in (project, course, project, course):
+            host.setCurrentWidget(page)
+            page.open_object(entity)
+            wait(app, lambda: bridge.pending == 0)
+            assert page.assistant_buttons
+            assert all(button.isVisible() == assistants_visible for button in page.assistant_buttons)
+            page.refresh()
+            wait(app, lambda: bridge.pending == 0)
+            page.set_assistants_visible(not assistants_visible)
+            page.set_assistants_visible(assistants_visible)
+            host.setCurrentWidget(blank)
+        # A note dialog may be constructed while its host is visible. Its child
+        # buttons must not become windows before the intentional dialog.open().
+        detail = TaskDetailDialog(bridge, note, host, on_codex=lambda *_: None,
+                                  assistants_visible=assistants_visible)
+        assert detail.assistant_button.isVisibleTo(detail) == assistants_visible
+        assert not detail.isVisible()
+        assert not observer.unexpected, observer.unexpected
+        assert not bridge.commands
+        after = core.query('state')
+        assert (after['epoch'], after['revision']) == (before['epoch'], before['revision'])
+    finally:
+        app.removeEventFilter(observer)
+        if detail:
+            detail.close(); detail.deleteLater()
+        host.close(); host.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
 
 
 def test_completed_rows_are_lazy_collapsed_and_fully_pageable(app,tmp_path):

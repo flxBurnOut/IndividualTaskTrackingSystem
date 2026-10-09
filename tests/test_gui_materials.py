@@ -120,7 +120,7 @@ def test_real_page_fade_is_finite_and_does_not_capture_input(material_scene, mat
     assert editors[1].text().endswith(' live')
 
 
-@pytest.mark.parametrize('change', ['resize', 'hide', 'theme', 'classic'])
+@pytest.mark.parametrize('change', ['resize', 'hide', 'theme'])
 def test_live_transition_cancels_on_geometry_or_presentation_change(material_scene, materials_app, monkeypatch, change):
     host, panel, nav, stack, transition, pages, editors, actions = material_scene
     monkeypatch.setattr(gui_materials, 'reduce_motion', lambda: False)
@@ -132,9 +132,6 @@ def test_live_transition_cancels_on_geometry_or_presentation_change(material_sce
         stack.hide()
     elif change == 'theme':
         apply_appearance(materials_app, {'theme': 'dark'})
-    else:
-        set_visual_style('classic')
-        apply_appearance(materials_app, current_appearance())
     materials_app.processEvents()
     assert transition.animation.state() == QAbstractAnimation.State.Stopped
     assert not transition._veil.isVisible()
@@ -169,7 +166,7 @@ def test_navigation_renders_icon_and_keeps_keyboard_focus_and_checkable_state(ma
     assert nav.isChecked()
 
 
-def test_backdrop_cache_tracks_real_dpr_resize_theme_and_classic(material_scene, materials_app):
+def test_backdrop_cache_tracks_real_dpr_resize_theme_and_accent(material_scene, materials_app):
     host, panel, nav, stack, transition, pages, editors, actions = material_scene
     first = host.backdrop()
     assert first.cacheKey() == host.backdrop().cacheKey()
@@ -189,14 +186,11 @@ def test_backdrop_cache_tracks_real_dpr_resize_theme_and_classic(material_scene,
     for x, y in ((.1, .2), (.5, .5), (.9, .8)):
         sample = image.pixelColor(round(image.width() * x), round(image.height() * y))
         assert max(sample.red(), sample.green(), sample.blue()) - min(sample.red(), sample.green(), sample.blue()) < 16
-    set_visual_style('classic')
-    apply_appearance(materials_app, current_appearance())
-    classic = host.backdrop().toImage()
-    assert classic.pixelColor(0, 0).name() == color('window')
-    assert classic.pixelColor(classic.width() // 2, classic.height() // 2).name() == color('window')
+    apply_appearance(materials_app, {**current_appearance(), 'accent': 'violet'})
+    accented = host.backdrop()
+    assert accented.cacheKey() != dark.cacheKey()
+    assert accented.toImage() != image
     assert editors[0].text() == 'Unsaved draft 0'
-    stack.setCurrentIndex(1)
-    assert not transition._veil.isVisible()
 
 
 def test_sidebar_has_transparent_rounded_corners_and_interactive_children(material_scene, materials_app):
@@ -346,13 +340,11 @@ def test_tabs_animate_only_content_and_keep_keyboard_drafts_scroll_and_fast_sele
         tabs.hide()
         assert tabs.tabBar().animation.state() == QAbstractAnimation.State.Stopped
         tabs.show()
-        for disabled_by in ('classic', 'reduced_motion'):
-            set_visual_style('classic' if disabled_by == 'classic' else 'glass')
-            apply_appearance(materials_app, DEFAULT_APPEARANCE)
-            monkeypatch.setattr(gui_materials, 'reduce_motion', lambda: disabled_by == 'reduced_motion')
-            tabs.setCurrentIndex(2 if tabs.currentIndex() == 0 else 0)
-            assert not transition.is_active()
-            assert tabs.tabBar().animation.state() == QAbstractAnimation.State.Stopped
+        apply_appearance(materials_app, DEFAULT_APPEARANCE)
+        monkeypatch.setattr(gui_materials, 'reduce_motion', lambda: True)
+        tabs.setCurrentIndex(2 if tabs.currentIndex() == 0 else 0)
+        assert not transition.is_active()
+        assert tabs.tabBar().animation.state() == QAbstractAnimation.State.Stopped
     finally:
         host.close()
         host.deleteLater()

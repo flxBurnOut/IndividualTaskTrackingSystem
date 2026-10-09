@@ -11,7 +11,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from .runtime import OwnerLock
 from .data_space import require_beta_dir
 
-COMMANDS = {'show', 'update', 'exit', 'visual-classic', 'visual-glass'}
+COMMANDS = {'show', 'update', 'exit'}
 
 
 def pipe_name(data_dir):
