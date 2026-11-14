@@ -142,8 +142,8 @@ class ResourceManager:
                  staging_limit: int = 2 * 1024**3):
         if reserve_bytes < 0 or staging_limit <= 0:
             raise ValueError("invalid resource budgets")
-        from .data_space import require_beta_dir
-        self.root = require_beta_dir(data_dir)
+        from .data_space import require_channel_dir
+        self.root = require_channel_dir(data_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.reserve_bytes, self.staging_limit = reserve_bytes, staging_limit
         self._lock, self._reserved = threading.RLock(), 0
@@ -559,8 +559,8 @@ class ResourceManager:
         The caller must set a fresh epoch and reconcile jobs/notifications before
         starting a service. Runtime discovery/credentials are never copied.
         """
-        from .data_space import require_beta_dir
-        path, destination = _plain_path(path), require_beta_dir(target_dir)
+        from .data_space import require_channel_dir
+        path, destination = _plain_path(path), require_channel_dir(target_dir)
         if destination.exists():
             raise ResourceError("ALREADY_EXISTS", "恢复只能写入不存在的新目录。")
         report = self.verify_backup(path)

@@ -31,7 +31,7 @@ def test_fresh_data_creates_guidance_and_connection_without_business_database(tm
     assert result["changed"] is True
     assert len(result["changed_files"]) == 4
     assert not (data / "database.sqlite3").exists()
-    assert 'Beta 测试版' in Path(result['readme_path']).read_text('utf-8')
+    assert '正式数据空间' in Path(result['readme_path']).read_text('utf-8')
     assert set(snapshots(data)) == {"AGENTS.md", "开始使用.md", str(Path(".codex") / "config.toml"),
                                    str(Path(".codex") / "management-instructions.md")}
     config = tomllib.loads(Path(result["config_path"]).read_text("utf-8"))["mcp_servers"]["personal_management"]
@@ -156,6 +156,34 @@ def test_old_managed_document_version_can_be_upgraded(tmp_path):
     result = workspace.prepare_workspace(tmp_path)
     assert result["changed_files"] == [str(path)]
     assert "begin_context" in path.read_text("utf-8")
+
+
+def test_reading_policy_upgrade_updates_both_managed_documents_preserving_user_config(tmp_path):
+    prepared = workspace.prepare_workspace(tmp_path)
+    documents = [Path(prepared[key]) for key in ('agents_path', 'instructions_path')]
+    previous = ('On budget warning, save a short summary, set '
+                'yield_for_compaction=true, then finish the turn. Software automatically '
+                'compacts and continues the same operation.\n')
+    for path in documents:
+        path.write_text(workspace._document(previous), encoding='utf-8')
+    config = Path(prepared['config_path'])
+    with config.open('a', encoding='utf-8') as stream:
+        stream.write('\n[personal]\nnote = "keep exactly"\n')
+    original_config = config.read_bytes()
+
+    result = workspace.prepare_workspace(tmp_path)
+
+    assert set(result['changed_files']) == {str(path) for path in documents}
+    assert config.read_bytes() == original_config
+    for path in documents:
+        text = path.read_text('utf-8')
+        assert workspace._managed_document(text)
+        assert previous not in text
+        for contract in ('ordinary_mcp', 'managed_job', 'next_action', 'operation_status',
+                         'end_turn_for_compaction', '4000', 'checkpoint_limit'):
+            assert contract in text
+    # Reopening a migrated workspace does not repeatedly rewrite its instructions.
+    assert workspace.prepare_workspace(tmp_path)['changed'] is False
 
 
 @pytest.mark.parametrize("change", ["guidance", "connection", "unmanaged_connection", "invalid_toml", "incomplete_marker"])

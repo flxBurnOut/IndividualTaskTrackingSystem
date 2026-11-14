@@ -12,6 +12,7 @@ from management import codex_project
 from management.ai import AIError
 from management.core import Core
 from management.gui_workflows import SettingsDialog
+from test_appearance_v5 import dispose_settings
 from management.schemas import BusinessError
 
 
@@ -227,9 +228,7 @@ def dialog(app, tmp_path):
     view = SettingsDialog(bridge, {'types': []}, tmp_path / 'synthetic-space')
     next(q for q in bridge.queries if q['name'] == 'settings')['callback']({'settings': {'ai': dict(CONFIG)}})
     yield view, bridge
-    view.close()
-    view.deleteLater()
-    app.processEvents()
+    dispose_settings(app,view)
 
 
 def test_gui_saves_configuration_without_claiming_a_desktop_connection(dialog):
@@ -278,10 +277,14 @@ def test_gui_disabling_keeps_project_record_visible(dialog):
     assert '接口保留' in view.message.text()
 
 
-def test_closed_settings_ignores_late_setup_result(dialog):
+def test_settings_waits_for_save_then_ignores_late_setup_result_after_close(dialog):
     view, bridge = dialog
     view.save_ai()
     view.reject()
+    assert not view._models_closed and view._ai_configuring
+    bridge.commands[-1]['callback']({'result': {'codex_project': PROJECT}})
+    view.reject()
+    assert view._models_closed
     before = view.message.text()
     bridge.commands[-1]['callback']({'result': {'codex_project': PROJECT}})
     assert view.message.text() == before

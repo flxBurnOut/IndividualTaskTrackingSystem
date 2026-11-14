@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from .data_space import default_beta_dir, require_beta_dir
+from .data_space import default_beta_dir, require_channel_dir
 
 
 class OwnerLock:
@@ -42,8 +42,16 @@ class OwnerLock:
 
 
 def default_data_dir():
-    # Never inherit the stable installation's environment or registry defaults.
-    return require_beta_dir(default_beta_dir())
+    from .data_space import CHANNEL
+    if CHANNEL == 'beta':
+        return require_channel_dir(default_beta_dir())
+    if os.environ.get('PERSONAL_MANAGEMENT_DATA'):
+        return require_channel_dir(os.environ['PERSONAL_MANAGEMENT_DATA'])
+    from .installation_state import installed_data_dir
+    installed = installed_data_dir()
+    if installed is not None:
+        return require_channel_dir(installed)
+    return require_channel_dir(Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'PersonalManagement' / 'data')
 
 
 class DataSpaceMismatch(ValueError):
@@ -52,16 +60,16 @@ class DataSpaceMismatch(ValueError):
 
 class UpdatePending(RuntimeError):
     code = 'update_pending'
-    message = '此 Beta 数据空间已暂停后台以准备更新。请更新 Beta 源码后打开个人事务管理 Beta 测试版；若取消更新，也请主动打开 Beta 软件恢复使用。'
+    message = '此数据空间已暂停后台以准备更新。请完成安装后打开个人事务管理；若取消更新，也请主动打开软件恢复使用。'
 
     def __init__(self, reason='update'):
         if reason == 'exit':
-            self.message = 'Beta 后台已由用户退出。请主动打开个人事务管理 Beta 测试版恢复使用；Codex 不会自动重新启动已退出的 Beta 后台。'
+            self.message = '后台已由用户退出。请主动打开个人事务管理恢复使用；Codex 不会自动重新启动已退出的后台。'
         super().__init__(self.message)
 
 
 def require_no_pending_update(root, resume_token=None):
-    root = require_beta_dir(root)
+    root = require_channel_dir(root)
     # A malformed marker is still a maintenance fence, never permission to
     # silently restart an old MCP-owned binary during file replacement.
     marker = Path(root) / 'update_pending.json'
@@ -137,7 +145,7 @@ def require_data_dir(value, expected):
 
 
 def discovery(root):
-    root = require_beta_dir(root)
+    root = require_channel_dir(root)
     try:
         value = json.loads((Path(root) / 'runtime.json').read_text('utf-8'))
     except (OSError, ValueError):
@@ -151,7 +159,7 @@ def discovery(root):
 
 
 def _service_args(root, bootstrap=False, resume_token=None):
-    root = require_beta_dir(root)
+    root = require_channel_dir(root)
     executable = Path(sys.executable)
     if getattr(sys, 'frozen', False):
         sibling = executable.with_name('PersonalManagementService.exe')
@@ -216,7 +224,7 @@ def _windows_broker_start(root, resume_token=None):
 
 
 def start_service(root, resume_token=None):
-    root = require_beta_dir(root)
+    root = require_channel_dir(root)
     require_no_pending_update(root, resume_token)
     root.mkdir(parents=True, exist_ok=True)
     options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,

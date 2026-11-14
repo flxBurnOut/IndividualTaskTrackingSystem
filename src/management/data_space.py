@@ -1,8 +1,7 @@
-"""Beta source-workspace boundaries, checked before database or service access.
+"""Release-channel boundaries checked before database or service access.
 
-This is deliberately not a switch supplied by an environment variable. The
-current Beta distribution may only own spaces in this checkout, or disposable
-fixtures created by packaging/check.py. A separate packaged channel is pending.
+The channel is part of the shipped code, never an environment override. Stable
+keeps the user's selected data space; Beta owns only its isolated checkout.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import stat
 from pathlib import Path
 
 
-CHANNEL = 'beta'
+CHANNEL = 'stable'
 CHECK_PROFILES = {'focused', 'full', 'gui', 'package', 'upgrade', 'tray', 'installer'}
 
 
@@ -28,7 +27,31 @@ def default_beta_dir():
 
 
 def require_packaged_channel():
-    raise BetaIsolationError('Beta 安装与发布通道尚未实现；已阻止使用正式版打包或发布入口。')
+    if CHANNEL != 'stable':
+        raise BetaIsolationError('Beta 安装与发布通道尚未实现；已阻止使用正式版打包或发布入口。')
+
+
+def require_channel_dir(data_dir, *, inspect_runtime=True):
+    if CHANNEL == 'beta':
+        return require_beta_dir(data_dir)
+    selected = Path(data_dir).expanduser().absolute()
+    root = selected.resolve()
+    if any(part.casefold() == '.beta-data' for part in (*selected.parts, *root.parts)):
+        raise BetaIsolationError('正式版不能打开 Beta 测试数据，请选择原正式数据目录；未打开数据库或连接后台。')
+    # Rendering workspace configuration must not read discovery credentials.
+    # Any resulting client/storage access still uses the default full check.
+    if not inspect_runtime:
+        return root
+    # The discovery record is only an additional isolation fence, never an
+    # authorization to use an arbitrary port or to overwrite existing data.
+    try:
+        record = json.loads((root / 'runtime.json').read_text('utf-8'))
+    except (OSError, ValueError):
+        record = {}
+    if isinstance(record, dict) and isinstance(record.get('service_contract'), dict):
+        if record['service_contract'].get('channel') == 'beta':
+            raise BetaIsolationError('所选空间属于 Beta 后台；正式版未连接，也未修改其中的数据。')
+    return root
 
 
 def require_beta_dir(data_dir):

@@ -262,5 +262,54 @@ class CoreTests(unittest.TestCase):
         self.assertFalse((destination / ".workspace.json").exists())
 
 
+    def test_optional_location_paths_disambiguate_names_without_changing_default_list(self):
+        first = self.create('domain', 'Work')
+        second = self.create('domain', 'Study')
+        project = self.create('project', 'Same name', parent_id=first['id'])
+        course = self.create('course', 'Same name', parent_id=second['id'])
+        nested = self.create('task', 'Same name', parent_id=project['id'])
+        before = self.core.query('state')
+        plain = self.core.query('list', search='Same name', limit=1)
+        self.assertNotIn('location_path', plain['items'][0])
+        ids = []; offset = 0
+        while offset is not None:
+            page = self.core.query('list', search='Same name', limit=1, offset=offset, include_path=True)
+            self.assertEqual(page['total'], 3)
+            self.assertEqual(len(page['items']), 1)
+            item = page['items'][0]; ids.append(item['id'])
+            self.assertTrue(item['location_path_complete'])
+            self.assertEqual(item['location_path'][-1]['id'], item['id'])
+            self.assertTrue(all(set(node) == {'id','type','title'} for node in item['location_path']))
+            if item['id'] == nested['id']:
+                self.assertEqual([node['id'] for node in item['location_path']], [first['id'],project['id'],nested['id']])
+            elif item['id'] == course['id']:
+                self.assertEqual([node['id'] for node in item['location_path']], [second['id'],course['id']])
+            offset = page['next_offset']
+        self.assertEqual(set(ids), {project['id'],course['id'],nested['id']})
+        one = self.core.query('get', id=project['id'], include_path=True)['entity']
+        self.assertEqual([node['id'] for node in one['location_path']], [first['id'],project['id']])
+        self.assertEqual(self.core.query('get', id=project['id'])['entity'], project)
+        self.assertEqual(self.core.query('state'), before)
+        with self.assertRaises(BusinessError): self.core.query('list', include_path='yes')
+
+    def test_location_path_bounds_cycles_without_loading_entity_bodies(self):
+        from management.presentation import Presenter
+        with self.core.store.connect() as connection:
+            presenter = Presenter(self.core, connection)
+            # Synthetic in-memory metadata exercises corrupt/oversized ancestry
+            # without bypassing business interfaces to alter the test database.
+            presenter.location_cache = {
+                str(i): {'id':str(i),'title':'Node '+str(i),'type':'domain','parent_id':str(i+1)}
+                for i in range(70)}
+            bounded = presenter.location_path(presenter.location_cache['0'])
+            self.assertEqual(len(bounded['location_path']), 64)
+            self.assertFalse(bounded['location_path_complete'])
+            presenter.location_cache['3']['parent_id'] = '0'
+            cycle = presenter.location_path(presenter.location_cache['0'])
+            self.assertEqual(len(cycle['location_path']), 4)
+            self.assertFalse(cycle['location_path_complete'])
+            self.assertEqual(presenter.cache, {})
+
+
 if __name__ == "__main__":
     unittest.main()

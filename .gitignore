@@ -4,7 +4,7 @@
 !/README.md
 !/AGENTS.md
 !/pyproject.toml
-!/启动个人事务管理Beta.vbs
+!/启动个人事务管理.vbs
 !/src/
 !/tests/
 !/packaging/
@@ -27,6 +27,11 @@
 !/docs/发布说明_1.1.1.md
 !/docs/发布说明_1.2.0.md
 !/docs/发布说明_1.2.1.md
+!/docs/发布说明_1.3.0.md
+!/docs/发布说明_1.3.1.md
+!/docs/发布说明_1.3.2.md
+!/docs/发布说明_1.3.3.md
+!/docs/发布说明_1.3.4.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -46,6 +51,7 @@
 !/packaging/installer.iss
 !/packaging/build_installer.py
 !/packaging/license_notices.py
+!/packaging/runtime_resources.py
 
 # Private data, credentials, local settings and generated files anywhere.
 /.beta-data/

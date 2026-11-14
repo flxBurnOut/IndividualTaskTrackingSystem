@@ -9,14 +9,14 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .runtime import OwnerLock
-from .data_space import require_beta_dir
+from .data_space import require_channel_dir
 
 COMMANDS = {'show', 'update', 'exit'}
 
 
 def pipe_name(data_dir):
-    identity = os.path.normcase(str(require_beta_dir(data_dir))) + '\0' + os.environ.get('USERNAME', os.environ.get('USER', ''))
-    return 'PersonalManagement.Beta.Gui.' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]
+    identity = os.path.normcase(str(require_channel_dir(data_dir))) + '\0' + os.environ.get('USERNAME', os.environ.get('USER', ''))
+    return 'PersonalManagement.Gui.' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]
 
 
 def notify_window(data_dir, command='show', timeout_ms=700):
@@ -37,7 +37,7 @@ def notify_window(data_dir, command='show', timeout_ms=700):
 
 
 def window_running(data_dir):
-    data_dir = require_beta_dir(data_dir)
+    data_dir = require_channel_dir(data_dir)
     lock = OwnerLock(Path(data_dir) / 'gui.lock')
     if not lock.acquire():
         return True
@@ -50,7 +50,7 @@ class WindowInstance(QObject):
 
     def __init__(self, data_dir, parent=None):
         super().__init__(parent)
-        data_dir = require_beta_dir(data_dir)
+        data_dir = require_channel_dir(data_dir)
         self.lock = OwnerLock(Path(data_dir) / 'gui.lock')
         self.server = QLocalServer(self)
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)

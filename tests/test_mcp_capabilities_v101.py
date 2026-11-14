@@ -294,3 +294,30 @@ def test_managed_catalog_and_direct_write_guard_use_actual_metadata_and_core(bus
     asyncio.run(scenario())
     assert not business.commands and "capabilities" not in business.queries
     assert core.query("list")["total"] == 0
+
+
+
+def test_large_registered_query_preserves_exact_view_and_rechecks_registry(business):
+    core=business.core
+    value={'custom_result':'Synthetic 中文 result. '*3000,'tail':'FINAL'}
+    core.extensions.register(QueryDefinition('synthetic.large_result','Synthetic view',lambda core,c,p:value,{'type':'object'}))
+    expected=core.query('synthetic.large_result')
+    async def scenario():
+        async with MCPClient(create_server(core.root,client=business)) as client:
+            first=await client.call_tool('query_business',{'name':'synthetic.large_result','params':{}})
+            assert not first.is_error,text(first)
+            page=first.structured_content
+            assert page['format']=='business-query-json/1' and 'context' not in page
+            fragments=[]
+            while True:
+                fragments.append(page['json_fragment'])
+                if page['complete']:break
+                following=page['continuation']
+                response=await client.call_tool(following['tool'],{**following['arguments'],'byte_limit':65536})
+                assert not response.is_error,text(response)
+                page=response.structured_content
+            assert json.loads(''.join(fragments))==expected
+            invalid=await client.call_tool('read_business_page',{'name':'synthetic.not_registered','params':{}})
+            error(invalid,'unknown_query')
+    asyncio.run(scenario())
+    assert 'prepare_context' not in business.queries and not business.commands

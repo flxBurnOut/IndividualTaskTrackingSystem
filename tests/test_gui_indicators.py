@@ -101,3 +101,45 @@ def test_indicator_respects_reduce_motion_and_dynamic_controls(scene,monkeypatch
     assert late._management_indicator.arrow.isVisible()
     assert combo._management_indicator is indicator
     assert draft.text()=='Unsaved input'
+
+
+@pytest.mark.parametrize('theme',['light','dark'])
+@pytest.mark.parametrize('font_size',[13,20])
+@pytest.mark.parametrize('raster_scale',[1.0,1.25,1.5])
+def test_checkbox_focus_check_uncheck_keeps_indicator_and_outline_aligned(scene,theme,font_size,raster_scale):
+    """Native layout and scaled rendering stay aligned through the full cycle."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QImage
+    from PySide6.QtWidgets import QCheckBox,QStyle,QStyleOptionButton
+    app,host,combo,draft,disclosure=scene
+    apply_appearance(app,{'theme':theme,'font_size':font_size,'accent':'violet'})
+    checkbox=QCheckBox('允许使用本机辅助处理');host.layout().insertWidget(0,checkbox)
+    host.resize(650,320);draft.setFocus();QTest.qWait(25)
+
+    def snapshot():
+        app.processEvents()
+        option=QStyleOptionButton();checkbox.initStyleOption(option)
+        indicator=checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator,option,checkbox)
+        contents=checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxContents,option,checkbox)
+        geometry=(checkbox.geometry().getRect(),(checkbox.sizeHint().width(),checkbox.sizeHint().height()),indicator.getRect(),contents.getRect())
+        image=QImage(QSize(round(checkbox.width()*raster_scale),round(checkbox.height()*raster_scale)),QImage.Format.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(raster_scale);image.fill(Qt.GlobalColor.transparent);checkbox.render(image)
+        # Sample the inside of the indicator; the outer keyboard focus ring is separate.
+        inner=indicator.adjusted(3,3,-3,-3);primary=QColor(color('primary'))
+        ink=sum(abs(pixel.red()-primary.red())+abs(pixel.green()-primary.green())+abs(pixel.blue()-primary.blue())<45
+                for x in range(round(inner.left()*raster_scale),round(inner.right()*raster_scale))
+                for y in range(round(inner.top()*raster_scale),round(inner.bottom()*raster_scale))
+                for pixel in [image.pixelColor(x,y)])
+        return geometry,ink
+
+    baseline,empty_ink=snapshot()
+    checkbox.setFocus();focused,_=snapshot()
+    QTest.mouseClick(checkbox,Qt.MouseButton.LeftButton,pos=QPoint(baseline[2][0]+baseline[2][2]//2,baseline[2][1]+baseline[2][3]//2))
+    checked,checked_ink=snapshot();assert checkbox.isChecked()
+    QTest.keyClick(checkbox,Qt.Key.Key_Space)
+    unchecked,unselected_ink=snapshot();assert not checkbox.isChecked()
+    draft.setFocus();blurred,_=snapshot()
+    checkbox.setFocus();refocused,_=snapshot()
+    assert all(value==baseline for value in (focused,checked,unchecked,blurred,refocused))
+    assert checked_ink>empty_ink+4 and unselected_ink==empty_ink
+    assert draft.text()=='Unsaved input'

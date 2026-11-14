@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import copy
+import uuid
 from typing import Any
 
 from .gui_calendar import install_calendar
@@ -13,7 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QPushButton, QScrollArea, QSpinBox, QTextEdit, QVBoxLayout,
-    QWidget,
+    QWidget, QMessageBox,
 )
 
 TYPE_LABELS = {
@@ -69,6 +71,15 @@ def label_type(value):
 
 def label_status(value):
     return STATUS_LABELS.get(value, value or "待确认")
+
+
+def location_label(entity):
+    """Distinguish names by both their type and structural ancestors."""
+    path = entity.get('location_path')
+    if path:
+        prefix = '资料库' if entity.get('location_path_complete', True) else '上层位置未完整读取'
+        return prefix + ' › ' + ' › '.join(label_type(node['type']) + ' · ' + node['title'] for node in path)
+    return label_type(entity.get('type')) + ' · ' + entity.get('title', '')
 
 
 def readable(value):
@@ -213,10 +224,14 @@ class EntityPicker(FormDialog):
         self.generation = 0
         self.offset = 0
         self.next_offset = None
+        self._picker_closed = False
+        self.finished.connect(lambda *_: setattr(self, '_picker_closed', True))
+        self.destroyed.connect(lambda *_: setattr(self, '_picker_closed', True))
         self.search = QLineEdit()
         self.search.setPlaceholderText("输入名称搜索…")
         self.body_layout.addWidget(self.search)
         self.items = QListWidget()
+        self.items.setWordWrap(True)
         self.items.setMinimumHeight(280)
         self.body_layout.addWidget(self.items)
         self.count = QLabel()
@@ -235,34 +250,37 @@ class EntityPicker(FormDialog):
         self.reload()
 
     def reload(self):
+        if self._picker_closed: return
         self.offset = 0
         self.items.clear()
         self.load()
 
     def load_more(self):
-        if self.next_offset is not None:
+        if not self._picker_closed and self.next_offset is not None:
             self.offset = self.next_offset
             self.load()
 
     def load(self):
+        if self._picker_closed: return
         self.generation += 1
         generation = self.generation
-        params = {"search": self.search.text().strip(), "limit": 50, "offset": self.offset}
+        params = {"search": self.search.text().strip(), "limit": 50, "offset": self.offset, 'include_path': True}
         if self.allowed_types:
             params["types"] = self.allowed_types
         def loaded(result):
-            if generation != self.generation:
+            if self._picker_closed or generation != self.generation:
                 return
             for entity in result.get("items", []):
                 if entity["id"] in self.exclude:
                     continue
-                item = QListWidgetItem(f"{entity['title']}\n{label_type(entity['type'])} · {label_status(entity.get('status'))}")
+                item = QListWidgetItem(f"{label_type(entity['type'])} · {entity['title']}\n{location_label(entity)}")
+                item.setToolTip(item.text() + '\n状态：' + label_status(entity.get('status')))
                 item.setData(Qt.ItemDataRole.UserRole, entity)
                 self.items.addItem(item)
             self.next_offset = result.get("next_offset")
             self.more.setEnabled(self.next_offset is not None)
             self.count.setText(f"找到 {result.get('total', self.items.count())} 项 · 已显示 {self.items.count()} 项")
-        self.bridge.query("list", loaded, self.error, **params)
+        self.bridge.query("list", loaded, lambda error: self.error(error) if not self._picker_closed and generation == self.generation else None, **params)
 
     def choose(self):
         item = self.items.currentItem()
@@ -436,6 +454,10 @@ class EntityForm(FormDialog):
         self.epoch = bridge.epoch
         self.entity = entity
         self.saving = False
+        self._submission = None
+        self._submission_options = None
+        self._uncertain = False
+        self._discard_close = False
         self.initial_payload = initial_payload or {}
         self.workflow = workflow
         self.on_saved = on_saved
@@ -495,24 +517,27 @@ class EntityForm(FormDialog):
         self.parent_picker = QWidget()
         parent_row = QHBoxLayout(self.parent_picker)
         parent_row.setContentsMargins(0, 0, 0, 0)
-        self.parent_button = QPushButton((self.context_parent or {}).get('title', '选择归属…'))
+        self.parent_button = QPushButton('选择位置…')
         self.parent_button.clicked.connect(self.choose_parent)
         self.clear_parent_button = QPushButton('清除')
         self.clear_parent_button.clicked.connect(self.clear_parent)
         parent_row.addWidget(self.parent_button, 1)
         parent_row.addWidget(self.clear_parent_button)
         parent_layout.addWidget(self.parent_picker)
+        from .gui_layout import ReadingLabel
+        self.parent_path = ReadingLabel('', 'Quiet')
+        parent_layout.addWidget(self.parent_path)
         self.parent_info = QLabel()
         self.parent_info.setWordWrap(True)
         self.parent_info.setObjectName('Hint')
         parent_layout.addWidget(self.parent_info)
         self.form.addRow(self.parent_label, self.parent_area)
         self.classification_enabled.toggled.connect(self._classification_changed)
-        if self.parent_id and not self.context_parent:
-            self.parent_button.setText('正在读取归属…')
+        if self.parent_id:
+            if not self.context_parent: self.parent_button.setText('正在读取位置…')
             selected_parent = self.parent_id
-            self.bridge.query('get', lambda result: self.parent_button.setText(result['entity']['title']) if self.parent_id == selected_parent else None,
-                              lambda _: self.parent_button.setText('归属暂不可读取'), id=self.parent_id)
+            self.bridge.query('get', lambda result: self._show_parent_location(result['entity']) if self.parent_id == selected_parent else None,
+                              lambda _: self.parent_button.setText('位置暂不可读取'), id=self.parent_id, include_path=True)
         self.event_owner_id = (entity or {}).get("data", {}).get("owner_id") if entity else self.initial_payload.get("data", {}).get("owner_id")
         self.owner_row = QWidget()
         owner_layout = QHBoxLayout(self.owner_row)
@@ -544,6 +569,7 @@ class EntityForm(FormDialog):
         self.body_layout.addStretch(1)
         self.type_box.currentIndexChanged.connect(self.rebuild_fields)
         self.rebuild_fields()
+        self._initial_form = self._form_state()
         self.buttons.accepted.connect(self.save)
         if entity and entity["type"] == "task":
             self.delete_button = QPushButton("恢复任务" if entity.get("archived") else "删除任务")
@@ -603,7 +629,11 @@ class EntityForm(FormDialog):
             if key in ("id", "title", "status", "parent_id", "version"):
                 continue
             spec = spec if isinstance(spec, dict) else {"type": spec}
-            editor = FieldEditor(key, spec, current.get(key), self)
+            if self.type_box.currentData() == 'task':
+                from .gui_task_fields import TaskFieldEditor
+                editor = TaskFieldEditor(key, spec, current.get(key), self)
+            else:
+                editor = FieldEditor(key, spec, current.get(key), self)
             self.fields[key] = editor
             if spec.get("read_only"):
                 editor.setEnabled(False)
@@ -615,12 +645,28 @@ class EntityForm(FormDialog):
                 editor.setToolTip(hint)
                 if isinstance(editor.editor, (QTextEdit, QLineEdit)):
                     editor.editor.setPlaceholderText(hint)
-            if key not in essentials:
+            if key not in essentials and current.get(key) is None:
                 self.extra_fields.append(editor)
                 self.field_layout.setRowVisible(editor, self.more_fields.isChecked())
             elif spec.get('type') in {'text','multiline'}:
                 editor.enabled.setChecked(True)
                 editor.enabled.hide()
+
+        if self.type_box.currentData() == 'task':
+            from .gui_layout import ActionRow
+            self.task_properties = ActionRow()
+            self.field_layout.insertRow(0, self.task_properties)
+            for key, caption in (('due_date', '截止日期'), ('estimated_minutes', '预计用时')):
+                if key not in self.fields: continue
+                editor = self.fields[key]
+                button = QPushButton(); button.setCheckable(True)
+                button.setAccessibleName('编辑' + caption)
+                def update_caption(e=editor, b=button, title=caption):
+                    b.setText(title + '：' + e.display_value())
+                editor.changed.connect(update_caption); update_caption()
+                button.toggled.connect(lambda checked, e=editor: (self.field_layout.setRowVisible(e, checked), e.editor.setFocus() if checked else None))
+                self.field_layout.setRowVisible(editor, False)
+                self.task_properties.addWidget(button)
 
         if self.entity is None:
             index = self.status_box.findData('active')
@@ -662,7 +708,7 @@ class EntityForm(FormDialog):
         context_type = (self.context_parent or {}).get('type')
         anchored = bool(self.parent_id and kind == 'project' and context_type != 'domain' and not self.entity)
         classification = kind in {'course', 'project', 'activity', 'goal', 'domain'} and not anchored
-        if self.entity:
+        if self.entity and kind != 'task':
             self.parent_mode = 'existing'
             self.parent_label.setText('当前归属')
             self.parent_info.setText('此处保留现有归属。需要移动时，请在项目与课程中调整。')
@@ -677,22 +723,30 @@ class EntityForm(FormDialog):
             self.parent_info.setText('例如学习、健康、职业。不选择分类也可以独立建立。')
         else:
             self.parent_mode = 'assignment'
-            self.parent_label.setText('任务归属' if kind == 'task' else '归属')
-            self.parent_info.setText('选择与这项工作直接相关的课程、项目或阶段；也可以保留为独立任务。' if kind == 'task' else '')
+            self.parent_label.setText('所属位置' if kind == 'task' else '归属')
+            self.parent_info.setText('选择所属的课程、项目、分类、活动或另一任务；也可以暂不分类。' if kind == 'task' else '')
         self.classification_enabled.blockSignals(True)
         self.classification_enabled.setChecked(bool(self.parent_id))
         self.classification_enabled.blockSignals(False)
         self.classification_enabled.setVisible(self.parent_mode == 'classification')
         self.parent_picker.setVisible(self.parent_mode != 'classification' or bool(self.parent_id))
-        editable = self.entity is None and self.parent_mode != 'context' and bool(self.parent_picker_types)
+        editable = (self.entity is None or kind == 'task') and self.parent_mode != 'context' and bool(self.parent_picker_types)
         self.parent_button.setEnabled(editable)
         self.clear_parent_button.setEnabled(editable)
         self.clear_parent_button.setVisible(self.parent_mode not in {'existing', 'context'})
         self.form.setRowVisible(self.parent_area, bool(allowed) or bool(self.parent_id))
         if not self.parent_id:
+            self.parent_path.setText(''); self.parent_button.setToolTip('')
             self.parent_button.setText('选择分类…' if self.parent_mode == 'classification' else '独立任务（可选择归属）' if kind == 'task' else '选择归属…')
         elif self.context_parent:
-            self.parent_button.setText(self.context_parent['title'])
+            self._show_parent_location(self.context_parent)
+
+    def _show_parent_location(self, entity):
+        self.parent_button.setText(('更改分类…' if getattr(self, 'parent_mode', '') == 'classification' else '更改位置…')
+                                   if self.parent_button.isEnabled() else '当前所属位置')
+        path = location_label(entity)
+        self.parent_button.setToolTip(path)
+        self.parent_path.setText(path)
 
     def _classification_changed(self, enabled):
         if getattr(self, 'parent_mode', '') != 'classification':
@@ -701,6 +755,7 @@ class EntityForm(FormDialog):
         if not enabled:
             self.parent_id = None
             self.parent_button.setText('选择分类…')
+            self.parent_path.setText(''); self.parent_button.setToolTip('')
 
     def toggle_more_fields(self, visible):
         for editor in getattr(self, 'extra_fields', []):
@@ -722,9 +777,9 @@ class EntityForm(FormDialog):
         self.owner_button.setText("未关联")
 
     def choose_parent(self):
-        if self.entity or self.parent_mode == 'context' or not self.parent_picker_types:
+        if (self.entity and self.entity['type'] != 'task') or self.parent_mode == 'context' or not self.parent_picker_types:
             return
-        picker = EntityPicker(self.bridge, self, allowed_types=self.parent_picker_types)
+        picker = EntityPicker(self.bridge, self, allowed_types=self.parent_picker_types, exclude=[self.entity['id']] if self.entity else None)
         if self.parent_mode == 'classification':
             picker.setWindowTitle('选择分类')
             picker.heading.setText('选择分类')
@@ -733,12 +788,13 @@ class EntityForm(FormDialog):
                 self.error('这项内容不能作为当前类型的归属。')
                 return
             self.parent_id = picker.selected['id']
-            self.parent_button.setText(picker.selected['title'])
+            self._show_parent_location(picker.selected)
 
     def clear_parent(self):
-        if self.entity or getattr(self, 'parent_mode', '') == 'context':
+        if (self.entity and self.entity['type'] != 'task') or getattr(self, 'parent_mode', '') == 'context':
             return
         self.parent_id = None
+        self.parent_path.setText(''); self.parent_button.setToolTip('')
         if getattr(self, 'parent_mode', '') == 'classification':
             self.classification_enabled.setChecked(False)
             self.parent_button.setText('选择分类…')
@@ -747,6 +803,12 @@ class EntityForm(FormDialog):
 
     def save(self):
         if self.saving:
+            return
+        if self._submission is not None:
+            self._send_submission()
+            return
+        if getattr(self, '_content_saved', False) and self._content_state() == self._saved_content_state:
+            self._retry_parent_move()
             return
         title = self.title_edit.text().strip()
         if not title:
@@ -781,29 +843,127 @@ class EntityForm(FormDialog):
         else:
             payload = {"type": self.type_box.currentData(), "title": title, "status": self.status_box.currentData(), "parent_id": self.parent_id, "data": data}
             command = "create"
-        def saved(result):
-            self.saving = False
-            if self.on_saved:
-                self.on_saved(result)
-            self.accept()
         if self.workflow:
             payload = {"module_id": self.workflow["module_id"], "workflow_id": self.workflow["id"], "input": payload}
             command = "run_workflow"
-        self.bridge.command(command, payload, saved, self.error, epoch=self.epoch)
+        self._submitted_form_state = copy.deepcopy(self._form_state())
+        self._desired_parent = self.parent_id
+        self._move_pending = bool(self.entity and self.entity['type'] == 'task' and self.parent_id != self.entity.get('parent_id'))
+        self._submission = (command, payload)
+        self._submission_options = {'request_id': str(uuid.uuid4()), 'epoch': self.epoch, 'expected_revision': self.bridge.revision}
+        self._send_submission()
+
+    def _send_submission(self):
+        self.saving = True
+        self.busy()
+        command, payload = self._submission
+        def saved(receipt):
+            self.saving = self._uncertain = False
+            self._submission = None
+            self._submission_options = None
+            entity = receipt.get('result', receipt).get('entity')
+            if self._move_pending and entity:
+                self.entity = entity
+                self._move_pending = False
+                self._content_saved = True
+                state = list(self._submitted_form_state)
+                self._saved_content_state = tuple(state[:3] + state[4:])
+                state[3] = entity.get('parent_id')
+                self._initial_form = tuple(state)
+                self._submission = ('move', {'id': entity['id'], 'version': entity['version'], 'parent_id': self._desired_parent})
+                self._submission_options = {'request_id': str(uuid.uuid4()), 'epoch': receipt.get('epoch', self.epoch), 'expected_revision': receipt.get('revision', self.bridge.revision)}
+                self.error_label.setText('内容已保存，正在更新所属位置…')
+                self._send_submission()
+                return
+            if entity: self.entity = entity
+            self._initial_form = self._form_state()
+            if self.on_saved: self.on_saved(receipt)
+            self.accept()
+        self.bridge.command(command, copy.deepcopy(payload), saved, self.error, **self._submission_options)
+
+    def _content_state(self):
+        state = self._form_state()
+        return state[:3] + state[4:]
+
+    def _retry_parent_move(self):
+        # Content already committed. Read a fresh version and retry only location.
+        self.saving = True; self.busy()
+        desired = self.parent_id
+        def loaded(result):
+            if result.get('epoch', self.epoch) != self.epoch:
+                failed({'message':'数据空间已变化，请保留输入并重新打开任务核对。'});return
+            entity = result['entity']
+            self.entity = entity
+            if entity.get('parent_id') == desired:
+                self.saving = False
+                self._initial_form = self._form_state()
+                if self.on_saved:self.on_saved({'result':{'entity':entity},'epoch':result.get('epoch'),'revision':result.get('revision')})
+                self.accept();return
+            self._desired_parent = desired
+            self._move_pending = False
+            self._submission = ('move', {'id':entity['id'], 'version':entity['version'], 'parent_id':desired})
+            self._submission_options = {'request_id':str(uuid.uuid4()), 'epoch':result.get('epoch',self.epoch), 'expected_revision':result.get('revision',self.bridge.revision)}
+            self._send_submission()
+        def failed(error):
+            self.saving = False
+            # This failed read has no unknown write to resolve.
+            self.body.setEnabled(True)
+            self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(True)
+            self.error_label.setText('任务内容已保存，所属位置尚未更新。重新读取失败，输入仍保留。\n'+error.get('message',str(error)))
+            self.error_label.show()
+        self.bridge.query('get',loaded,failed,id=self.entity['id'],display=True)
 
     def error(self, error):
         self.saving = False
+        code = error.get('code') if isinstance(error, dict) else None
+        transport_unknown = code in {'connection_lost', 'connection_error', 'timeout', 'request_timeout', 'protocol_error', 'response_limit', 'internal_error'}
+        definite_rejection = code in {'revision_conflict', 'entity_conflict', 'validation'}
+        self._uncertain = transport_unknown or (self._uncertain and not definite_rejection)
+        if not self._uncertain: self._submission = self._submission_options = None
         super().error(error)
+        if self._uncertain:
+            self.body.setEnabled(False)
+            self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('核对上次保存结果')
+        if getattr(self, '_content_saved', False):
+            self.error_label.setText('任务内容已保存，所属位置尚未确认更改。\n' + self.error_label.text())
+
+    def _form_state(self):
+        values = {}
+        for name, field in self.fields.items():
+            widget = field.editor
+            if isinstance(widget, QTextEdit): value = widget.toPlainText()
+            elif isinstance(widget, QComboBox): value = widget.currentData()
+            elif isinstance(widget, QCheckBox): value = widget.isChecked()
+            elif isinstance(widget, QDateEdit): value = widget.date().toString('yyyy-MM-dd')
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)): value = widget.lineEdit().text()
+            else: value = widget.text()
+            values[name] = (field.enabled.isChecked(), value)
+        return (self.type_box.currentData(), self.title_edit.text(), self.status_box.currentData(),
+                self.parent_id, self.event_owner_id, values)
+
+    def _allow_close(self):
+        if self.saving or self._uncertain:
+            self.error_label.setText('请先等待保存结束或核对上一次保存结果，再关闭。')
+            self.error_label.show()
+            return False
+        if self._discard_close or self._form_state() == self._initial_form: return True
+        message = ('任务内容已经保存。所属位置仍有未保存的修改；保存后关闭，还是只放弃位置修改？'
+                   if getattr(self, '_content_saved', False) and self._content_state() == self._saved_content_state
+                   else '保存后关闭，还是放弃本次未保存的修改？')
+        answer = QMessageBox.warning(self, '有未保存的修改', message,
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer == QMessageBox.StandardButton.Save:
+            self.save(); return False
+        return answer == QMessageBox.StandardButton.Discard
 
     def reject(self):
-        if not self.saving:
+        if self._allow_close():
             super().reject()
 
     def closeEvent(self, event):
-        if self.saving:
-            event.ignore()
-        else:
-            super().closeEvent(event)
+        event.ignore()
+        self.reject()
 
 
 class FeedbackDialog(FormDialog):

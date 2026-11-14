@@ -212,7 +212,8 @@ class RecoveryPanel(QFrame):
                 v.addWidget(label('累计已补 '+number(p.get('completed_quantity'))+' / '+number(p.get('total_quantity'))+' '+p.get('unit','')+' · '+state))
                 if p.get('issues'):v.addWidget(label('；'.join(p['issues'][:2])))
                 if p.get('ratio') is not None:
-                    bar=QProgressBar();bar.setRange(0,100);bar.setValue(round(max(0,min(1,p['ratio']))*100));bar.setTextVisible(True);bar.setFormat('%p%（数量进度）');v.addWidget(bar)
+                    from .gui_progress import AnimatedProgressBar
+                    bar=AnimatedProgressBar(reveal_scope=self,reveal_key=('recovery',task['id']));bar.setRange(0,100);bar.setValue(round(max(0,min(1,p['ratio']))*100));bar.setTextVisible(True);bar.setFormat('%p%（数量进度）');v.addWidget(bar)
                 else:v.addWidget(label('数量尚未明确，不显示推测的完成百分比。'))
                 actions=ActionRow();actions.addWidget(button('更新进度',lambda _,e=task:self.record(e)));actions.addWidget(button('加入某天计划',lambda _,e=task:self.open_task(e)));v.addWidget(actions);self.rows_layout.addWidget(row)
             self.next_offset=result.get('next_offset');self.previous.setVisible(self.offset>0);self.next.setVisible(self.next_offset is not None)

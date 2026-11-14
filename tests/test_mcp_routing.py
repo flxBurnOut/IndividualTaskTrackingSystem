@@ -294,3 +294,22 @@ def test_present_null_in_server_context_is_rejected(tmp_path):
             await server.call_tool('begin_discussion', {'text': 'synthetic', 'request_id': 'request'}, context)
     run(scenario)
     assert not business.calls
+
+
+
+@pytest.mark.parametrize('name,args',[
+    ('read_material_batch',{}),
+    ('checkpoint_context_batch',{'items':[],'summary':'Scoped summary'}),
+    ('read_context_batch',{'requests':[{'collection':'records'}]}),
+])
+def test_batch_tools_route_through_current_matter_and_reject_other_operation(tmp_path,name,args):
+    business=Business()
+    async def scenario():
+        async with MCPClient(create_server(tmp_path,client=business)) as client:
+            result=await client.session.call_tool(name,{'operation_id':'owned-operation',**args},meta={'threadId':THREAD_A})
+            assert not result.is_error
+            forbidden=await client.session.call_tool(name,{'operation_id':'other-matter-operation',**args},meta={'threadId':THREAD_A})
+            assert forbidden.is_error and 'discussion_context_mismatch' in error_text(forbidden)
+    run(scenario)
+    assert not any(call[0] in {'query','command'} for call in business.calls)
+    assert any(call[1]=='context' and call[2]['name']==name for call in business.calls)

@@ -114,7 +114,7 @@ def test_primary_objects_are_independent_with_distinct_fields_and_optional_class
         assert 'due_date' not in saved['data']
         assert core.query('list',type='domain')['total']==0
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_course_and_activity_do_not_inherit_an_illegal_project_context(app,tmp_path):
@@ -132,7 +132,7 @@ def test_course_and_activity_do_not_inherit_an_illegal_project_context(app,tmp_p
             assert dialog.result()==QDialog.DialogCode.Accepted,dialog.error_label.text()
             assert core.query('list',type=kind)['items'][0]['parent_id'] is None
         finally:
-            dialog.close()
+            dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_context_subproject_keeps_parent_and_own_project_goal_fields(app,tmp_path):
@@ -143,7 +143,8 @@ def test_context_subproject_keeps_parent_and_own_project_goal_fields(app,tmp_pat
         assert dialog.heading.text()=='新建子项目'
         assert dialog.parent_mode=='context'
         assert dialog.parent_id==parent['id']
-        assert dialog.parent_button.text()=='Parent project'
+        assert dialog.parent_button.text()=='当前所属位置'
+        assert '项目 · Parent project' in dialog.parent_path.text()
         assert not dialog.parent_button.isEnabled()
         dialog.clear_parent()
         assert dialog.parent_id==parent['id']
@@ -155,7 +156,7 @@ def test_context_subproject_keeps_parent_and_own_project_goal_fields(app,tmp_pat
         saved=core.query('get',id=parent['id'])['children'][0]
         assert saved['parent_id']==parent['id'] and saved['data']['purpose']=='Deliver this subproject outcome'
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_task_keeps_explicit_assignment_and_full_completion_gate(app,tmp_path):
@@ -164,7 +165,7 @@ def test_task_keeps_explicit_assignment_and_full_completion_gate(app,tmp_path):
     dialog,bridge=form(core,'task',parent_entity=course)
     try:
         assert dialog.parent_mode=='assignment'
-        assert dialog.parent_label.text()=='任务归属'
+        assert dialog.parent_label.text()=='所属位置'
         assert dialog.parent_id==course['id']
         assert dialog.primary_field_names==['completion_gate','estimated_minutes','due_date']
         assert 'course' in dialog.parent_picker_types
@@ -177,7 +178,7 @@ def test_task_keeps_explicit_assignment_and_full_completion_gate(app,tmp_path):
         assert saved['data']['completion_gate']=='Solve and verify all three questions'
         assert 'estimated_minutes' not in saved['data']
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_classification_picker_only_offers_domain_and_can_clear_without_changing_type(app,tmp_path,monkeypatch):
@@ -186,7 +187,7 @@ def test_classification_picker_only_offers_domain_and_can_clear_without_changing
     seen=[]
     class Picker:
         selected=category
-        def __init__(self,bridge,parent=None,allowed_types=None):
+        def __init__(self,bridge,parent=None,allowed_types=None,exclude=None):
             seen.append(allowed_types)
             self.heading=QLabel()
         def setWindowTitle(self,title): pass
@@ -198,7 +199,8 @@ def test_classification_picker_only_offers_domain_and_can_clear_without_changing
         dialog.choose_parent()
         assert seen==[['domain']]
         assert dialog.parent_id==category['id']
-        assert dialog.parent_button.text()=='学习'
+        assert dialog.parent_button.text()=='更改分类…'
+        assert '分类 · 学习' in dialog.parent_path.text()
         dialog.classification_enabled.setChecked(False)
         assert dialog.parent_id is None
         dialog.title_edit.setText('Still a course')
@@ -208,7 +210,7 @@ def test_classification_picker_only_offers_domain_and_can_clear_without_changing
         assert core.query('get',id=category['id'])['entity']['type']=='domain'
         assert label_type('domain')=='分类'
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_selected_classification_must_be_resolved_or_explicitly_omitted(app,tmp_path):
@@ -221,7 +223,7 @@ def test_selected_classification_must_be_resolved_or_explicitly_omitted(app,tmp_
         assert bridge.commands==[]
         assert '请选择一个分类' in dialog.error_label.text()
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_edit_preserves_existing_parent_extensions_nulls_and_status(app,tmp_path):
@@ -244,7 +246,7 @@ def test_edit_preserves_existing_parent_extensions_nulls_and_status(app,tmp_path
         assert actual['parent_id']==parent['id'] and actual['status']=='blocked'
         assert actual['data']==entity['data']
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 
@@ -273,7 +275,7 @@ def test_course_semester_fields_are_optional_then_save_only_explicit_anchors(app
         assert entity['data']['semester_start']=='2030-01-07'
         assert 'semester_end' not in entity['data']
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def days():
@@ -337,6 +339,150 @@ def test_rows_columns_switch_preserves_day_data_and_navigation(app):
         assert chart.layout_style=='columns'
     finally:
         chart.close()
+
+
+@pytest.mark.parametrize('kind', ['bar', 'ring', 'column'])
+def test_progress_reveal_paints_empty_middle_and_final_without_changing_evidence(app, monkeypatch, kind):
+    from management.gui_theme import color
+    from test_theme_accents import painted_pixel, assert_gradient_pixel
+    monkeypatch.setattr('management.gui_progress.reduce_motion', lambda: False)
+    summary = {'total': 4, 'done': 2, 'incomplete': 1, 'unreported': 1}
+    if kind == 'column':
+        widget = VerticalCoverageBar({'date': '2030-01-07', 'has_plan': True, 'summary': summary})
+        widget.resize(100, 228)
+        rect = widget.plot_rect()
+        point = (rect.left() + 3, rect.bottom() - 8)
+    else:
+        widget = CoverageBar() if kind == 'bar' else CoverageRing()
+        widget.resize(240, 22) if kind == 'bar' else widget.resize(150, widget.height())
+        widget.set_summary(summary)
+        diameter = min(widget.width(), widget.height()) - 16
+        radius = (diameter - max(10, diameter * .15)) / 2
+        point = (30, widget.height() / 2) if kind == 'bar' else (widget.width() / 2 + radius, widget.height() / 2)
+    try:
+        assert not widget.reveal.started and widget.reveal.fraction == 0
+        evidence = (copy.deepcopy(widget.values), copy.deepcopy(widget.segments), widget.accessibleName())
+        widget.show()
+        app.processEvents()
+        assert widget.reveal.started
+        widget.reveal.animation.setCurrentTime(0)
+        empty = widget.grab().toImage()
+        assert painted_pixel(widget, *point) == color('chart_track')
+        widget.reveal.animation.setCurrentTime(200)
+        middle = widget.grab().toImage()
+        assert 0 < widget.reveal.fraction < 1
+        assert_gradient_pixel(painted_pixel(widget, *point), 'done')
+        widget.reveal.animation.setCurrentTime(650)
+        complete = widget.grab().toImage()
+        assert widget.reveal.fraction == 1
+        assert empty != middle and middle != complete
+        assert widget.total == 4
+        assert (widget.values, widget.segments, widget.accessibleName()) == evidence
+        if kind != 'column':
+            widget.set_summary(copy.deepcopy(summary))
+        widget.hide(); widget.show(); app.processEvents()
+        assert widget.reveal.fraction == 1, 'Showing or polling the same chart must not replay from empty'
+    finally:
+        widget.close(); widget.deleteLater(); app.processEvents()
+
+
+def test_progress_waits_for_visible_data_and_honors_reduced_motion(app, monkeypatch):
+    motion = {'reduce': False}
+    monkeypatch.setattr('management.gui_progress.reduce_motion', lambda: motion['reduce'])
+    widget = CoverageBar()
+    widget.resize(240, 22)
+    try:
+        widget.show(); app.processEvents()
+        assert not widget.reveal.started
+        widget.set_summary({})
+        assert not widget.reveal.started
+        widget.set_summary({'total': 4, 'done': 1, 'unreported': 3})
+        assert widget.reveal.started and widget.reveal.fraction == 0
+        widget.reveal.animation.setCurrentTime(200)
+        motion['reduce'] = True
+        widget.reveal.animation.setCurrentTime(210)
+        assert widget.reveal.fraction == 1
+        assert widget.total == 4 and widget.values['unreported'] == 3
+        other = CoverageRing()
+        other.set_summary({'total': 1, 'done': 1})
+        other.show(); app.processEvents()
+        assert other.reveal.fraction == 1
+        other.close(); other.deleteLater()
+    finally:
+        widget.close(); widget.deleteLater(); app.processEvents()
+
+
+def test_native_count_progress_keeps_final_value_and_rebuilt_page_does_not_replay(app, monkeypatch):
+    from management.gui_progress import AnimatedProgressBar
+    from management.gui_workspace import CountProgress
+    from test_theme_accents import painted_pixel, assert_gradient_pixel
+    monkeypatch.setattr('management.gui_progress.reduce_motion', lambda: False)
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    bar = AnimatedProgressBar(reveal_scope=page, reveal_key=('owner', 'synthetic-course'))
+    bar.setRange(0, 10); bar.setFixedSize(280, 12); bar.setTextVisible(False)
+    changes = []
+    bar.valueChanged.connect(changes.append)
+    bar.setValue(8)
+    layout.addWidget(bar)
+    count = CountProgress(reveal_scope=page, reveal_key=('workspace', 'synthetic-project'))
+    count.set_counts({'total_tasks': 10, 'done_tasks': 8, 'unknown_tasks': 2})
+    layout.addWidget(count)
+    try:
+        page.show(); app.processEvents()
+        assert bar.value() == count.bar.value() == 8
+        assert bar.maximum() == count.bar.maximum() == 10
+        wording = count.count.text(), count.explanation.text()
+        for elapsed in (0, 200, 650):
+            bar.reveal.animation.setCurrentTime(elapsed)
+            count.bar.reveal.animation.setCurrentTime(elapsed)
+            assert bar.value() == count.bar.value() == 8
+            assert (count.count.text(), count.explanation.text()) == wording
+        assert changes == [8], 'Paint frames must not emit business-value changes'
+        left, right = painted_pixel(bar, 10, 6), painted_pixel(bar, 210, 6)
+        assert_gradient_pixel(left, 'primary'); assert_gradient_pixel(right, 'primary')
+        assert left != right and bar.size().width() == 280 and bar.size().height() == 12
+        bar.hide()
+        replacement = AnimatedProgressBar(reveal_scope=page, reveal_key=('owner', 'synthetic-course'))
+        replacement.setRange(0, 10); replacement.setValue(8); layout.addWidget(replacement)
+        replacement.show(); app.processEvents()
+        assert replacement.reveal.fraction == 1
+        count.set_counts({'total_tasks': 10, 'done_tasks': 8, 'unknown_tasks': 2})
+        assert count.bar.reveal.fraction == 1
+    finally:
+        page.close(); page.deleteLater(); app.processEvents()
+
+
+@pytest.mark.parametrize('style', ['columns', 'rows', 'tiles'])
+def test_weekly_refresh_preserves_reveal_and_only_new_day_plays(app, monkeypatch, style):
+    monkeypatch.setattr('management.gui_progress.reduce_motion', lambda: False)
+    chart = WeekDaysChart()
+    chart.set_style(style); chart.set_days(days()); chart.resize(850, 900)
+    try:
+        chart.show(); app.processEvents()
+        original_bars = list(chart.bars)
+        wait(app, lambda: all(bar.reveal.started for bar in original_bars if bar.total))
+        for bar in original_bars:
+            if bar.total:
+                bar.reveal.animation.setCurrentTime(650)
+        chart.set_days(copy.deepcopy(days()))
+        assert chart.bars == original_bars
+        changed = days()
+        changed[0]['summary'] = {'total': 2, 'done': 2}
+        changed[-1]['date'] = '2030-01-14'
+        chart.set_days(changed); app.processEvents()
+        assert chart.bars[0].reveal.fraction == 1
+        assert chart.bars[0].values['done'] == 2
+        # Replacement children in an already visible layout receive Show on
+        # the next event pass; their reveal begins after that layout settles.
+        # Wait for the actual start, rather than assuming one processEvents()
+        # drains timers that were queued by the same pass's Show events.
+        wait(app, lambda: chart.bars[-1].reveal.started)
+        assert chart.bars[-1].reveal.started and chart.bars[-1].reveal.fraction < 1
+        chart.hide(); chart.show(); app.processEvents()
+        assert chart.bars[-1].reveal.fraction == 1
+    finally:
+        chart.close(); chart.deleteLater(); app.processEvents()
 
 
 def test_ring_keeps_denominator_unknown_and_attendance_separate(app):
@@ -538,7 +684,7 @@ def test_dashboard_details_have_local_actions_and_reflow_without_business_change
         assert page.owner_open.isVisible() and page.owner_open.height()>=page.owner_open.sizeHint().height()
         for bar in page.owner_section.findChildren(QProgressBar):
             assert bar.isVisible() and bar.geometry().bottom()<page.owner_section.height()
-            assert bar.height()==6
+            assert bar.height()==12
         assert page.owner_rows.count()==1
         next(button for button in page.alert_box.findChildren(QPushButton) if button.text().startswith('查看事项')).click()
         assert opened==['task-sample']
@@ -595,7 +741,7 @@ def test_type_specific_form_fits_narrow_width_without_horizontal_scroll(app,tmp_
         assert dialog.title_edit.geometry().right()<=dialog.title_edit.parentWidget().width()
         assert dialog.parent_area.geometry().right()<=dialog.parent_area.parentWidget().width()
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def save_previews(directory):
@@ -639,7 +785,7 @@ def save_previews(directory):
                 assert calendar.grab().save(str(out/'calendar.png'))
                 measurements['calendar']={'logical_size':[calendar.width(),calendar.height()],'dpr':calendar.devicePixelRatioF()}
                 QTest.keyClick(calendar,Qt.Key.Key_Escape)
-            dialog.close()
+            dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
         chart=WeekDaysChart()
         chart.resize(540,410)
         chart.set_days(days())

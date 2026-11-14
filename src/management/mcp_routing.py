@@ -63,7 +63,7 @@ class DiscussionRouting:
             # Put the trusted identity last so caller parameters cannot replace it.
             return self.client._request('native-discussion', action,
                                         {**params, 'provider_thread_id': thread_id, 'provider_turn_id': turn_id},
-                                        timeout=100 if params.get('name') in {'next_context_step', 'read_material'} else 35)
+                                        timeout=100 if params.get('name') in {'next_context_step', 'read_material', 'read_material_batch'} else 35)
         except Exception as exc:
             if hasattr(exc, 'code'):
                 raise ToolError(json.dumps({'code': exc.code, 'message': str(exc),

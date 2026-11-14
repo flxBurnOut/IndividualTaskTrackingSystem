@@ -29,12 +29,19 @@ def discussion_result_target(dialog):
                          *dialog.empty_history.findChildren(QLabel), dialog.status)
 
 
+def editor_information_target(dialog):
+    properties = getattr(dialog, 'task_properties', None)
+    buttons = properties.findChildren(QPushButton) if properties is not None and isValid(properties) else []
+    return first_visible(*buttons, *(getattr(field, 'enabled', None) for field in dialog.fields.values()),
+                         *(getattr(field, 'editor', None) for field in dialog.fields.values()), dialog.more_fields)
+
+
 def install_main_tutorials(window):
     manager = window.onboarding
     ready = window.onboarding_ready
     page = window.dashboard_page
     manager.watch('dashboard', page, lambda: [
-        TourStep(page.date, '欢迎使用个人事务管理 Beta 测试版', '总览汇总今天、本周安排和当前需要留意的事项。接下来用几步认识常用入口；也可以随时跳过。'),
+        TourStep(page.date, '欢迎使用个人事务管理', '总览汇总今天、本周安排和当前需要留意的事项。接下来用几步认识常用入口；也可以随时跳过。'),
         TourStep(window.nav_buttons['tasks'], '从这里切换面板', '“任务”快速记录与整理待办；“今天”按日期安排与执行；“项目与课程”整理任务和资料；“复盘”记录实际结果。'),
         TourStep(window.new_button, '先记录需要做的事', '从“＋ 新建”创建任务、项目、课程、活动、分类或目标。任务可以归属到项目或课程，方便后续安排。'),
         TourStep(window.search_input, '直接输入名称查找', '在这里输入任务、项目或课程名称并按 Enter。Ctrl+K 可快速聚焦；搜索结果支持翻页，选中后点击打开或按 Enter。'),
@@ -47,15 +54,15 @@ def install_main_tutorials(window):
     today = window.today_page
     manager.watch('today', today, lambda: [
         TourStep(today.date, '先确认要安排的日期', '切换日期后，这里会显示那一天的计划与固定安排。可以补记过去，也可以提前安排。'),
-        TourStep(today.manual_button, '自己安排一天', '从任务池选择任务，调整先后顺序和时间。时间不确定时可以只排先后；完成标准沿用源任务。'),
+        TourStep(lambda: first_visible(getattr(today, 'quick_input', None), today.manual_button), '先添加一件事', '直接输入任务，或从已有任务中选择。需要调整整天顺序和时间时再打开详细安排。'),
         TourStep(lambda: first_visible(*today.plan_box.findChildren(QPushButton, 'ReviewChoice'), today.manual_button), '在当天安排中记录实际结果', '有当天安排后，点击完成或其他反馈会立即保存，并同步到复盘；请按实际情况选择。还没有计划时，可以先“安排这一天”。'),
         TourStep(today.habits_button, '固定框架与日常习惯', '“日常习惯”设置提醒、准备待办和安排偏好；“每周课表”查看固定时段。固定课表和每日计划分别维护。'),
     ], host=window, ready=ready)
     tasks = window.tasks_page
     manager.watch('tasks', tasks, lambda: [
-        TourStep(tasks.quick_input, '先记下来', '只填标题就能保存，按 Enter 可连续录入。日期、归属和完成标准可以以后补充。'),
-        TourStep(tasks.group_picker, '从全部任务里查找', '按待办、未填日期、到期、未来截止或归属查找，搜索覆盖所有分页。未填日期的任务也可能已加入某天计划，列表会分别显示。'),
-        TourStep(tasks.open_button, '补充信息与安排', '先选中列表中的任务，再打开详情；也可使用旁边的编辑、拆分和加入今天。上方“批量录入”可粘贴多项任务，先预览再一次保存。'),
+        TourStep(lambda: first_visible(tasks.quick_input, tasks.search_input), '先记下来，再按需查找', '记录页只填标题就能保存。进入任务库后，输入名称可以在当前查看范围内查找任务。'),
+        TourStep(lambda: first_visible(tasks.library_button, tasks.group_picker), '需要整理时打开任务库', '任务库是二级页面；显示范围决定看哪些任务，排列顺序决定先看哪项。返回记录页不会丢掉查看条件。'),
+        TourStep(lambda: first_visible(tasks.batch_button, tasks.open_button), '一次记多项或拆分大任务', '一次添加多个任务只建立任务记录，保存后再选择是否安排到某天。拆分会创建可单独处理的子任务，两种窗口都有独立使用说明。'),
     ], host=window, ready=ready)
     workspace = window.workspace_page
     manager.watch('projects', workspace, lambda: [
@@ -146,7 +153,7 @@ def _dialog_steps(dialog, kind):
     if kind == 'editor':
         return lambda: [
             TourStep(dialog.title_edit, '给事项一个明确的名称', '任务最好写成可以执行和检查的具体动作。项目、课程等则用便于查找的名称。'),
-            TourStep(lambda: first_visible(*(getattr(field, 'enabled', None) for field in dialog.fields.values()), *(getattr(field, 'editor', None) for field in dialog.fields.values()), dialog.more_fields), '补充当前已知的信息', '勾选字段旁的小方框后填写日期、说明或完成标准；没有勾选框的字段可直接填写。其他字段可在“更多信息”中查看，没有依据的信息可以暂时留空。'),
+            TourStep(lambda: editor_information_target(dialog), '按需补充信息', '任务的日期、用时可点击展开填写，留空表示未知。完成标准直接填写；其他字段在“更多信息”中查看。' if dialog.type_box.currentData() == 'task' else '勾选字段旁的小方框后填写已知信息，其他字段可直接填写。更多信息可以按需展开。'),
             TourStep(dialog.buttons.button(QDialogButtonBox.StandardButton.Save), '确认内容后保存', '点击保存才会写入记录。教程不会填写字段、提交表单或修改你的草稿。'),
         ]
     return None

@@ -54,8 +54,8 @@ def remember_installed_data_dir(data_dir, executable):
 def resume_after_update(data_dir):
     """An explicit GUI launch resumes a stopped space, never a background MCP."""
     from .runtime import OwnerLock, read_startup_failure, start_service
-    from .data_space import require_beta_dir
-    root = require_beta_dir(data_dir)
+    from .data_space import require_channel_dir
+    root = require_channel_dir(data_dir)
     marker = root / 'update_pending.json'
     if not marker.exists():
         return

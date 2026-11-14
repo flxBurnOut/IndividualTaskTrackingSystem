@@ -44,7 +44,7 @@ def test_unknown_direct_style_requests_do_not_change_the_interface(invalid):
 def test_data_space_validation_is_retained():
     for requested in (None, 'classic'):
         with pytest.raises(BetaIsolationError):
-            profile.configure_visual_profile(workspace_root() / 'not-a-beta-space', requested)
+            profile.configure_visual_profile(workspace_root() / '.beta-data' / 'default', requested)
 
 
 def test_gui_entrypoint_opens_new_style_without_touching_retired_preferences(tmp_path, monkeypatch):

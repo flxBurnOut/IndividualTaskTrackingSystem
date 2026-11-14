@@ -60,3 +60,32 @@ def test_completed_recovery_is_filtered_before_paging_without_changing_progress(
     cmd(core,'update',{'id':completed[0]['id'],'version':completed[0]['version'],'patch':{'status':'active'}})
     reopened=core.query('recovery_summary',course_id=course['id'],open_only=True)
     assert reopened['total']==2 and reopened['completed_hidden']==11
+
+
+def test_task_library_sort_is_applied_before_pagination_and_ids_filter(tmp_path):
+    from management.schemas import BusinessError
+    core=Core(tmp_path)
+    owner_z=cmd(core,'create',{'type':'project','title':'Zulu'})['entity']
+    owner_a=cmd(core,'create',{'type':'project','title':'Alpha'})['entity']
+    records=[]
+    for i in range(35):
+        records.append(task(core, f'Sorted task {i:02}', parent_id=owner_z['id'] if i % 2 else owner_a['id'],
+                            data={} if i == 0 else {'due_date':f'2030-02-{(i % 28)+1:02}'}))
+    before=core.query('state')
+    for order in ('recent','due','owner'):
+        all_items=core.query('task_pool',sort=order,limit=100)['items']; seen=[]; offset=0
+        while offset is not None:
+            page=core.query('task_pool',sort=order,limit=4,offset=offset)
+            seen.extend(e['id'] for e in page['items']);offset=page['next_offset']
+        assert seen==[e['id'] for e in all_items] and len(set(seen))==35
+        if order=='recent': assert all_items[0]['id']==records[-1]['id']
+        if order=='due':
+            dates=[e['data'].get('due_date') or '9999-12-31' for e in all_items]
+            assert dates==sorted(dates) and all_items[-1]['id']==records[0]['id']
+        if order=='owner': assert [e['owner_label'] for e in all_items]==sorted(e['owner_label'] for e in all_items)
+    subset=core.query('task_pool',task_ids=[records[0]['id'],records[-1]['id']],sort='recent')
+    assert subset['total']==2 and [e['id'] for e in subset['items']]==[records[-1]['id'],records[0]['id']]
+    assert core.query('task_pool',task_ids=[])['total']==0
+    with pytest.raises(BusinessError):core.query('task_pool',sort='invalid')
+    with pytest.raises(BusinessError):core.query('task_pool',task_ids='not a list')
+    assert core.query('state')==before

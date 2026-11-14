@@ -2,10 +2,13 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 from pathlib import Path
 import os
+import sys
 root = Path(SPECPATH).parent
+sys.path.insert(0, str(root / 'packaging'))
+from runtime_resources import runtime_data_files
 hidden = ['websockets.sync.client','websockets.sync.server','pythoncom','pywintypes','win32com.client','win32timezone','win32com.shell.shell','win32com.propsys.propsys','win32com.propsys.pscon','mcp.server','mcp.server.mcpserver','reportlab.pdfbase.ttfonts','pypdf','docx','openpyxl']
 hidden += collect_submodules('management')
-a = Analysis([str(root / 'packaging' / 'entry.py')], pathex=[str(root / 'src')], binaries=[], datas=collect_data_files('tzdata') + collect_data_files('management', includes=['builtin_skills/**/*.md','assets/*.ico','assets/*.png','assets/*.svg']), hiddenimports=hidden, hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=['PySide6.QtWebEngineCore','PySide6.QtWebEngineWidgets','PySide6.QtQml','PySide6.QtQuick','PySide6.QtMultimedia','pytest','tkinter'], noarchive=False)
+a = Analysis([str(root / 'packaging' / 'entry.py')], pathex=[str(root / 'src')], binaries=[], datas=runtime_data_files() + collect_data_files('tzdata') + collect_data_files('management', includes=['builtin_skills/**/*.md','assets/*.ico','assets/*.png','assets/*.svg']), hiddenimports=hidden, hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=['PySide6.QtWebEngineCore','PySide6.QtWebEngineWidgets','PySide6.QtQml','PySide6.QtQuick','PySide6.QtMultimedia','pytest','tkinter'], noarchive=False)
 # Qt 6.11 uses Windows system ICU with unversioned exports (e.g. ucnv_open).
 # A third-party ICU found on the tool environment PATH exports *_78 instead;
 # packaging it shadows System32 ICU and causes QtWidgets loader error 127.

@@ -10,7 +10,7 @@ import uuid
 
 from .runtime import DataSpaceMismatch, UpdatePending, default_data_dir, discovery, read_startup_failure, require_data_dir, start_service
 from .runtime_contract import client_headers, matches_contract, mismatch_details, service_mismatch_message
-from .data_space import BetaIsolationError, require_beta_dir
+from .data_space import BetaIsolationError, require_channel_dir
 
 
 class ClientError(Exception):
@@ -25,9 +25,9 @@ class Client:
             raise ValueError('Unknown client entrance')
         self.entrance = entrance
         try:
-            self.data_dir = require_beta_dir(data_dir if data_dir is not None else default_data_dir())
+            self.data_dir = require_channel_dir(data_dir if data_dir is not None else default_data_dir())
         except BetaIsolationError as error:
-            raise ClientError('beta_data_isolation', str(error)) from error
+            raise ClientError('data_channel_isolation', str(error)) from error
         self.autostart = autostart
         self.epoch, self.revision = None, None
         self.runtime = None
@@ -93,7 +93,7 @@ class Client:
 
     def _require_data_dir(self, value):
         try:
-            require_beta_dir(self.data_dir)
+            require_channel_dir(self.data_dir)
             require_data_dir(value, self.data_dir)
         except (DataSpaceMismatch, BetaIsolationError) as error:
             self.runtime = None
@@ -149,11 +149,11 @@ class Client:
 
     def query(self, name, **params):
         try:
-            return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
+            return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material','read_material_batch'} else 35))
         except ClientError as error:
             if error.code in {'connection_lost', 'unauthorized', 'service_unavailable'}:
                 self._connect()
-                return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material'} else 35))
+                return self._remember(self._request('query', name, params, timeout=300 if name=='library_folder' else 100 if name in {'next_context_step','read_material','read_material_batch'} else 35))
             raise
 
     def state(self):

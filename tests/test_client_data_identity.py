@@ -248,7 +248,69 @@ def test_mcp_error_preserves_readable_identity_failure_and_sends_no_business_wri
     assert a.query('list')['total'] == b.query('list')['total'] == 0
 
 
-def test_beta_default_ignores_formal_environment_and_installation(tmp_path, monkeypatch):
+@pytest.fixture
+def beta_channel(monkeypatch):
+    from management import data_space
+    monkeypatch.setattr(data_space, 'CHANNEL', 'beta')
+
+
+@pytest.mark.parametrize('selection', ['environment', 'installed', 'default'])
+def test_stable_default_preserves_original_data_selection(tmp_path, monkeypatch, selection):
+    from management import data_space, installation_state, runtime
+    monkeypatch.setattr(data_space, 'CHANNEL', 'stable')
+    monkeypatch.delenv('PERSONAL_MANAGEMENT_DATA', raising=False)
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'local'))
+    selected = tmp_path / 'original-data'
+    monkeypatch.setattr(installation_state, 'installed_data_dir', lambda: selected if selection == 'installed' else None)
+    if selection == 'environment':
+        monkeypatch.setenv('PERSONAL_MANAGEMENT_DATA', str(selected))
+        monkeypatch.setattr(installation_state, 'installed_data_dir', lambda: pytest.fail('Ignored explicit data selection'))
+    expected = selected if selection != 'default' else tmp_path / 'local' / 'PersonalManagement' / 'data'
+    assert runtime.default_data_dir() == expected
+    assert not expected.exists()
+
+
+@pytest.mark.parametrize('entrance', ['client', 'store', 'service', 'bootstrap', 'resume', 'resources', 'tray'])
+@pytest.mark.parametrize('identity', ['beta_path', 'beta_runtime'])
+def test_stable_rejects_beta_before_open_connect_or_write(tmp_path, monkeypatch, entrance, identity):
+    from management import data_space, runtime
+    from management.installation_state import resume_after_update
+    from management.resources import ResourceManager
+    from management.service import run_service
+    from management.storage import Store
+    from management.tray_runtime import gui_args
+    monkeypatch.setattr(data_space, 'CHANNEL', 'stable')
+    root = tmp_path / '.beta-data' / 'default' if identity == 'beta_path' else tmp_path / 'test-space'
+    root.mkdir(parents=True)
+    (root / 'database.sqlite3').write_bytes(b'Synthetic Beta data; must not be opened')
+    (root / 'runtime.json').write_text(json.dumps({'service_contract': {'channel': 'beta'}}), 'utf-8')
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+    monkeypatch.setattr(client_module, 'discovery', lambda *_: pytest.fail('Contacted Beta service'))
+    monkeypatch.setattr(runtime.subprocess, 'run', lambda *a, **k: pytest.fail('Started a process'))
+    operations = {'client': lambda: Client(root), 'store': lambda: Store(root),
+        'service': lambda: run_service(root), 'bootstrap': lambda: runtime.start_service(root),
+        'resume': lambda: resume_after_update(root), 'resources': lambda: ResourceManager(root),
+        'tray': lambda: gui_args(root)}
+    with pytest.raises((data_space.BetaIsolationError, ClientError), match='Beta'):
+        operations[entrance]()
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == before
+
+
+def test_stable_demo_request_fails_before_starting_or_creating_data(tmp_path, monkeypatch, capsys):
+    from management import data_space, __main__, runtime, demo_data
+    monkeypatch.setattr(data_space, 'CHANNEL', 'stable')
+    root = tmp_path / 'untouched-formal-data'
+    monkeypatch.setattr('sys.argv', ['management', '--data-dir', str(root), '--seed-demo'])
+    monkeypatch.setattr(runtime, 'start_service', lambda *_: pytest.fail('Started a service'))
+    with pytest.raises(SystemExit) as error:
+        __main__.main()
+    assert error.value.code == 2 and '正式版不会创建演示记录' in capsys.readouterr().err
+    with pytest.raises(demo_data.DemoError, match='正式版'):
+        demo_data.seed_demo(None, root)
+    assert not root.exists()
+
+
+def test_beta_default_ignores_formal_environment_and_installation(tmp_path, monkeypatch, beta_channel):
     from management import data_space, installation_state, runtime
     workspace = tmp_path / 'Beta'
     monkeypatch.setattr(data_space, 'workspace_root', lambda: workspace)
@@ -259,7 +321,7 @@ def test_beta_default_ignores_formal_environment_and_installation(tmp_path, monk
 
 
 @pytest.mark.parametrize('entrance', ['client', 'store', 'service', 'bootstrap', 'resume', 'resources', 'restore', 'tray'])
-def test_beta_rejects_formal_directory_before_open_connect_or_write(tmp_path, monkeypatch, entrance):
+def test_beta_rejects_formal_directory_before_open_connect_or_write(tmp_path, monkeypatch, entrance, beta_channel):
     from management import data_space, runtime
     from management.installation_state import resume_after_update
     from management.resources import ResourceManager
@@ -288,7 +350,7 @@ def test_beta_rejects_formal_directory_before_open_connect_or_write(tmp_path, mo
     assert {p.name: p.read_bytes() for p in formal.iterdir()} == before
 
 
-def test_beta_cli_rejects_formal_directory_without_starting_it(tmp_path, monkeypatch, capsys):
+def test_beta_cli_rejects_formal_directory_without_starting_it(tmp_path, monkeypatch, capsys, beta_channel):
     from management import data_space, __main__
     formal = tmp_path / 'formal-not-created'
     monkeypatch.setattr(data_space, 'workspace_root', lambda: tmp_path / 'Beta')
@@ -299,7 +361,7 @@ def test_beta_cli_rejects_formal_directory_without_starting_it(tmp_path, monkeyp
     assert not formal.exists()
 
 
-def test_beta_rejects_linked_database_before_sqlite_open(tmp_path, monkeypatch):
+def test_beta_rejects_linked_database_before_sqlite_open(tmp_path, monkeypatch, beta_channel):
     from management import data_space
     from management.storage import Store
     workspace = tmp_path / 'Beta'
@@ -314,7 +376,7 @@ def test_beta_rejects_linked_database_before_sqlite_open(tmp_path, monkeypatch):
     assert formal.read_bytes() == b'Synthetic formal database'
 
 
-def test_beta_rejects_directory_junction(tmp_path, monkeypatch):
+def test_beta_rejects_directory_junction(tmp_path, monkeypatch, beta_channel):
     from management import data_space
     import subprocess
     if os.name != 'nt':
@@ -335,7 +397,7 @@ def test_beta_rejects_directory_junction(tmp_path, monkeypatch):
         junction.rmdir()
 
 
-def test_beta_test_directory_requires_owned_check_marker(tmp_path, monkeypatch):
+def test_beta_test_directory_requires_owned_check_marker(tmp_path, monkeypatch, beta_channel):
     from management import data_space
     workspace = tmp_path / 'Beta'
     work = workspace / '.build' / 'checks' / 'focused' / 'work'
@@ -351,13 +413,13 @@ def test_beta_test_directory_requires_owned_check_marker(tmp_path, monkeypatch):
     assert data_space.require_beta_dir(work / 'fixture') == work / 'fixture'
 
 
-def test_beta_does_not_change_formal_installation_selection(monkeypatch):
+def test_beta_does_not_change_formal_installation_selection(monkeypatch, beta_channel):
     from management import installation_state
     monkeypatch.setattr(installation_state, 'installed_data_dir', lambda *_: pytest.fail('Touched formal registry'))
     installation_state.remember_installed_data_dir('unused', 'unused')
 
 
-def test_beta_directory_check_tolerates_removed_sqlite_wal(tmp_path, monkeypatch):
+def test_beta_directory_check_tolerates_removed_sqlite_wal(tmp_path, monkeypatch, beta_channel):
     from management import data_space
     workspace = tmp_path / 'Beta'
     own = workspace / '.beta-data' / 'default'
@@ -377,7 +439,7 @@ def test_beta_directory_check_tolerates_removed_sqlite_wal(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('failure', [PermissionError, OSError])
-def test_beta_directory_check_still_rejects_unreadable_entries(tmp_path, monkeypatch, failure):
+def test_beta_directory_check_still_rejects_unreadable_entries(tmp_path, monkeypatch, failure, beta_channel):
     from management import data_space
     workspace = tmp_path / 'Beta'
     own = workspace / '.beta-data' / 'default'
@@ -394,7 +456,7 @@ def test_beta_directory_check_still_rejects_unreadable_entries(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize('kind', ['symlink', 'reparse', 'hardlink'])
-def test_beta_entry_snapshot_rejects_redirected_or_shared_files(tmp_path, monkeypatch, kind):
+def test_beta_entry_snapshot_rejects_redirected_or_shared_files(tmp_path, monkeypatch, kind, beta_channel):
     import stat
     from types import SimpleNamespace
     from management import data_space

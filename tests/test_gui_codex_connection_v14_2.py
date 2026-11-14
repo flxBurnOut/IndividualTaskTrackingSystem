@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication, QWidget
 from management.gui_codex_connection import CodexConnectionController
 from management.gui_assistant import AssistanceDialog
 from management.gui_workflows import SettingsDialog
+from test_appearance_v5 import dispose_settings
 from test_ux_workflows_v2 import ControlledBridge
 
 
@@ -197,4 +198,4 @@ def test_settings_save_and_explicit_connect_are_separate(app, tmp_path):
         assert [item['name'] for item in bridge.commands] == ['configure_codex', 'connect_codex']
         bridge.commands[-1]['callback']({'result': {'ready': True, 'state': 'ready'}})
         assert '已连接' in dialog.codex_bridge_note.text()
-    finally:dialog.close();dialog.deleteLater();app.processEvents()
+    finally:dispose_settings(app,dialog)

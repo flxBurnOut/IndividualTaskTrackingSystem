@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     from management.data_space import require_packaged_channel
     require_packaged_channel()
+    from runtime_resources import ssl_policy_file
+    ssl_policy_file()  # Fail before creating a release if runtime policy is missing.
     from build_installer import source_version
     version=source_version()
     parser=argparse.ArgumentParser()

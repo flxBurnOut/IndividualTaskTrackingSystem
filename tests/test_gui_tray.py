@@ -70,9 +70,9 @@ def online(jobs=None):
 
 def test_status_shows_real_running_queued_and_pending_review_counts(tray):
     item, bridge = tray
-    assert 'Beta 测试版' in item.open_action.text()
-    assert 'Beta' in item.exit_action.text() and 'Beta' in item.version.text()
-    assert 'Beta 测试版' in item.icon.tooltip
+    assert item.open_action.text() == '打开个人事务管理'
+    assert item.exit_action.text() == '退出软件与后台' and '软件版本：' in item.version.text()
+    assert '个人事务管理' in item.icon.tooltip and 'Beta' not in item.icon.tooltip
     assert bridge.reads[0][0] == 'runtime_status'
     bridge.reads[-1][1](online({'running': 2, 'queued': 3, 'awaiting_review': 4}))
     assert '2 项执行中，3 项排队' in item.status.text()
@@ -175,6 +175,33 @@ def test_gui_exit_preserves_unsaved_edit_and_uncertain_write(app):
     finally:
         editor.close()
         window.close()
+
+
+@pytest.mark.parametrize('page_name', ['tasks_page', 'today_page'])
+@pytest.mark.parametrize('state_name', ['draft', 'unresolved'])
+def test_tray_exit_checks_main_page_work_before_stopping_backend(app, page_name, state_name):
+    from PySide6.QtWidgets import QLabel, QLineEdit
+    window = QWidget()
+    window.review_pending = False
+    window.bridge = Bridge()
+    errors, paused = [], []
+    window.show_error = errors.append
+    window.notice = QLabel(window)
+    window.poll = SimpleNamespace(stop=lambda: paused.append('poll'))
+    window.codex_connection = SimpleNamespace(timer=SimpleNamespace(stop=lambda: paused.append('connection')))
+    field = QLineEdit('Synthetic unsaved task' if state_name == 'draft' else '', window)
+    unresolved = [state_name == 'unresolved']
+    setattr(window, page_name, SimpleNamespace(quick_input=field, pending_writes=lambda: unresolved[0]))
+    try:
+        request_exit(window)
+        assert not window.bridge.stops and not paused
+        assert not getattr(window, '_exit_pending', False) and errors
+        assert field.text() == ('Synthetic unsaved task' if state_name == 'draft' else '')
+        field.clear(); unresolved[0] = False
+        request_exit(window)
+        assert len(window.bridge.stops) == 1
+    finally:
+        window.close(); window.deleteLater(); app.processEvents()
 
 
 @pytest.mark.parametrize('command', ['show', 'update', 'exit'])

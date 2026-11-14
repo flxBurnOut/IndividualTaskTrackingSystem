@@ -75,6 +75,9 @@ def resume(space, *, bind=True):
 
 @pytest.mark.parametrize('name,params', [
     ('checkpoint_context', {'summary': 'Late old result', 'yield': True}),
+    ('checkpoint_context_batch', {'items': [], 'summary': 'Stale batch', 'yield': True}),
+    ('read_material_batch', {}),
+    ('read_context_batch', {'requests': [{'collection': 'records'}]}),
     ('refresh_context', {'include_new_sources': False}),
     ('validate_candidate', {'proposal': PROPOSAL}),
 ])
@@ -102,6 +105,9 @@ def test_new_generation_without_a_new_turn_does_not_reclaim_old_turn(space):
 
 @pytest.mark.parametrize('name,params', [
     ('checkpoint_context', {'summary': 'Raced write', 'yield': True}),
+    ('checkpoint_context_batch', {'items': [], 'summary': 'Stale batch', 'yield': True}),
+    ('read_material_batch', {}),
+    ('read_context_batch', {'requests': [{'collection': 'records'}]}),
     ('refresh_context', {'include_new_sources': False}),
     ('validate_candidate', {'proposal': PROPOSAL}),
 ])

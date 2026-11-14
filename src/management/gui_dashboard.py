@@ -4,6 +4,7 @@ from PySide6.QtCore import QEvent,Signal,Qt,QTimer
 from PySide6.QtWidgets import QWidget,QVBoxLayout,QHBoxLayout,QBoxLayout,QFrame,QScrollArea,QLabel,QLayout,QProgressBar,QPushButton,QGridLayout,QSizePolicy
 from .gui_workspace import plain_label,make_button,clear_layout
 from .gui_charts import CoverageChart
+from .gui_progress import AnimatedProgressBar
 from .chart_preferences import normalize_chart_preferences
 from .gui_layout import ActionRow, ReadingLabel
 
@@ -205,8 +206,8 @@ class DashboardPage(QScrollArea):
             button.setAccessibleName('查看课程或项目：'+owner['label'])
             actions=ActionRow();actions.addWidget(summary);actions.addWidget(button)
             row.addWidget(actions)
-            bar=QProgressBar();bar.setRange(0,max(1,owner['total']));bar.setValue(owner['done']);bar.setTextVisible(False);bar.setMaximumHeight(9)
-            bar.setObjectName('OwnerProgress');bar.setFixedHeight(6);bar.setMaximumWidth(280);row.addWidget(bar)
+            bar=AnimatedProgressBar(reveal_scope=self,reveal_key=('owner',owner.get('id',owner.get('title'))));bar.setRange(0,max(1,owner['total']));bar.setValue(owner['done']);bar.setTextVisible(False)
+            bar.setObjectName('OwnerProgress');bar.setFixedHeight(12);bar.setMaximumWidth(280);row.addWidget(bar)
             self.owner_rows.addLayout(row)
 
     def reflow_week(self):

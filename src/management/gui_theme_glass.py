@@ -10,12 +10,11 @@ LIGHT = dict(
     window='#f3f4f6', surface='#ffffff', surface_alt='#f0f1f4', sidebar='#eceef2',
     text='#292a30', muted='#666a74', border='#d9dce2',
     primary='#b44845', primary_text='#ffffff', primary_hover='#9f3c3b',
-    selection='#f4e6e4', selection_text='#793a39',
-    warning_bg='#fff2f0', warning_text='#92524a', warning_border='#e6c3bd',
+    selection='#f6eae8', selection_text='#793a39',
     disabled_bg='#eceef1', disabled_text='#8b8e96', focus='#bd605d', scrollbar='#c6c9d1',
-    done='#607b71', incomplete='#986532', unreported='#d8dce3', other_reported='#7b6b96',
+    unreported='#d8dce3',
     chart_track='#eff0f3', chart_grid='#d4d7de', chart_label='#676b74',
-    chart_on_color='#ffffff', chart_on_unknown='#444852',
+    chart_on_unknown='#444852',
     chat_user='#f4e8e7', calendar_header='#f3f3f6', calendar_today='#f2ddda',
     danger='#ac383f', danger_bg='#fbecef', danger_border='#dba9b0',
     hover='#f6f6f8', pressed='#e8e9ee',
@@ -31,11 +30,10 @@ DARK = dict(
     text='#f0eff2', muted='#b2b0ba', border='#48484f',
     primary='#dd9998', primary_text='#301c20', primary_hover='#ebaeab',
     selection='#4a353c', selection_text='#f7dcde',
-    warning_bg='#3d3034', warning_text='#e0b0a7', warning_border='#775653',
     disabled_bg='#323337', disabled_text='#898890', focus='#e4b3b1', scrollbar='#626269',
-    done='#a8bdb4', incomplete='#d9b18b', unreported='#505158', other_reported='#bdb0d5',
+    unreported='#505158',
     chart_track='#36373d', chart_grid='#4e4e57', chart_label='#b9b6c1',
-    chart_on_color='#251f24', chart_on_unknown='#edeaf1',
+    chart_on_unknown='#edeaf1',
     chat_user='#44363e', calendar_header='#323237', calendar_today='#564049',
     danger='#f0a7ac', danger_bg='#472c35', danger_border='#75515c',
     hover='#3a3b41', pressed='#44454d',
@@ -47,11 +45,11 @@ DARK = dict(
 )
 
 
-# These are interaction colors, not task/result colors. A palette choice must
-# never change the meaning of success, warning, incomplete or destructive work.
+# Accent hues cover interaction, attention and review graphics. Result names,
+# counts and unknown coverage remain explicit; destructive actions stay distinct.
 _ACCENTS = {
     'light': {
-        'coral': ('#b44845', '#9f3c3b', '#ffffff', '#f4e6e4', '#793a39', '#bd605d', '#ead0cd', '#f4e8e7', '#f2ddda'),
+        'coral': ('#b44845', '#9f3c3b', '#ffffff', '#f6eae8', '#793a39', '#bd605d', '#ead0cd', '#f4e8e7', '#f2ddda'),
         'blue': ('#2d63a8', '#24538e', '#ffffff', '#e5edf8', '#274f80', '#447bbd', '#c8d9ef', '#e7eef8', '#d9e6f6'),
         'violet': ('#7850a4', '#65428e', '#ffffff', '#eee7f6', '#624081', '#8b66b3', '#dfcfee', '#eee8f5', '#e7dcef'),
         'rose': ('#a9436f', '#92395f', '#ffffff', '#f6e6ee', '#853556', '#bb5f88', '#ebcedc', '#f5e8ef', '#f0dce5'),
@@ -76,8 +74,29 @@ def accent_tokens(theme='light', accent='default'):
     return dict(zip(_ACCENT_ROLES, _ACCENTS[theme][accent]))
 
 
+def _content_tokens(tokens, theme):
+    """Keep result series in the chosen hue without losing readable labels."""
+    primary = tokens['primary']
+    target = 255 if theme == 'dark' else 0
+
+    def shade(amount):
+        return '#' + ''.join(f'{round(int(primary[i:i + 2], 16) * (1 - amount) + target * amount):02x}'
+                             for i in (1, 3, 5))
+
+    return dict(warning_text=primary, warning_bg=tokens['selection'],
+                warning_border=tokens['focus_soft'], done=primary,
+                incomplete=shade(.22), other_reported=shade(.44),
+                chart_absent=shade(.66), chart_on_color=tokens['primary_text'])
+
+
+# Compatibility exports must describe the current default theme, too.
+LIGHT.update(_content_tokens(LIGHT, 'light'))
+DARK.update(_content_tokens(DARK, 'dark'))
+
+
 def palette_tokens(theme='light', accent='default'):
-    return {**(DARK if theme == 'dark' else LIGHT), **accent_tokens(theme, accent)}
+    tokens = {**(DARK if theme == 'dark' else LIGHT), **accent_tokens(theme, accent)}
+    return {**tokens, **_content_tokens(tokens, theme)}
 
 
 def stylesheet(config):
@@ -206,20 +225,16 @@ QPushButton#FolderCard:hover, QPushButton#HabitsSummary:hover { background: %(ho
 QPushButton#HabitsSummary { background: %(surface_alt)s; color: %(text)s; border: 1px solid %(border)s; border-radius: 12px; padding: 10px 14px; text-align: left; }
 QPushButton#Danger, QPushButton#DeleteTask { color: %(danger)s; border-color: %(danger_border)s; }
 QPushButton#Danger:hover, QPushButton#DeleteTask:hover { background: %(danger_bg)s; }
-QPushButton#ReviewChoice[result="done"]:checked, QPushButton#ReviewChoice[result="attended"]:checked {
-    background: %(done)s; color: %(chart_on_color)s; border: 2px solid %(done)s; font-weight: 600;
+QPushButton#ReviewChoice:checked {
+    background: %(primary)s; color: %(primary_text)s; border: 2px solid %(primary)s; font-weight: 600;
 }
-QPushButton#ReviewChoice[result="incomplete"]:checked, QPushButton#ReviewChoice[result="missed_needs_catchup"]:checked {
-    background: %(incomplete)s; color: %(chart_on_color)s; border: 2px solid %(incomplete)s; font-weight: 600;
-}
-QPushButton#ReviewChoice[result="absent"]:checked { background: %(danger)s; color: %(chart_on_color)s; border: 2px solid %(danger)s; font-weight: 600; }
 QPushButton:focus, QToolButton:focus, QPushButton#Primary:focus, QPushButton#Prominent:focus,
 QPushButton#Nav:focus, QPushButton#QuietButton:focus, QPushButton#CompletedTasksToggle:focus,
 QPushButton#TextLink:focus, QPushButton#TaskMark:focus, QPushButton#FolderCard:focus,
 QPushButton#HabitsSummary:focus, QPushButton#Danger:focus, QPushButton#DeleteTask:focus,
 QPushButton#ReviewChoice:focus, QPushButton#ReviewChoice:checked:focus,
 QPushButton#TutorialNext:focus, QPushButton#TutorialQuiet:focus {
-    border: 2px solid %(focus)s;
+    border-color: %(focus)s;
 }
 QPushButton:disabled, QToolButton:disabled, QPushButton#Primary:disabled, QPushButton#Prominent:disabled,
 QPushButton#Nav:disabled, QPushButton#QuietButton:disabled, QPushButton#TextLink:disabled,
@@ -273,14 +288,14 @@ QHeaderView::section:checked { background: %(selection)s; color: %(selection_tex
 QTableCornerButton::section { background: %(surface_alt)s; border: 1px solid %(border)s; }
 QProgressBar { background: %(chart_track)s; color: %(text)s; border: 0; border-radius: 5px; text-align: center; }
 QProgressBar::chunk { background: %(primary)s; border-radius: 5px; }
-QProgressBar#OwnerProgress, QProgressBar#OwnerProgress::chunk { border-radius: 3px; }
+QProgressBar#OwnerProgress, QProgressBar#OwnerProgress::chunk { border-radius: 6px; }
 QTabWidget::pane { background: transparent; border: 0; }
 QTabBar::tab { background: %(surface_alt)s; color: %(muted)s; border: 1px solid transparent; border-radius: 8px; padding: 9px 17px; margin: 2px; }
 QTabBar::tab:hover { background: %(hover)s; color: %(text)s; }
 QTabBar::tab:selected { background: %(surface)s; color: %(selection_text)s; border-color: %(border)s; border-bottom: 2px solid %(primary)s; font-weight: 600; }
 QTabBar::tab:disabled { color: %(disabled_text)s; background: %(disabled_bg)s; }
 QTabBar:focus { border: 1px solid %(focus)s; border-radius: 9px; }
-QCheckBox, QRadioButton { spacing: 7px; }
+QCheckBox, QRadioButton { spacing: 7px; border: 1px solid transparent; border-radius: 5px; }
 QCheckBox:focus, QRadioButton:focus { border: 1px solid %(focus)s; border-radius: 5px; }
 QCheckBox:disabled, QRadioButton:disabled { color: %(disabled_text)s; }
 QCheckBox::indicator, QTreeView::indicator { width: %(indicator_size)dpx; height: %(indicator_size)dpx; background: %(surface)s; border: 1px solid %(scrollbar)s; border-radius: 4px; }

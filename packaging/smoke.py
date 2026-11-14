@@ -217,6 +217,182 @@ async def verify_frozen_mcp_plan_revision(client, params):
     return evidence
 
 
+async def verify_frozen_mcp_material_continuation(client, params):
+    """Read synthetic originals through the packaged MCP, with no quota resets."""
+    import base64
+    import hashlib
+    from reportlab.pdfgen import canvas
+    from management.context_service import MAX_PAGE_BYTES, size
+
+    root = checked_path(client.data_dir.parent, ROOT / '.build' / 'checks')
+    text = ('Synthetic complete reading 中文 "quoted" evidence.\n' * 3800) + 'FINAL_TEXT_MARKER'
+    text_path = root / 'synthetic-long-context.txt'
+    text_path.write_bytes(text.encode('utf-8'))
+    pdf_path = root / 'synthetic-four-page-context.pdf'
+    document = canvas.Canvas(str(pdf_path), pagesize=(600, 800))
+    for number in range(1, 5):
+        document.drawString(35, 770, f'SYNTHETIC PAGE {number}')
+        for row in range(29):
+            document.drawString(35, 740-row*20,
+                f'Row {row:02d}: Synthetic reading evidence with dates, criteria and required details.')
+        document.rect(30, 150, 530, 600)
+        if number == 4:
+            document.drawString(35, 100, 'FINAL_PAGE_RUBRIC: synthetic score 40 percent')
+        document.showPage()
+    document.save()
+    sources = [client.command('add_source', {'kind':'file', 'path':str(path)})['result']['entity']
+               for path in (text_path, pdf_path)]
+    before, jobs_before = client.state(), client.query('jobs')['total']
+    evidence = {'transport':'frozen_stdio_mcp', 'synthetic_only':True}
+
+    async def call(session, tool, args):
+        response = await session.call_tool(tool, args)
+        blocks = [block.text for block in response.content if block.type == 'text']
+        assert not response.is_error, f'{tool}: ' + '\n'.join(blocks)
+        value = response.structured_content or json.loads(blocks[0])
+        maximum = 64*1024 if tool in {'read_material_batch', 'read_context_batch'} else MAX_PAGE_BYTES
+        assert size(value) <= maximum or tool == 'prepare_context'
+        images = [block for block in response.content if block.type == 'image']
+        if tool == 'read_material_batch':
+            expected = [item['content'] for item in value['items'] if item['content']['kind'] == 'image']
+            assert len(images) == len(expected)
+            for picture, metadata in zip(images, expected):
+                raw = base64.b64decode(picture.data)
+                assert picture.mime_type == 'image/png' and raw.startswith(b'\x89PNG\r\n\x1a\n')
+                assert hashlib.sha256(raw).hexdigest() == metadata['sha256']
+        elif value.get('content', {}).get('kind') == 'image':
+            assert len(images) == 1 and images[0].mime_type == 'image/png'
+            raw = base64.b64decode(images[0].data)
+            assert raw.startswith(b'\x89PNG\r\n\x1a\n')
+            assert hashlib.sha256(raw).hexdigest() == value['content']['sha256']
+        else:
+            assert not images
+        return value
+
+    for source, is_pdf in zip(sources, (False, True)):
+        operation, keys, pieces, pictures = None, [], [], []
+        # Closing and recreating the frozen MCP process must preserve the exact
+        # source position; all progress lives in this isolated business service.
+        for connection in range(2):
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    opened = await call(session, 'prepare_context', {
+                        'goal':'Read this synthetic original completely', 'source_ids':[source['id']],
+                        **({'operation_id':operation} if operation else {})})
+                    if operation:
+                        assert opened['operation_id'] == operation and opened['stage'] == 0
+                    operation = opened['operation_id']
+                    assert opened['mode']=='ordinary_mcp' and opened['budget_policy']=='advisory'
+                    assert opened['next_action']=='continue_reading'
+                    for _ in range(160):
+                        step = await call(session, 'next_context_step', {'operation_id':operation})
+                        if step.get('all_steps_processed'):
+                            assert connection == 1
+                            break
+                        assert step['source_id'] == source['id'] and step['step_key'] not in keys
+                        keys.append(step['step_key'])
+                        content = step['content']
+                        (pictures if content['kind'] == 'image' else pieces).append(content)
+                        await call(session, 'checkpoint_context', {'operation_id':operation,
+                            'step_key':step['step_key'], 'delivery_token':step['delivery_token'],
+                            'result':{'facts':[], 'notes':'Synthetic frozen MCP fixture acknowledges this unit.'}})
+                        if connection == 0 and len(keys) == (6 if is_pdf else 3):
+                            break
+                    else:
+                        raise AssertionError('Synthetic original did not terminate within the page bound')
+                    if connection == 1:
+                        status = await call(session, 'operation_status', {'operation_id':operation})
+                        assert status['stage'] == 0 and not status['checkpoint_required']
+                        assert status['mode']=='ordinary_mcp' and status['budget_policy']=='advisory'
+                        assert status['next_action']=='continue_reading'
+                        assert status['materials']['steps'] == {'completed':len(keys)}
+                        assert status['delivered_bytes'] > 64*1024
+                        if is_pdf:
+                            assert len(pieces) == 4 and len(pictures) == 4
+                            assert 'FINAL_PAGE_RUBRIC' in pieces[-1]['text']
+                            assert '第 4 页' in pictures[-1]['locator']
+                            evidence['four_page_pdf'] = {'text_pages':4, 'native_image_pages':4,
+                                'last_page_marker':True, 'resumed_before_page_four':True}
+                        else:
+                            assert ''.join(piece['text'] for piece in pieces) == text and not pictures
+                            assert status['tool_calls'] > 128 and len(keys) > 64
+                            seen, cursor = [], None
+                            for _ in range(100):
+                                page = await call(session, 'query_context', {'operation_id':operation,
+                                    'collection':'facts', 'cursor':cursor})
+                                seen.extend(item['step_key'] for item in page['items'])
+                                cursor = page['next_cursor']
+                                if cursor is None:
+                                    assert page['complete']
+                                    break
+                            else:
+                                raise AssertionError('Synthetic saved facts did not finish paging')
+                            assert sorted(seen) == sorted(keys)
+                            evidence['long_text'] = {'complete_character_match':True, 'steps':len(keys),
+                                'tool_calls':status['tool_calls'], 'delivered_bytes':status['delivered_bytes'],
+                                'saved_facts_complete':True}
+    # Exercise the shipped batch module, not just its registered names. Both
+    # response loss and receipt loss use the same durable operation/step ledger.
+    batch_evidence = []
+    for source, is_pdf in zip(sources, (False, True)):
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                assert {'read_material_batch', 'checkpoint_context_batch', 'read_context_batch'} <= {tool.name for tool in listed.tools}
+                opened = await call(session, 'prepare_context', {
+                    'goal':'Read the whole synthetic original in batches', 'source_ids':[source['id']]})
+                operation = opened['operation_id']
+                first = await call(session, 'read_material_batch', {'operation_id':operation})
+                assert first['items'] and not first['all_steps_processed']
+        keys, pieces, pictures = [], [], []
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                batch = await call(session, 'read_material_batch', {'operation_id':operation})
+                assert batch['items'] == first['items']
+                for number in range(100):
+                    if batch['all_steps_processed']:
+                        break
+                    assert batch['items']
+                    for item in batch['items']:
+                        assert item['step_key'] not in keys
+                        keys.append(item['step_key'])
+                        content = item['content']
+                        (pictures if content['kind'] == 'image' else pieces).append(content)
+                    entries = [{'step_key':item['step_key'], 'delivery_token':item['delivery_token'], 'result':{}}
+                               for item in batch['items']]
+                    saved = await call(session, 'checkpoint_context_batch', {'operation_id':operation, 'items':entries})
+                    assert saved['atomic'] and saved['acknowledged'] == len(entries)
+                    if number == 0:
+                        repeated = await call(session, 'checkpoint_context_batch', {'operation_id':operation, 'items':entries})
+                        assert repeated['reused_count'] == len(entries)
+                    batch = await call(session, 'read_material_batch', {'operation_id':operation})
+                else:
+                    raise AssertionError('Frozen batch reader failed to finish the synthetic original')
+                views = await call(session, 'read_context_batch', {'operation_id':operation, 'requests':[
+                    {'collection':'facts', 'view':'facts'}, {'id':source['id'], 'version':source['version']}]})
+                assert views['requests_complete'] and views['items'][0]['result']['complete']
+                assert not views['items'][0]['result']['items']  # Empty acknowledgements are not reread as facts.
+                assert views['items'][1]['result']['item']['id'] == source['id']
+                status = await call(session, 'operation_status', {'operation_id':operation})
+                assert status['materials']['steps'] == {'completed':len(keys)}
+                if is_pdf:
+                    assert len(pieces) == len(pictures) == 4 and 'FINAL_PAGE_RUBRIC' in pieces[-1]['text']
+                else:
+                    assert ''.join(piece['text'] for piece in pieces) == text and not pictures
+                    assert status['tool_calls'] < 2*len(keys)
+                batch_evidence.append({'kind':'pdf' if is_pdf else 'text', 'units':len(keys),
+                    'calls':status['tool_calls'], 'native_images':len(pictures), 'complete_original':True,
+                    'restart_replay':True, 'idempotent_batch_save':True, 'compact_facts':True})
+    evidence['batch_transport'] = batch_evidence
+    assert client.state() == before and client.query('jobs')['total'] == jobs_before
+    evidence.update(business_revision_unchanged=True, no_model_jobs=True,
+                    same_operation_after_mcp_restart=True, passed=True)
+    return evidence
+
+
 async def main(work_dir, report_path):
     root = require_test_workspace(work_dir) / 'package'
     root.mkdir(parents=True)
@@ -252,7 +428,8 @@ async def main(work_dir, report_path):
         report['gui'] = json.loads(verify_report.read_text('utf-8'))
         assert report['gui']['loaded'] and report['gui']['visible']
         assert gui.returncode == 0 and report['gui']['onboarding']['passed']
-        assert report['gui']['onboarding']['steps'] == 7 and report['gui']['onboarding']['progress_saved']
+        # The promoted workbench adds independent habits and assistant entries.
+        assert report['gui']['onboarding']['steps'] == 9 and report['gui']['onboarding']['progress_saved']
         assert client.state()['revision'] == before_onboarding
         report['fresh_empty_after_gui'] = client.state()['counts'] == {}
         skills=client.query('skills')['items'];assert any(x['id']=='course-notes' and x['instructions'] for x in skills)
@@ -388,6 +565,7 @@ async def main(work_dir, report_path):
         assert job['status']=='completed', job
         report['frozen_document_worker'] = job['result']['metadata']['validation']
         report['mcp_generic_plan_revision'] = await verify_frozen_mcp_plan_revision(client, params)
+        report['mcp_material_continuation'] = await verify_frozen_mcp_material_continuation(client, params)
         report['service_survives_both_entrances'] = service.is_running()
         report['passed'] = True
     except Exception as error:

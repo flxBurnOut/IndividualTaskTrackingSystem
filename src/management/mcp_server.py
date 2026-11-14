@@ -20,12 +20,17 @@ from .mcp_pages import PAGE_QUERIES, PageQuery, page as business_page, validate_
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 INSTRUCTIONS = (
-    "个人事务管理 Beta 测试版业务接口，仅连接独立 Beta 数据空间。每个新任务及每轮业务处理先读取最新上下文。所有写入经业务命令，"
+    "个人事务管理业务接口，仅连接所属的正式数据空间。每个新任务及每轮业务处理先读取最新上下文。所有写入经业务命令，"
     "必须携带读取所得 epoch、revision 和唯一 request_id；重试使用同一 ID 与同一内容。"
     "旧聊天不是当前事实。未确认保持未知，完成/出席/学习/提交/掌握分别记录。"
     "事实更新不自动重排计划。不要访问数据库、工作簿或生成写库脚本。普通操作由你推理，"
     "不会再次启动后台 AI。优先 prepare_context 并用统一分页工具读取完整约束；遇到冲突重新读取并处理，"
     "不可更换版本号盲重试。只有成功回执表示写入成功。"
+    "读取按服务返回的 mode、next_action 接续：ordinary_mcp 的累计用量只是提醒，"
+    "沿原 operation_id 和游标继续读取；yield 只保存进度，不会安排后台自动续跑。"
+    "上下文整理由 Codex 宿主负责。旧读取停在检查点时先用 operation_status 恢复原操作，"
+    "不更换模式、不新建操作绕过限制，也不把读取边界报成文件不存在。"
+    "批量资料优先 read_material_batch/checkpoint_context_batch，独立详情或集合用 read_context_batch；逐项保留版本和续读位置。"
     "如果当前会话关联软件事项，每轮先 begin_discussion，最后 submit_candidate；"
     "身份由 Codex 调用上下文提供，不能指定其他会话。受管事项只返回候选，由用户在软件确认。"
 )
@@ -210,19 +215,9 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             if name in PAGE_QUERIES and size(value)>MAX_PAGE_BYTES:
                 return business_page(name, params, value)
             if name not in QUERY_NAMES and name not in {'material_image','state','settings'} and size(value)>MAX_PAGE_BYTES:
-                scope={'kind':'general'}
-                if params.get('date'):scope['date']=params['date']
-                if params.get('owner_id'):scope['entity_id']=params['owner_id']
-                if name=='conversation' and value.get('conversation'):scope['conversation_id']=value['conversation']['id']
-                context=client.query('prepare_context',goal='读取 '+name,scope=scope)
-                operation=context['operation_id']
-                if name=='job':return client.query('read_context_item',operation_id=operation,id='job:'+params['id'])
-                result={'context':context,'requested_view':name,'instruction':'结果按统一分页接口读取，未将截断正文当作完整结果。'}
-                if name=='today':
-                    # The history body can require context readers without
-                    # making the explicit current-plan identity disappear.
-                    result.update({key:value[key] for key in ('current_plan_id','current_plan_version') if key in value})
-                return result
+                # query_business already authorized registered extension queries.
+                # Preserve the actual view instead of replacing it with unrelated indexes.
+                return business_page(name,params,value,registered=name not in get_args(QueryName))
             return value
         except Exception as exc:
             if hasattr(exc, "code"):
@@ -286,10 +281,14 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         return query(name, **(params or {}))
 
     @server.tool(annotations=READ, structured_output=True)
-    def read_business_page(name: PageQuery, params: dict[str, Any],
+    def read_business_page(name: str, params: dict[str, Any],
                            offset: Annotated[int, Field(strict=True, ge=0)] = 0,
-                           version: str | None = None) -> dict[str, Any]:
-        """Continue an ordinary large get/receipt/list/source_content response.
+                           version: str | None = None,
+                           byte_limit: Annotated[int, Field(strict=True, ge=2048, le=65536)] = 16384) -> dict[str, Any]:
+        """Continue the exact ordinary business view. Use byte_limit=65536 to
+        fetch more in one call; returned continuations retain this bounded size.
+        Only builtin read views and currently registered query extensions are allowed.
+        State/settings/capabilities retain their dedicated interfaces.
 
         Use the returned continuation arguments exactly, including explicit nulls
         and the original query's row/character offsets. Concatenate json_fragment
@@ -304,9 +303,16 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             raise _capability_error('discussion_query_forbidden',
                 '此普通业务续读入口不适用于受管讨论；请使用当前事项的 read_context_item 或 read_material。')
         try:
-            validate_page_request(name, params, offset, version)
+            registered=False
+            if name not in PAGE_QUERIES:
+                if name in get_args(QueryName):
+                    raise _capability_error('business_page_query','状态、设置和能力目录使用各自的读取入口。')
+                registered=any(entry.get('kind')=='query' and entry.get('name')==name
+                               for entry in raw_capabilities()['code_extensions'])
+                if not registered:raise _capability_error('unknown_query','Query is not registered.')
+            validate_page_request(name, params, offset, version,registered=registered)
             value = client.query(name, **params)
-            return business_page(name, params, value, offset=offset, version=version)
+            return business_page(name, params, value, offset=offset, version=version, byte_limit=byte_limit,registered=registered)
         except Exception as exc:
             if hasattr(exc, 'code'):
                 raise ToolError(json.dumps({'code': exc.code, 'message': str(exc),
@@ -500,7 +506,7 @@ def run(data_dir: str | Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=APP_NAME + " MCP 接口（标准输入输出）")
-    parser.add_argument("--data-dir", required=True, help="与 Beta 桌面客户端相同的独立 Beta 数据目录")
+    parser.add_argument("--data-dir", required=True, help="与桌面客户端相同的正式数据目录")
     args = parser.parse_args()
     run(args.data_dir)
 

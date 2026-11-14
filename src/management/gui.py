@@ -245,7 +245,7 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(15, 25, 15, 19)
         side.setSpacing(8)
         side.addWidget(plain_label("个人事务", "Brand"))
-        side.addWidget(plain_label("Beta 测试版", "BrandSub"))
+        side.addWidget(plain_label("个人事务工作台", "BrandSub"))
         self.nav_buttons = {}
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
@@ -514,6 +514,7 @@ class MainWindow(QMainWindow):
         if section not in dict(NAVIGATION):
             return
         self.section = section
+        if section == 'tasks': self.tasks_page.show_capture()
         self.nav_buttons[section].setChecked(True)
         self.refresh_navigation_icons()
         self.pages.setCurrentWidget({'dashboard': self.dashboard_page, 'today': self.today_page, 'tasks': self.tasks_page, 'projects': self.workspace_page, 'reviews': self.review_page}[section])
@@ -625,8 +626,8 @@ class MainWindow(QMainWindow):
         finally:
             dialog.deleteLater()
 
-    def manual_plan(self, date):
-        PlanDialog(self.bridge, self, self.saved, date=QDate.fromString(date, "yyyy-MM-dd")).exec()
+    def manual_plan(self, date, task_ids=None):
+        PlanDialog(self.bridge, self, self.saved, date=QDate.fromString(date, "yyyy-MM-dd"), task_ids=task_ids).exec()
 
     def review_handoff(self, prompt):
         import re
@@ -791,12 +792,48 @@ class MainWindow(QMainWindow):
             self.show_error(error)
         self.bridge.query("changes", loaded, failed, after=self.change_cursor, epoch=self.bridge.epoch, limit=100)
 
+    def _close_owned_dialogs(self):
+        """Let each owned editor decide whether its work can be discarded.
+
+        Qt closing a parent window does not consult each child dialog's custom
+        reject guard. Keep the service usable until every dialog has consented.
+        """
+        from shiboken6 import isValid
+        dialogs = [dialog for dialog in self.findChildren(QDialog)
+                   if isValid(dialog) and dialog.isVisible() and dialog.isWindow()]
+        confirmations = [dialog for dialog in dialogs if isinstance(dialog, QMessageBox)]
+        if confirmations:
+            confirmations[-1].raise_(); confirmations[-1].activateWindow()
+            return False
+        def depth(dialog):
+            count, parent = 0, dialog.parentWidget()
+            while parent is not None and parent is not self:
+                count += 1; parent = parent.parentWidget()
+            return count
+        for dialog in sorted(dialogs, key=depth, reverse=True):
+            if not isValid(dialog) or not dialog.isVisible(): continue
+            dialog.close()
+            if isValid(dialog) and dialog.isVisible():
+                dialog.raise_(); dialog.activateWindow()
+                return False
+        return not any(isValid(dialog) and dialog.isVisible() and dialog.isWindow()
+                       for dialog in self.findChildren(QDialog))
+
     def closeEvent(self, event):
-        if self.tasks_page.quick_pending:
+        if self.tasks_page.pending_writes() or (hasattr(self.today_page, 'pending_writes') and self.today_page.pending_writes()):
             self.notice.setText('正在保存任务，请等待结果后再关闭；保存失败时会保留输入。')
             self.notice.show()
             event.ignore()
             return
+        if not self._close_owned_dialogs():
+            self.notice.setText('请先处理打开窗口中未保存的内容或待核对结果，再关闭主窗口。')
+            self.notice.show(); event.ignore()
+            return
+        if hasattr(self.today_page, 'quick_input') and self.today_page.quick_input.text().strip() and not self.close_requested:
+            answer = QMessageBox.question(self, '当天任务尚未保存', '要放弃当天快速输入中的文字并关闭吗？', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore(); return
+            self.today_page.quick_input.clear()
         if self.tasks_page.quick_input.text().strip() and not self.tasks_page.quick_pending and not self.close_requested:
             choice = QMessageBox.question(self, '任务尚未保存', '快速记录中仍有文字。要放弃这些输入并关闭窗口吗？', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
             if choice != QMessageBox.StandardButton.Yes:
@@ -838,8 +875,8 @@ class MainWindow(QMainWindow):
 
 def run(data_dir, argv=None, *, show_update=False):
     from .branding import set_windows_identity, configure_application
-    from .data_space import require_beta_dir
-    data_dir = require_beta_dir(data_dir)
+    from .data_space import require_channel_dir
+    data_dir = require_channel_dir(data_dir)
     set_windows_identity()
     app = QApplication.instance() or QApplication(argv or [])
     configure_application(app)
@@ -848,7 +885,7 @@ def run(data_dir, argv=None, *, show_update=False):
     if not instance.acquire():
         command = 'update' if show_update else 'show'
         if not notify_window(data_dir, command):
-            QMessageBox.information(None, APP_NAME, '已有 Beta 窗口正在启动或退出，请稍后重试。')
+            QMessageBox.information(None, APP_NAME, '已有窗口正在启动或退出，请稍后重试。')
         return 0
     manager = install_gui_gc(app)
     app.setStyle("Fusion")

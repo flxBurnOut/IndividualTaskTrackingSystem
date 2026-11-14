@@ -121,7 +121,9 @@ def test_mcp_tool_schemas_are_serializable_and_expose_only_candidate_workflow():
     tools=asyncio.run(server.list_tools())
     from management.context_mcp import TOOL_NAMES
     assert {t.name for t in tools}=={'begin_discussion','query_business','submit_candidate'}|TOOL_NAMES
-    assert all(t.output_schema for t in tools if t.name not in {'next_context_step','read_material'})
+    image_readers={'next_context_step','read_material','read_material_batch'}
+    assert all(t.output_schema for t in tools if t.name not in image_readers)
+    assert all(not t.output_schema for t in tools if t.name in image_readers)
 
 def test_native_different_request_cannot_adopt_an_active_gui_turn(core):
     job,publish=claimed(core)

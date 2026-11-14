@@ -55,10 +55,10 @@ def test_version_summary_distinguishes_mcp_observation_from_configuration():
     from management.gui_update import version_summary
     state = {'service_contract': {'app_version': __version__}}
     assert '尚未核验' in version_summary(state)
-    assert '个人事务管理 · Beta 测试版' in version_summary(state)
-    assert '未核验为 Beta' in version_summary(state)
-    state['service_contract']['channel'] = 'beta'
-    assert f'后台版本：{__version__}（Beta 测试版）' in version_summary(state)
+    assert '个人事务管理' in version_summary(state)
+    assert '未核验通道' in version_summary(state)
+    state['service_contract']['channel'] = 'stable'
+    assert f'后台版本：{__version__}（正式版）' in version_summary(state)
     state['client_entrances'] = {'mcp': {'app_version': __version__, 'verified': True}}
     assert '其他已打开会话仍可能需要刷新' in version_summary(state)
     state['client_entrances']['mcp']['app_version'] = '1.0.2'
@@ -77,10 +77,10 @@ def test_update_dialog_does_not_stop_backend_with_unsaved_editor(tmp_path, monke
         query=lambda name, done, failed: done({'service_contract': {'app_version': __version__}}),
         prepare_update=lambda *args: calls.append('stop'))
     dialog = UpdateDialog(parent)
-    assert 'Beta' in dialog.windowTitle()
+    assert dialog.windowTitle() == '版本与更新'
     instructions = '\n'.join(label.text() for label in dialog.findChildren(QLabel))
-    assert '尚未提供独立 Beta 安装包' in instructions
-    assert '启动个人事务管理Beta.vbs' in instructions
+    assert '安装时核对原数据位置' in instructions
+    assert '从更新后的快捷方式启动' in instructions
     assert '请运行新版安装包' not in instructions
     editor = QDialog(parent)
     editor.show()
@@ -100,6 +100,35 @@ def test_update_dialog_does_not_stop_backend_with_unsaved_editor(tmp_path, monke
         parent.close()
 
 
+@pytest.mark.parametrize('page_name', ['tasks_page', 'today_page'])
+@pytest.mark.parametrize('state_name', ['draft', 'unresolved'])
+def test_update_checks_main_page_work_before_stopping_backend(tmp_path, page_name, state_name):
+    from PySide6.QtWidgets import QApplication, QWidget, QLineEdit
+    from management.gui_update import UpdateDialog
+    app = QApplication.instance() or QApplication([])
+    parent = QWidget(); parent.data_dir = tmp_path; parent.review_pending = False
+    calls, paused = [], []
+    parent.poll = SimpleNamespace(stop=lambda: paused.append('poll'))
+    parent.codex_connection = SimpleNamespace(timer=SimpleNamespace(stop=lambda: paused.append('connection')))
+    parent.bridge = SimpleNamespace(callbacks={}, uncertain_writes={},
+        query=lambda name, done, failed: done({'service_contract': {'app_version': __version__}}),
+        prepare_update=lambda *args: calls.append('stop'))
+    field = QLineEdit('Synthetic unsaved task' if state_name == 'draft' else '', parent)
+    unresolved = [state_name == 'unresolved']
+    setattr(parent, page_name, SimpleNamespace(quick_input=field, pending_writes=lambda: unresolved[0]))
+    dialog = UpdateDialog(parent)
+    try:
+        dialog.prepare_update()
+        assert not calls and not paused and not dialog.preparing
+        assert field.text() == ('Synthetic unsaved task' if state_name == 'draft' else '')
+        field.clear(); unresolved[0] = False
+        dialog.prepare_update()
+        assert calls == ['stop']
+    finally:
+        dialog.preparing = False; dialog.close(); dialog.deleteLater()
+        parent.close(); parent.deleteLater(); app.processEvents()
+
+
 @pytest.mark.parametrize('theme,font_size',[('light',13),('dark',20)])
 def test_version_dialog_wraps_long_paths_and_keeps_actions_reachable(tmp_path,theme,font_size):
     import os
@@ -114,7 +143,7 @@ def test_version_dialog_wraps_long_paths_and_keeps_actions_reachable(tmp_path,th
             font_path=Path(os.environ.get('WINDIR','C:/Windows'))/'Fonts'/name
             if font_path.is_file():QFontDatabase.addApplicationFont(str(font_path))
     parent=QWidget();parent.data_dir=tmp_path/('long_local_profile_name_'*4)
-    calls=[];parent.bridge=SimpleNamespace(query=lambda name,done,failed:done({'service_contract':{'app_version':__version__,'channel':'beta'}}),prepare_update=lambda *_:calls.append('stop'))
+    calls=[];parent.bridge=SimpleNamespace(query=lambda name,done,failed:done({'service_contract':{'app_version':__version__,'channel':'stable'}}),prepare_update=lambda *_:calls.append('stop'))
     dialog=None
     try:
         set_visual_style('glass');apply_appearance(app,{'theme':theme,'font_size':font_size})

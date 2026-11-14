@@ -273,8 +273,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_service(data_dir, resume_token=None):
-    from .data_space import require_beta_dir
-    root = require_beta_dir(data_dir)
+    from .data_space import require_channel_dir
+    root = require_channel_dir(data_dir)
     require_no_pending_update(root, resume_token)
     lock = OwnerLock(root / 'service.lock')
     if not lock.acquire():

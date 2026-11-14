@@ -62,9 +62,18 @@ def task_pool(core, c, p):
     group = p.get('group', 'open')
     if group not in {'open', 'done', 'undated', 'due', 'future', 'unowned', 'all'}:
         raise BusinessError('validation', '任务分组无效。')
+    sort = p.get('sort', 'recent')
+    if sort not in {'recent', 'due', 'owner'}:
+        raise BusinessError('validation', '任务排列顺序无效。')
     search = str(p.get('search') or '').strip()[:200]
     limit, offset = max(1, min(100, int(p.get('limit', 30)))), max(0, int(p.get('offset', 0)))
     clauses, args = ["e.status NOT IN ('cancelled','draft')"], []
+    if p.get('task_ids') is not None:
+        ids = p['task_ids']
+        if not isinstance(ids, list) or len(ids) > 100 or any(not isinstance(i, str) or not i for i in ids):
+            raise BusinessError('validation', '请选择不超过 100 项任务。')
+        clauses.append('e.id IN (' + (','.join('?' for _ in ids) or 'NULL') + ')')
+        args.extend(ids)
     if search:
         clauses.append("e.title LIKE ? ESCAPE '\\'")
         args.append('%' + search.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
@@ -88,7 +97,11 @@ def task_pool(core, c, p):
     filtered = sql + ' WHERE ' + selected
     total = c.execute('SELECT count(*) FROM (' + filtered + ')', args).fetchone()[0]
     date_order = f"min(coalesce({scheduled},'9999-12-31'),coalesce({due},'9999-12-31'))"
-    order = owner_sort_sql('pool') + ' COLLATE NOCASE,' + date_order + ',pool.created_at,pool.id'
+    order = {
+        'recent': 'pool.created_at DESC,pool.id DESC',
+        'due': f"coalesce({due},'9999-12-31'),pool.created_at DESC,pool.id",
+        'owner': owner_sort_sql('pool') + ' COLLATE NOCASE,' + date_order + ',pool.created_at,pool.id',
+    }[sort]
     plan = _latest_plan(core, c, day)
     planned = {block['target_id'] for block in plan['data'].get('blocks', [])} if plan else set()
     presenter, items, size = Presenter(core, c), [], 0
@@ -105,7 +118,7 @@ def task_pool(core, c, p):
             break
         items.append(entity)
         size += cost
-    return {'date': day, 'group': group, 'search': search, 'items': items, 'total': total,
+    return {'date': day, 'group': group, 'sort': sort, 'search': search, 'items': items, 'total': total,
             'next_offset': offset + len(items) if offset + len(items) < total else None,
             'plan': {'id': plan['id'], 'version': plan['version'], 'mode': plan['data']['mode']} if plan else None}
 

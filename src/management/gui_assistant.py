@@ -70,7 +70,7 @@ PROGRESS_LABELS={
     'creating_thread':'正在创建 Codex 任务','thread_ready':'Codex 任务已连接','sending':'正在将消息交给 Codex',
     'waiting_model':'Codex 已收到，正在等待回复','reasoning':'Codex 正在思考','receiving':'正在接收回复',
     'validating':'正在核对回复与待保存内容','provider_retry':'连接暂时中断，正在恢复',
-    'compacting':'正在保存进度并整理上下文','checkpointed':'本批已保存，即将继续','reading':'正在分批读取资料',
+    'compacting':'正在保存进度并整理上下文','checkpointed':'本批已保存，等待接续','reading':'正在分批读取资料',
     'running':'Codex 正在处理','failed':'本次处理失败','cancelled':'本次处理已停止','completed':'回复已完成',
 }
 

@@ -19,9 +19,12 @@ MAX_PAGE_BYTES = 16 * 1024
 ENVELOPE_BYTES = 24 * 1024
 STAGE_BYTES = 64 * 1024
 RESERVE_BYTES = 8 * 1024
+STAGE_CALLS = 128
+IMAGE_CONTEXT_BYTES = 12000
 QUERY_NAMES = {'prepare_context', 'query_context', 'read_context_item', 'read_material',
                'describe_action', 'context_coverage', 'operation_status',
-               'next_context_step', 'checkpoint_context', 'validate_candidate','refresh_context'}
+               'next_context_step', 'checkpoint_context', 'validate_candidate','refresh_context',
+               'read_material_batch','checkpoint_context_batch','read_context_batch'}
 ACTIVE = "e.archived=0 AND e.status NOT IN ('cancelled','draft')"
 
 
@@ -43,7 +46,7 @@ def _fragment(text, offset, budget):
         if size(text[offset:offset+mid]) <= budget: lo = mid
         else: hi = mid-1
     if lo == 0 and offset < len(text):
-        raise BusinessError('context_budget', '当前页预算不足，请先保存检查点。')
+        raise BusinessError('context_page_limit', '当前页不足以返回一个字符，请增大 byte_limit 后重试原位置。')
     end = offset+lo
     return text[offset:end], end if end < len(text) else None
 
@@ -128,9 +131,9 @@ def _where(core, c, op, name, params):
         conditions.append("json_extract(e.data,'$.date')=?"); args.append(day)
     if name == 'feedback':
         conditions.append("json_extract(e.data,'$.business_date')=?"); args.append(day)
-    has_completion=bool(c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_type(data,'$.dimensions.completion') IS NOT NULL LIMIT 1").fetchone())
+    has_completion=name in {'tasks','deadlines'} and bool(c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_type(data,'$.dimensions.completion') IS NOT NULL LIMIT 1").fetchone())
     if name in {'tasks','deadlines'} and not has_completion:conditions.append("e.status!='done'")
-    if name in {'tasks','deadlines'} and c.execute("SELECT 1 FROM entities WHERE type='feedback' AND archived=0 AND json_type(data,'$.dimensions.completion') IS NOT NULL LIMIT 1").fetchone():
+    if name in {'tasks','deadlines'} and has_completion:
         from .task_views import rows_sql
         completion=rows_sql('e.id=__outer_id__',day).replace('e.','context_task.').replace('entities e ','entities context_task ').replace('__outer_id__','e.id')
         conditions.append("(e.type!='task' OR NOT EXISTS(SELECT 1 FROM ("+completion+") WHERE completion_state='done'))")
@@ -220,7 +223,8 @@ def envelope(core,c,op):
         'readers':sorted(QUERY_NAMES-{'prepare_context'}),'page_bytes':PAGE_BYTES,
         'coverage':'Indexes only; no record body or material has been read by the model.',
         'stage':op['stage'],'checkpoint':op['checkpoint'],
-        'instructions':'先查询与目标相关的记录，按 next_cursor 继续；详情用 read_context_item。计划必须核对完整 deadlines、rules、events 和当前计划；入选事项的 dependencies 入口提供前置、后置及实际完成状态，须完整读取。资料用 next_context_step 自动逐批读取并 checkpoint_context；检查点不修改业务。'}
+        'instructions':'先查询与目标相关的记录，按 next_cursor 继续；详情用 read_context_item。计划必须核对完整 deadlines、rules、events 和当前计划；入选事项的 dependencies 入口提供前置、后置及实际完成状态，须完整读取。资料优先 read_material_batch 并 checkpoint_context_batch；详情与集合可用 read_context_batch。逐项保留来源和续读位置，检查点不修改业务。',
+        **continuation_state(op)}
     if size(result)>ENVELOPE_BYTES: raise BusinessError('context_envelope','上下文索引扩展过大，请检查已注册集合。')
     return result
 
@@ -235,13 +239,55 @@ def _summary(row):
     return e
 
 
+def continuation_state(op):
+    """A page limit is universal; only a software-owned job has a stage driver."""
+    managed=bool(op['job_id'])
+    threshold=op['delivered_bytes']>=STAGE_BYTES-RESERVE_BYTES-2048 or op['tool_calls']>=STAGE_CALLS
+    waiting=managed and op['phase']!='ready' and (threshold or op['phase'] in {'checkpointed','budget_stop'})
+    action='operation_complete' if op['phase']=='ready' else (
+        'await_managed_compaction' if waiting and op['phase']=='checkpointed' else
+        'save_checkpoint_and_yield' if waiting else 'continue_reading')
+    notice=('本操作由软件后台作业管理；只有确认宿主压缩成功后才恢复阶段预算。' if managed else
+        '普通 MCP 读取可沿原游标继续；累计用量仅作提醒，宿主负责对话上下文管理，软件不会自动代为压缩或续发消息。')
+    return {'mode':'managed_job' if managed else 'ordinary_mcp','budget_policy':'stage' if managed else 'advisory',
+        'checkpoint_required':waiting,'next_action':action,'notice':notice}
+
+
+def _checkpoint_required(op):
+    return BusinessError('context_checkpoint_required',
+        '本阶段读取预算将满。请保存检查点并结束本轮；关联后台作业须确认宿主压缩完成后才能接续。',
+        {'operation_id':op['id'],'stage':op['stage'],
+         'remaining_bytes':max(0,STAGE_BYTES-op['delivered_bytes']-RESERVE_BYTES),
+         **continuation_state({**op,'phase':'budget_stop'})})
+
+
 def _budget(op, requested):
     requested=max(2048,min(MAX_PAGE_BYTES,int(requested or PAGE_BYTES)))
+    if not op['job_id']:return requested
     remaining=STAGE_BYTES-op['delivered_bytes']-RESERVE_BYTES
-    if remaining<2048 or op['phase'] in {'checkpointed','budget_stop'} or op['tool_calls']>=128:
-        raise BusinessError('context_checkpoint_required','本阶段读取预算将满。请保存检查点并结束本轮，软件会在原任务压缩上下文后自动接续。',
-                            {'operation_id':op['id'],'stage':op['stage'],'remaining_bytes':max(0,remaining)})
+    if remaining<2048 or op['phase'] in {'checkpointed','budget_stop'} or op['tool_calls']>=STAGE_CALLS:
+        raise _checkpoint_required(op)
     return min(requested,remaining)
+
+
+def _fit_page(op,amount,maximum):
+    """Do not mistake a too-small page for a missing host compaction."""
+    if amount<=maximum:return
+    remaining=STAGE_BYTES-op['delivered_bytes']-RESERVE_BYTES
+    if op['job_id'] and remaining<PAGE_BYTES and amount<=MAX_PAGE_BYTES:
+        raise _checkpoint_required(op)
+    raise BusinessError('context_page_limit',
+        '这个内容块超过当前入口的单次读取上限，原位置和进度已保留。请报告此分块问题；等待压缩或反复重试不会解决。当前 MCP 入口不能调整单页大小。',
+        {'operation_id':op['id'],'page_bytes':maximum,'required_bytes':amount,
+         'max_page_bytes':MAX_PAGE_BYTES,'next_action':'report_page_limit','progress_preserved':True})
+
+
+def _charge_image(c,op,result):
+    # Image estimates are statistics for ordinary MCP, a real reservation for
+    # managed jobs. Keep this identical for current and historical materials.
+    if op['job_id'] and op['delivered_bytes']+size(result)+IMAGE_CONTEXT_BYTES>STAGE_BYTES-RESERVE_BYTES:
+        raise _checkpoint_required(op)
+    c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+? WHERE id=?',(IMAGE_CONTEXT_BYTES,op['id']))
 
 
 def _charge(c,op,result):
@@ -278,7 +324,7 @@ def page(core,c,op,collection,params=None,cursor=None,limit=80,byte_limit=None):
         query=c.execute('SELECT * FROM context_queries WHERE id=?',(query['id'],)).fetchone()
     if query and query['stamp']==stamp and query['last_page'] and (cursor or '')==query['last_cursor']:
         result=json.loads(query['last_page'])
-        if size(result)>_budget(op,byte_limit):raise BusinessError('context_checkpoint_required','请保存检查点后重试原游标。')
+        _fit_page(op,size(result),_budget(op,byte_limit))
         return _charge(c,op,result)
     if cursor and query and query['stamp']!=stamp:raise BusinessError('context_changed','这个集合已变化，请重新从第一页读取。',{'collection':collection})
     if cursor:
@@ -361,6 +407,10 @@ def _special(core,c,op,identifier):
 
 def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
     from .context_dependencies import PREFIX, PLAN_TYPES, reference, snapshot
+    if type(offset) is not int or offset<0:
+        raise BusinessError('context_cursor','详情位置必须是非负整数。')
+    if offset and version is None:
+        raise BusinessError('context_version','分段续读必须携带首段返回的版本。')
     dependency_reader=None
     if identifier.startswith(PREFIX):
         value=snapshot(core,c,identifier[len(PREFIX):],op['scope']['date']);current=digest(value)
@@ -384,6 +434,8 @@ def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
         value=core.store.get(c,identifier);current=value['version']
         if value['type'] in PLAN_TYPES:dependency_reader=reference(identifier)
     if version is not None and version!=current: raise BusinessError('context_changed','该记录在分段读取期间已改变，请重新读取这条记录。')
+    text=value if isinstance(value,str) else encode(value)
+    if offset>len(text):raise BusinessError('context_cursor','详情位置超出原文，不能将空片段记为全文已读。')
     budget=_budget(op,byte_limit)
     if not offset and size({'item':value,'version':current})<budget-512:
         result={'id':identifier,'item':value,'version':current,'next_offset':None,'complete':True}
@@ -400,8 +452,10 @@ def read_item(core,c,op,identifier,offset=0,version=None,byte_limit=None):
         read_until=max(until,old['read_until'] if old and old['version']==str(current) else 0)
         c.execute('INSERT INTO context_parts VALUES (?,?,?,?,?) ON CONFLICT(operation_id,item_id) DO UPDATE SET version=excluded.version,read_until=excluded.read_until,complete=excluded.complete',
             (op['id'],identifier,str(current),read_until,int(read_until==len(text))))
+    part=c.execute('SELECT version,complete FROM context_parts WHERE operation_id=? AND item_id=?',(op['id'],identifier)).fetchone()
+    result['coverage_complete']=bool(part and part['version']==str(current) and part['complete'])
     if not identifier.startswith(('@','message:','job:','receipt:',PREFIX)):
-        c.execute('INSERT INTO context_reads VALUES (?,?,?,?) ON CONFLICT(operation_id,entity_id) DO UPDATE SET detail=CASE WHEN version=excluded.version THEN max(detail,excluded.detail) ELSE excluded.detail END,version=excluded.version',(op['id'],identifier,current,2 if result['complete'] else 1))
+        c.execute('INSERT INTO context_reads VALUES (?,?,?,?) ON CONFLICT(operation_id,entity_id) DO UPDATE SET detail=CASE WHEN version=excluded.version THEN max(detail,excluded.detail) ELSE excluded.detail END,version=excluded.version',(op['id'],identifier,current,2 if result['coverage_complete'] else 1))
     return _charge(c,op,result)
 
 
@@ -416,7 +470,8 @@ def coverage(core,c,op,query_cursor=''):
     return {'operation_id':op['id'],'phase':op['phase'],'stage':op['stage'],'scope':op['scope'],
         'delivered_bytes':op['delivered_bytes'],'stage_budget_bytes':STAGE_BYTES,
         'collections':queries,'next_query_cursor':next_query_cursor,'tool_calls':op['tool_calls'],'materials':{'sources':sources,'steps':steps},
-        'checkpoint':op['checkpoint'],'validation':json.loads(op['validation']) if op['validation'] else None}
+        'checkpoint':op['checkpoint'],'validation':json.loads(op['validation']) if op['validation'] else None,
+        **continuation_state(op)}
 
 
 def history_page(core,c,op,cursor=None,byte_limit=None):
@@ -499,7 +554,8 @@ def validate(core,c,op,candidate,*,require_coverage=True):
     if incomplete: raise BusinessError('material_incomplete','资料仍在分批读取，请继续 next_context_step。',{'sources':incomplete})
     completed_steps=c.execute("SELECT count(*) FROM context_steps WHERE operation_id=? AND status='completed'",(op['id'],)).fetchone()[0]
     if completed_steps>1:
-        merge=c.execute("SELECT complete,total FROM context_queries WHERE operation_id=? AND collection='facts' AND params='{}'",(op['id'],)).fetchone()
+        merge=c.execute("SELECT complete,total FROM context_queries WHERE operation_id=? AND collection='facts' AND params IN (?,?) ORDER BY complete DESC LIMIT 1",
+                        (op['id'],'{}',encode({'view':'facts'}))).fetchone()
         if not merge or not merge['complete'] or merge['total']!=completed_steps:
             raise BusinessError('material_merge_required','各批分析已保存，请分页读取 facts 合并全部候选事实后再提交。')
 
@@ -546,20 +602,27 @@ def validate(core,c,op,candidate,*,require_coverage=True):
 
 def checkpoint(core,c,op,p):
     step_key=p.get('step_key'); result=p.get('result') or {}
-    if not isinstance(result,dict) or size(result)>PAGE_BYTES-1800: raise BusinessError('checkpoint_limit','单批检查点超过预算，请保存较小批次。')
+    summary=p.get('summary',op['checkpoint'].get('summary',''))
+    reused=False
+    for field,value,kind,maximum in [('result',result,dict,PAGE_BYTES-1800),('summary',summary,str,4000)]:
+        if not isinstance(value,kind) or size(value)>maximum:
+            raise BusinessError('checkpoint_limit',
+                f'{field} 格式无效或超过 {maximum} 字节；按 JSON 序列化后的 UTF-8 字节计算，请缩短摘要或分批保存事实后重试。',
+                {'operation_id':op['id'],'field':field,'max_bytes':maximum,'actual_bytes':size(value),
+                 'encoding':'json_utf8','expected_type':'object' if kind is dict else 'string',
+                 'progress_preserved':True,'next_action':'shorten_checkpoint_and_retry'})
     if step_key:
         row=c.execute('SELECT * FROM context_steps WHERE operation_id=? AND step_key=?',(op['id'],step_key)).fetchone()
         if not row or row['status']=='pending': raise BusinessError('checkpoint_step','该批内容尚未送达，不能记为已处理。')
         fingerprint=digest(result)
-        if row['status']=='completed' and row['fingerprint']==fingerprint:
-            return {'saved':True,'reused':True,'step_key':step_key}
+        reused=row['status']=='completed' and row['fingerprint']==fingerprint
         from .materials import delivery_token
         if p.get('delivery_token')!=delivery_token(core,c,op,row):
             raise BusinessError('context_changed','本批读取版本或运行代次已变化，请重新读取原文后再保存检查点。')
         actual=c.execute('SELECT version,archived FROM entities WHERE id=?',(row['source_id'],)).fetchone()
         if not actual or actual['archived'] or actual['version']!=row['source_version']:
             raise BusinessError('context_changed','原件版本已变化，请刷新此操作后重新读取。')
-        if row['status']=='completed':
+        if row['status']=='completed' and not reused:
             if p.get('expected_fingerprint')!=row['fingerprint']:
                 raise BusinessError('checkpoint_conflict','该批已有不同结果；请回读原文并用原检查点指纹明确修订。')
             c.execute('INSERT INTO context_step_history(operation_id,step_key,snapshot,created_at) VALUES (?,?,?,?)',(op['id'],step_key,encode(dict(row)),now()))
@@ -567,9 +630,10 @@ def checkpoint(core,c,op,p):
                 c.execute('INSERT INTO context_step_history(operation_id,step_key,snapshot,created_at) VALUES (?,?,?,?)',(op['id'],'candidate:'+str(draft['seq']),encode(dict(draft)),now()))
             c.execute('DELETE FROM context_actions WHERE operation_id=?',(op['id'],))
             c.execute("DELETE FROM context_queries WHERE operation_id=? AND collection='facts'",(op['id'],))
-        validate_evidence(c,op,row,result)
-        c.execute("UPDATE context_steps SET status='completed',result=?,fingerprint=?,updated_at=? WHERE operation_id=? AND step_key=?",(encode(result),fingerprint,now(),op['id'],step_key))
-    if result.get('actions') is not None:
+        if not reused:
+            validate_evidence(c,op,row,result)
+            c.execute("UPDATE context_steps SET status='completed',result=?,fingerprint=?,updated_at=? WHERE operation_id=? AND step_key=?",(encode(result),fingerprint,now(),op['id'],step_key))
+    if not reused and result.get('actions') is not None:
         from .ai import validate_proposal
         allowed=None
         if op['job_id']:allowed=set(json.loads(core._job(c,op['job_id'])['input'])['allowed_commands'])
@@ -581,13 +645,13 @@ def checkpoint(core,c,op,p):
         for action in batch['actions']:
             c.execute('INSERT OR IGNORE INTO context_actions(operation_id,fingerprint,command,payload,reason) VALUES (?,?,?,?,?)',
                 (op['id'],digest([action['command'],action['payload']]),action['command'],encode(action['payload']),action['reason']))
-    summary=p.get('summary','')
-    if not isinstance(summary,str) or size(summary)>4000: raise BusinessError('checkpoint_limit','接续摘要最多 4000 字节，事实请存入批次结果。')
     saved={'summary':summary,'last_step':step_key,'stage':op['stage']}
-    yield_requested=bool(p.get('yield',False))
+    yield_requested=bool(p.get('yield',False) and op['job_id'])
+    phase='checkpointed' if yield_requested else 'reading'
     c.execute("UPDATE context_operations SET checkpoint=?,phase=?,updated_at=? WHERE id=?",
-        (encode(saved),'checkpointed' if yield_requested else 'reading',now(),op['id']))
-    return {'saved':True,'step_key':step_key,'continue_in_same_operation':True,'end_turn_for_compaction':yield_requested,'remerge_required':bool(p.get('expected_fingerprint'))}
+        (encode(saved),phase,now(),op['id']))
+    return {'saved':True,'reused':reused,'step_key':step_key,'continue_in_same_operation':True,'end_turn_for_compaction':yield_requested,
+        'remerge_required':bool(p.get('expected_fingerprint')),**continuation_state({**op,'phase':phase})}
 
 
 def validate_evidence(c,op,step,result):
@@ -603,6 +667,8 @@ def compacted(core,identifier):
     """Only a confirmed provider contextCompaction completion may reset quota."""
     with core.store.lock,core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE');op=_operation(core,c,identifier,writable=True)
+        if not op['job_id']:
+            raise BusinessError('context_compaction_mode','普通 MCP 操作由宿主管理上下文，软件不重置其累计读取统计。')
         c.execute("UPDATE context_operations SET stage=stage+1,delivered_bytes=0,tool_calls=0,phase='reading',updated_at=? WHERE id=?",(now(),identifier))
         c.commit()
 
@@ -614,12 +680,22 @@ def handle(core,name,p):
     if identifier:
         with core.store.lock,core.store.connect() as c:
             c.execute('BEGIN IMMEDIATE')
-            _operation(core,c,identifier)
+            op=_operation(core,c,identifier)
+            if not op['job_id'] and op['phase'] in {'checkpointed','budget_stop'}:
+                # Upgrade compatibility, not proof of host compaction: retain
+                # operation, evidence, versions, cursors, checkpoint and counters.
+                c.execute("UPDATE context_operations SET phase='reading',updated_at=? WHERE id=?",(now(),identifier))
             c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+?,tool_calls=tool_calls+1 WHERE id=?',
                       (size(p),identifier))
             c.commit()
     try:
         return _handle(core,name,p)
+    except BusinessError as error:
+        # Materials perform bounded I/O outside _handle's SQL transaction too.
+        # Record an early image reservation stop even below the soft threshold.
+        if error.code=='context_checkpoint_required' and identifier:
+            _stop_budget(core,identifier,required=True)
+        raise
     finally:
         if identifier:
             _stop_budget(core, identifier)
@@ -630,13 +706,15 @@ def _stop_budget(core, identifier, *, required=False):
     with core.store.lock,core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE')
         try:
-            _operation(core,c,identifier)
+            op=_operation(core,c,identifier)
+            if not op['job_id']:
+                c.commit();return
             if required:
                 c.execute("UPDATE context_operations SET phase='budget_stop' WHERE id=? AND phase NOT IN ('ready','checkpointed')",(identifier,))
             else:
                 c.execute("""UPDATE context_operations SET phase='budget_stop'
-                    WHERE id=? AND phase='reading' AND (delivered_bytes>=? OR tool_calls>=128)""",
-                    (identifier,STAGE_BYTES-RESERVE_BYTES-2048))
+                    WHERE id=? AND phase='reading' AND (delivered_bytes>=? OR tool_calls>=?)""",
+                    (identifier,STAGE_BYTES-RESERVE_BYTES-2048,STAGE_CALLS))
             c.commit()
         except BusinessError:
             c.rollback()
@@ -645,6 +723,9 @@ def _stop_budget(core, identifier, *, required=False):
 def _handle(core,name,p):
     if name not in QUERY_NAMES: raise BusinessError('context_query','未注册的读取方法。')
     # Extraction is bounded I/O and must never run while holding a DB transaction.
+    if name=='read_material_batch':
+        from .context_batches import read_material_batch
+        return read_material_batch(core,p)
     if name in {'read_material','next_context_step'}:
         from .materials import read_material, next_step
         if name=='read_material' and p.get('from_job'):
@@ -658,20 +739,21 @@ def _handle(core,name,p):
                 identifier=p.get('operation_id')
                 result=envelope(core,c,_operation(core,c,identifier)) if identifier else create(core,c,scope=p.get('scope') or {'kind':'general'},goal=p.get('goal','读取当前业务'),sources=p.get('source_ids') or [])
             else:
-                op=_operation(core,c,p.get('operation_id'),writable=name in {'checkpoint_context','refresh_context'})
-                if name=='query_context' and p.get('collection')=='actions':
-                    from .context_candidates import page as action_page
-                    _budget(op,p.get('byte_limit'))
-                    result=_charge(c,op,action_page(core,{'operation_id':op['id'],'after':p.get('cursor') or 0}))
-                elif name=='query_context' and p.get('collection')=='facts' and (p.get('filters') or {}).get('job_id'):
-                    from .context_history import facts
-                    result=facts(core,c,op,p['filters']['job_id'],p.get('cursor'))
-                elif name=='query_context':
-                    result=history_page(core,c,op,p.get('cursor'),p.get('byte_limit')) if p.get('collection')=='history' else __import__('management.materials',fromlist=['facts_page']).facts_page(core,c,op,p.get('cursor'),p.get('byte_limit')) if p.get('collection')=='facts' else page(core,c,op,p.get('collection'),p.get('filters'),p.get('cursor'),p.get('limit',80),p.get('byte_limit'))
+                op=_operation(core,c,p.get('operation_id'),writable=name in {'checkpoint_context','checkpoint_context_batch','refresh_context'})
+                if name=='query_context':
+                    from .context_batches import query_page
+                    result=query_page(core,c,op,p,p.get('byte_limit'))
+                elif name=='read_context_batch':
+                    from .context_batches import read_context_batch
+                    result=read_context_batch(core,c,op,p)
+                elif name=='checkpoint_context_batch':
+                    from .context_batches import checkpoint_batch
+                    result=_charge(c,op,checkpoint_batch(core,c,op,p))
                 elif name=='read_context_item': result=read_item(core,c,op,p['id'],p.get('offset',0),p.get('version'),p.get('byte_limit'))
                 elif name in {'context_coverage','operation_status'}:
-                    if op['delivered_bytes']>STAGE_BYTES-RESERVE_BYTES or op['tool_calls']>=128:
-                        result={'operation_id':op['id'],'phase':op['phase'],'stage':op['stage'],'checkpoint_required':True}
+                    if op['job_id'] and (op['delivered_bytes']>STAGE_BYTES-RESERVE_BYTES or op['tool_calls']>=STAGE_CALLS):
+                        result={'operation_id':op['id'],'phase':op['phase'],'stage':op['stage'],
+                            'checkpoint':op['checkpoint'],**continuation_state(op)}
                     else:result=coverage(core,c,op,p.get('query_cursor',''))
                     result=_charge(c,op,result)
                 elif name=='checkpoint_context': result=_charge(c,op,checkpoint(core,c,op,p))
@@ -684,8 +766,12 @@ def _handle(core,name,p):
                     if command not in CANDIDATE_COMMANDS: raise BusinessError('proposal_scope','该操作未开放。')
                     value={'command':command,'types':core.types(c).get(p.get('type'),{}),
                            'contract':'Use command/reason/payload_json in submit_candidate; Core validates all actions.'}
-                    budget=_budget(op,p.get('byte_limit'));text,following=_fragment(encode(value),p.get('offset',0),budget-512)
-                    result=_charge(c,op,{'json_fragment':text,'next_offset':following})
+                    offset=p.get('offset',0);version=digest(value);encoded=encode(value)
+                    if type(offset) is not int or not 0<=offset<=len(encoded):raise BusinessError('context_cursor','操作说明位置无效。')
+                    if offset and p.get('version') is None:raise BusinessError('context_version','续读操作说明需要原版本。')
+                    if p.get('version') is not None and p['version']!=version:raise BusinessError('context_changed','操作说明已变化，请从首段重新读取。')
+                    budget=_budget(op,p.get('byte_limit'));text,following=_fragment(encoded,offset,budget-512)
+                    result=_charge(c,op,{'json_fragment':text,'next_offset':following,'version':version})
                 elif name=='validate_candidate':
                     from .ai import validate_proposal
                     candidate=validate_proposal(p.get('proposal'))
@@ -695,6 +781,4 @@ def _handle(core,name,p):
             c.commit();return result
         except Exception as error:
             c.rollback()
-            if getattr(error,'code',None)=='context_checkpoint_required' and p.get('operation_id'):
-                _stop_budget(core,p['operation_id'],required=True)
             raise

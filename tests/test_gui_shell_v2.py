@@ -11,7 +11,7 @@ import pytest
 from PySide6.QtCore import QDate, QEvent, QMimeData, QPoint, QPointF, Qt, QUrl, QTimer
 from PySide6.QtGui import QDropEvent, QDesktopServices, QFontDatabase
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QDialogButtonBox, QMessageBox, QScrollArea, QWidget, QLayout
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QDialog, QDialogButtonBox, QMessageBox, QScrollArea, QWidget, QLayout
 from management.client import Client
 from management.gui import MainWindow, STYLESHEET
 from management.gui_workspace import CountProgress
@@ -65,6 +65,39 @@ def wait(app, predicate, timeout=12):
         time.sleep(.01)
     raise AssertionError("The native UI did not reach the expected state")
 
+def settle_visuals(app, host):
+    """Retained screenshots show final fills, after the real 650 ms reveal."""
+    from PySide6.QtCore import QAbstractAnimation
+    from management.gui_progress import ProgressReveal
+    QTest.qWait(700)
+    wait(app, lambda: all(reveal.animation.state() != QAbstractAnimation.State.Running
+                         for reveal in host.findChildren(ProgressReveal)))
+    app.processEvents()
+
+
+def close_preview(app, dialog):
+    """Explicitly choose discard in a real close prompt after a preview ends.
+
+    This drives the actual guard. It never edits the dirty flag or writes data.
+    Tests of Cancel/Save use their own actions and assertions instead.
+    """
+    from shiboken6 import isValid
+    if not isValid(dialog): return
+    timer = QTimer()
+    def discard_prompt():
+        for box in app.topLevelWidgets():
+            if not isinstance(box, QMessageBox) or not box.isVisible(): continue
+            for button in box.buttons():
+                standard = box.standardButton(button)
+                if standard in (QMessageBox.StandardButton.Discard, QMessageBox.StandardButton.Yes) or '放弃' in button.text():
+                    button.click(); return
+    timer.timeout.connect(discard_prompt); timer.start(20)
+    try:
+        dialog.close(); app.processEvents()
+    finally:
+        timer.stop(); timer.deleteLater()
+
+
 @pytest.fixture
 def shell(app_v2, tmp_path):
     root = tmp_path / "synthetic-v2-data"
@@ -84,7 +117,20 @@ def shell(app_v2, tmp_path):
                 window.review_pending = False
                 # These inputs belong to this disposable fixture. A failed
                 # assertion must not leave teardown waiting in a modal prompt.
-                window.tasks_page.quick_input.clear()
+                window.onboarding.stop()
+                # Only failed-fixture teardown can clear synthetic in-flight
+                # flags; ordinary assertions below exercise the real prompts.
+                for page in (window.tasks_page, window.today_page):
+                    page.quick_input.clear()
+                    for flag in ('quick_pending','quick_uncertain','plan_pending','plan_uncertain',
+                                 'completion_pending','completion_uncertain','join_pending','join_uncertain',
+                                 'review_saving','review_uncertain'):
+                        if hasattr(page, flag): setattr(page, flag, False)
+                for dialog in reversed(window.findChildren(QDialog)):
+                    if not dialog.isVisible(): continue
+                    if hasattr(dialog, '_discard_close'): dialog._discard_close = True
+                    if hasattr(dialog, 'dirty'): dialog.dirty = False
+                    close_preview(app_v2, dialog)
                 window.close()
                 wait(app_v2, lambda: not window.isVisible() and not window.bridge.thread.isRunning() and not window.bridge.mutation_thread.isRunning())
                 # Retire this fixture on the Qt owner thread before the next case;
@@ -150,7 +196,7 @@ def test_light_and_dark_appearance_share_data_and_live_editor(app_v2, shell, tmp
                 wait(app_v2, lambda: not shell.dashboard_page._layout_pending)
                 # Finite entrance animation must finish before a retained image.
                 wait(app_v2, lambda: not shell.page_transition.is_active())
-                app_v2.processEvents();shell.repaint()
+                settle_visuals(app_v2, shell); shell.repaint()
                 assert current_appearance()['theme']==theme
                 assert shell.grab().save(str(report / f'visual-glass-{section}-{theme}.png'))
                 if section=='dashboard':
@@ -185,11 +231,11 @@ def test_light_and_dark_appearance_share_data_and_live_editor(app_v2, shell, tmp
                                'minimum':widget.minimumHeight(),'hint':widget.sizeHint().height()}
                               for widget in sections]
                     first=next(widget for widget in sections if not widget.isHidden())
-                    assert first.y()<=page.body.contentsMargins().top()+4,geometry
+                    assert first.mapTo(page.scroll.widget(), QPoint()).y()<=page.body.contentsMargins().top()+4,geometry
                     assert page.plan_box.height()<=page.plan_box.sizeHint().height()+4,geometry
                     apply_appearance(app_v2, {**previous_appearance, 'theme': theme, 'font_size': 13})
                     wait(app_v2,sections_ready)
-                    app_v2.processEvents();shell.repaint()
+                    settle_visuals(app_v2, shell); shell.repaint()
                     assert current_appearance()['theme']==theme
                     assert shell.grab().save(str(report / f'visual-glass-today-empty-{theme}.png'))
                     shell.today_page.date.setDate(QDate.currentDate())
@@ -316,7 +362,7 @@ def test_dialog_guides_preserve_unsaved_plan_and_settings(app_v2, shell):
         assert settings.guide_button.isVisible()
         assert client.state()['revision'] == before
     finally:
-        settings.close()
+        close_preview(app_v2, settings)
         settings.deleteLater()
 
 
@@ -392,8 +438,7 @@ def test_all_tutorial_steps_align_with_real_controls_and_keep_business_read_only
 
     def close_dialog(dialog):
         if manager.overlay is not None:manager.overlay.skip_button.click()
-        if isinstance(dialog,PlanDialog):dialog.dirty=False
-        dialog.close();app_v2.processEvents()
+        close_preview(app_v2, dialog);app_v2.processEvents()
         wait(app_v2,lambda:not shell.bridge.callbacks)
 
     try:
@@ -461,7 +506,7 @@ def test_all_tutorial_steps_align_with_real_controls_and_keep_business_read_only
         if manager.overlay is not None:manager.overlay.skip_button.click()
         for dialog in reversed(dialogs):
             if isinstance(dialog,PlanDialog):dialog.dirty=False
-            dialog.close();dialog.deleteLater()
+            close_preview(app_v2, dialog);dialog.deleteLater()
         report_path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         app_v2.sendPostedEvents(None,QEvent.Type.DeferredDelete);app_v2.processEvents()
         apply_appearance(app_v2,old_appearance)
@@ -555,7 +600,7 @@ def test_populated_tutorial_targets_are_real_controls_and_tours_do_not_save(app_
                 part for field in editor.fields.values()
                 for part in (getattr(field,'enabled',None),getattr(field,'editor',None)) if part is not None]})
             assert form.title_edit.text()=='虚构的未保存'+kind
-            form.close();app_v2.processEvents()
+            close_preview(app_v2, form);app_v2.processEvents()
 
         bridge=ControlledBridge();chat=show_dialog(AssistanceDialog(bridge,shell,prompt='未发送的虚构草稿',auto_send=False))
         bridge.deliver('settings',{'settings':{'ai':{'enabled':False}}})
@@ -583,7 +628,7 @@ def test_populated_tutorial_targets_are_real_controls_and_tours_do_not_save(app_
         assert populated['passed'],json.dumps([record for record in records if not record['passed']],ensure_ascii=False,indent=2)
     finally:
         if manager.overlay is not None:manager.overlay.skip_button.click()
-        for dialog in reversed(dialogs):dialog.close();dialog.deleteLater()
+        for dialog in reversed(dialogs):close_preview(app_v2, dialog);dialog.deleteLater()
         previous_report=json.loads(report_path.read_text('utf-8')) if report_path.exists() else {'theme':theme,'font_size':size}
         previous_report['populated']=populated
         report_path.write_text(json.dumps(previous_report,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -646,7 +691,7 @@ def test_text_is_complete_across_main_pages_and_secondary_windows(app_v2, shell,
         apply_appearance(app_v2, {**old_appearance, 'theme': theme, 'font_size': size})
         host.resize(width, height)
         # Process asynchronous polish, height-for-width and scrollbar changes.
-        QTest.qWait(180); app_v2.processEvents()
+        settle_visuals(app_v2, host)
         wait(app_v2, lambda: not shell.bridge.callbacks and not shell.dashboard_page._layout_pending)
         issues = _text_layout_issues(host)
         for scroll in host.findChildren(QScrollArea):
@@ -670,7 +715,7 @@ def test_text_is_complete_across_main_pages_and_secondary_windows(app_v2, shell,
         dialog.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
         for width in (940, 620):
             inspect(dialog, area, width, 720)
-        dialog.close(); app_v2.processEvents()
+        close_preview(app_v2, dialog); app_v2.processEvents()
 
     try:
         for section in ('dashboard', 'today', 'tasks', 'projects', 'reviews'):
@@ -678,6 +723,12 @@ def test_text_is_complete_across_main_pages_and_secondary_windows(app_v2, shell,
             wait(app_v2, lambda: not shell.bridge.callbacks and not shell.page_transition.is_active())
             for width in (1700, 1100):
                 inspect(shell, section, width, 950)
+        shell.navigate('tasks'); shell.tasks_page.open_library()
+        wait(app_v2, lambda: not shell.bridge.callbacks)
+        assert shell.tasks_page.stack.currentIndex() == 1
+        for width in (1700, 1100): inspect(shell, 'task-library', width, 950)
+        shell.tasks_page.back_button.click()
+        assert shell.tasks_page.stack.currentIndex() == 0
         for entity in (project, course):
             shell.navigate('projects'); shell.workspace_page.open_object(entity)
             wait(app_v2, lambda: not shell.bridge.callbacks)
@@ -690,6 +741,36 @@ def test_text_is_complete_across_main_pages_and_secondary_windows(app_v2, shell,
         inspect(shell, 'weekly-review', 1100, 950)
         for kind in ('task', 'project', 'course', 'activity', 'domain', 'goal'):
             dialog_check(EntityForm(shell.bridge, shell.capabilities, shell, default_type=kind), 'new-' + kind)
+        # The task's property chips must expose optional editors without a gate.
+        task_form = EntityForm(shell.bridge, shell.capabilities, shell, entity=task)
+        dialogs.append(task_form); task_form.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
+        for button in task_form.task_properties.findChildren(QPushButton): button.click()
+        for width in (940, 620): inspect(task_form, 'task-properties', width, 720)
+        close_preview(app_v2, task_form)
+        from management.gui_task_batch import TaskBatchDialog
+        batch = TaskBatchDialog(shell.bridge, shell)
+        dialogs.append(batch); batch.open()
+        for width in (940, 620): inspect(batch, 'batch-input', width, 720)
+        batch.paste.setPlainText('整理较长的虚构任务说明并核对截止信息\n准备另一项虚构展示任务')
+        batch.preview_button.click(); wait(app_v2, lambda: not shell.bridge.callbacks and not batch.previewing)
+        assert batch.step == 'review' and batch.table.isHidden()
+        for width in (940, 620): inspect(batch, 'batch-review', width, 720)
+        close_preview(app_v2, batch)
+        split = TaskBatchDialog(shell.bridge, shell, source=task)
+        dialogs.append(split); split.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
+        assert split.mode == 'split' and split.table.isHidden()
+        for width in (940, 620): inspect(split, 'split-task', width, 720)
+        close_preview(app_v2, split)
+        from management.gui_workflows import SettingsDialog, HabitsDialog
+        settings = SettingsDialog(shell.bridge, shell.capabilities, shell.data_dir, shell)
+        dialogs.append(settings); settings.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
+        for index, name in enumerate(('display', 'timetable', 'assistance', 'advanced')):
+            settings.tabs.setCurrentIndex(index)
+            for width in (940, 620): inspect(settings, 'settings-' + name, width, 720)
+        close_preview(app_v2, settings)
+        dialog_check(HabitsDialog(shell.bridge, shell.capabilities, shell), 'habits')
+        from management.gui_today import DayTaskPicker
+        dialog_check(DayTaskPicker(shell.bridge, day, shell), 'existing-task-picker')
         dialog_check(TaskDetailDialog(shell.bridge, task, shell), 'task-detail')
         dialog_check(SearchDialog(shell.bridge, shell, lambda *_: None, initial_text='演示'), 'search')
         dialog_check(UpdateDialog(shell), 'version')
@@ -718,7 +799,7 @@ def test_text_is_complete_across_main_pages_and_secondary_windows(app_v2, shell,
         if shell.onboarding.overlay is not None:
             shell.onboarding.stop()
         for dialog in dialogs:
-            dialog.close(); dialog.deleteLater()
+            close_preview(app_v2, dialog); dialog.deleteLater()
         (report / f'text-layout-{theme}.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
         app_v2.sendPostedEvents(None, QEvent.Type.DeferredDelete); app_v2.processEvents()
         shell.apply_visual_style(old_style)
@@ -764,17 +845,19 @@ def test_manual_workspace_has_no_assistant_requirement_and_preserves_active_jobs
     shell.tasks_page.quick_input.setText('合成：先记录，再安排')
     shell.tasks_page.quick_button.click()
     wait(app_v2, lambda: not shell.bridge.callbacks)
-    assert shell.tasks_page.items.topLevelItemCount() == 1
-    shell.tasks_page.plan_button.click()
+    assert shell.tasks_page.stack.currentIndex() == 0
+    assert len(shell.tasks_page.recent_tasks) == 1 and shell.tasks_page.result is None
+    task_id = shell.tasks_page.recent_tasks[0]['id']
+    shell.tasks_page.recent_plan_buttons[task_id].click()
     wait(app_v2, lambda: not shell.bridge.callbacks)
-    assert not shell.tasks_page.plan_button.isEnabled()
-    assert shell.tasks_page.selected()['in_plan']
+    assert not shell.tasks_page.recent_plan_buttons[task_id].isEnabled()
+    assert shell.tasks_page.recent_tasks[0]['in_plan']
     assert client.query('jobs')['total'] == 0
     folder = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(shell.data_dir)))
     try:
         for theme, size in [('light', 13), ('dark', 20)]:
             apply_appearance(app_v2, {'theme': theme, 'font_size': size})
-            app_v2.processEvents()
+            settle_visuals(app_v2, shell)
             assert shell.grab().save(str(folder / f'manual-tasks-{theme}.png'))
     finally:
         apply_appearance(app_v2, shell._saved_appearance)
@@ -1080,14 +1163,13 @@ def test_today_warning_pagination_can_reach_all_returned_risks(app_v2):
     page = TodayPage(bridge)
     page.show()
     page.refresh()
-    assert len(page.warning_result["items"]) == 3
+    assert len(page.warning_result["items"]) == 5
     button = next(button for button in page.findChildren(QPushButton) if button.text() == "更多警戒")
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-    assert page.warning_offset == 3
-    page.set_warning_page(page.warning_result["next_offset"])
-    assert page.warning_offset == 6
-    assert [item["title"] for item in page.warning_result["items"]] == ["合成警戒 6", "合成警戒 7"]
-    assert bridge.offsets == [0, 3, 6]
+    assert page.warning_offset == 5
+    assert [item["title"] for item in page.warning_result["items"]] == ["合成警戒 5", "合成警戒 6", "合成警戒 7"]
+    assert page.warning_result["next_offset"] is None
+    assert bridge.offsets == [0, 5]
     page.close()
 
 
@@ -1122,7 +1204,7 @@ def test_habits_guide_and_chart_preferences_apply_through_real_service(app_v2, s
         assert shell.review_page.daily_chart.chart_style == 'ring'
         assert shell.review_page.week_days.layout_style == 'tiles'
         assert client.query('settings')['settings']['charts']['weekly_style'] == 'tiles'
-        settings.close()
+        close_preview(app_v2, settings)
         shell.navigate('dashboard')
         wait(app_v2, lambda: not shell.bridge.callbacks)
         folder = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(tmp_path)))
@@ -1142,16 +1224,17 @@ def test_habits_guide_and_chart_preferences_apply_through_real_service(app_v2, s
             assert page.horizontalScrollBar().maximum() == 0
             assert not shell.habits_button.visibleRegion().isEmpty()
             assert not shell.search_input.visibleRegion().isEmpty()
+            settle_visuals(app_v2, shell)
             assert shell.grab().save(str(folder / ('custom-charts-' + theme + '.png')))
             settings.open()
             settings.tabs.setCurrentIndex(settings._provider_tab)
             app_v2.processEvents()
             assert settings.grab().save(str(folder / ('assistant-settings-' + theme + '.png')))
-            settings.close()
+            close_preview(app_v2, settings)
     finally:
         shell.onboarding.stop()
         if settings:
-            settings.close(); settings.deleteLater()
+            close_preview(app_v2, settings); settings.deleteLater()
         habits.close(); habits.deleteLater()
         apply_appearance(app_v2, DEFAULT_APPEARANCE)
         app_v2.processEvents()
@@ -1177,7 +1260,7 @@ def test_accent_settings_save_via_service_and_reopen(app_v2,shell,tmp_path):
         assert saved['theme']=='dark' and saved['accent']=='violet'
         assert current_appearance()['accent']=='violet'
         assert color('primary')==palette_tokens('dark','violet')['primary']
-        settings.close();settings.deleteLater();app_v2.processEvents()
+        close_preview(app_v2, settings);settings.deleteLater();app_v2.processEvents()
         settings=SettingsDialog(shell.bridge,shell.capabilities,shell.data_dir,shell)
         settings.open();wait(app_v2,lambda:not shell.bridge.callbacks)
         assert settings.accent_picker.currentData()=='violet'
@@ -1187,7 +1270,7 @@ def test_accent_settings_save_via_service_and_reopen(app_v2,shell,tmp_path):
         settings.repaint()
         assert settings.grab().save(str(report/'settings-saved-violet.png'))
     finally:
-        settings.close();settings.deleteLater();app_v2.processEvents()
+        close_preview(app_v2, settings);settings.deleteLater();app_v2.processEvents()
         apply_appearance(app_v2,previous)
 
 
@@ -1262,11 +1345,14 @@ def test_real_navigation_renders_distinct_entrance_frames_after_layout_and_setti
 
         early_change, early_mean = frame_difference(early, final)
         middle_change, middle_mean = frame_difference(middle, final)
-        assert early_change > .04 and early_mean > 1.0, (early_change, early_mean)
-        assert middle_change > .02 and middle_mean > .5, (middle_change, middle_mean)
-        assert early != middle != final
         for name, frame in (('early', early), ('middle', middle), ('final', final)):
             assert frame.save(str(report / f'navigation-entrance-{name}.png'))
+        assert early_change > .04 and early_mean > 1.0, (early_change, early_mean)
+        # The task entry page now intentionally has much less content than the
+        # former full library. Require visible pixel change and progression
+        # towards the actual final frame, not the old page's occupied area.
+        assert middle_change > .01 and .5 < middle_mean < early_mean, (early_change, early_mean, middle_change, middle_mean)
+        assert early != middle != final
         try:
             from PIL import Image
         except ImportError:
@@ -1438,7 +1524,7 @@ def test_real_tab_changes_render_entrance_frames_without_losing_unsaved_work(app
         assert (after['epoch'], after['revision']) == (before['epoch'], before['revision'])
     finally:
         if settings is not None:
-            settings.close()
+            close_preview(app_v2, settings)
             settings.deleteLater()
         shell.review_page._choices.clear()
         shell.review_page._update_actions()
@@ -1447,3 +1533,191 @@ def test_real_tab_changes_render_entrance_frames_without_losing_unsaved_work(app
         shell.apply_visual_style(previous_style)
         apply_appearance(app_v2, previous_appearance)
         shell.onboarding.set_automatic(automatic)
+
+
+def test_stage_a_batch_and_split_workflow_uses_second_level_library(app_v2, shell, tmp_path):
+    client = Client(shell.data_dir, autostart=False)
+    shell.onboarding.set_automatic(False); shell.navigate('tasks')
+    page = shell.tasks_page
+    assert page.stack.currentIndex() == 0 and not page.items.isVisible()
+    page.batch_button.click(); batch = page.dialogs[-1]
+    batch.paste.setPlainText('合成：准备活动\n合成：核对资料\n合成：联系场地')
+    batch.preview_button.click(); wait(app_v2, lambda: not shell.bridge.callbacks and not batch.previewing)
+    assert batch.step == 'review' and len(batch.cards) == 3 and not batch.table.isVisible()
+    assert batch.save_button.isEnabled() and '尚未保存' in batch.status.text()
+    before = client.state(); batch.save_button.click()
+    wait(app_v2, lambda: batch.saved and not shell.bridge.callbacks)
+    assert len(batch.saved_ids) == 3 and client.query('list', type='plan')['total'] == 0
+    assert client.state()['revision'] > before['revision']
+    batch.view_batch_button.click(); wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert page.stack.currentIndex() == 1 and page.result['total'] == 3
+    assert {page.items.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)['id'] for i in range(3)} == set(batch.saved_ids)
+    close_preview(app_v2, batch)
+    source = page.selected(); page.split_button.click(); split = page.dialogs[-1]
+    wait(app_v2, lambda: not shell.bridge.callbacks and not split.source_loading)
+    assert split.mode == 'split' and len(split.cards) == 2 and split.table.isHidden()
+    split.cards[0].title.setText('合成：确认场地')
+    split.cards[1].title.setText('合成：准备材料')
+    split.cards[0].gate.setText('取得场地确认')
+    split.cards[1].gate.setText('材料清单齐全')
+    split.relation.setCurrentIndex(1)
+    split.preview_button.click(); wait(app_v2, lambda: not shell.bridge.callbacks and not split.previewing)
+    assert split.save_button.isEnabled() and '前后依赖' in split.sequence_hint.text()
+    split.save_button.click(); wait(app_v2, lambda: split.saved and not shell.bridge.callbacks)
+    children = [client.query('get', id=identifier)['entity'] for identifier in split.saved_ids]
+    assert len(children) == 2 and all(child['parent_id'] == source['id'] for child in children)
+    assert client.query('get', id=source['id'])['entity']['status'] != 'done'
+    assert client.query('list', type='plan')['total'] == 0
+    close_preview(app_v2, split)
+    saved_scope = list(page.task_ids); selected = page.selected()['id']
+    page.back_button.click(); assert page.stack.currentIndex() == 0
+    page.library_button.click()
+    assert page.task_ids == saved_scope and page.selected()['id'] == selected
+    shell.navigate('dashboard'); shell.navigate('tasks')
+    assert page.stack.currentIndex() == 0
+
+
+def test_stage_a_today_default_warning_columns_and_existing_task_picker(app_v2, shell, tmp_path):
+    from management.gui_theme import current_appearance, apply_appearance
+    client = Client(shell.data_dir, autostart=False)
+    day = QDate.currentDate().toString('yyyy-MM-dd')
+    target = create(client, 'task', '合成：从已有任务加入今天')
+    for index in range(8): create(client, 'task', f'合成：今天到期 {index}', {'due_date':day})
+    create(client, 'rule', '合成：到期提醒', {'rule_kind':'warning','days_before':3})
+    shell.onboarding.set_automatic(False); shell.poll.stop()
+    before = client.state(); old = current_appearance()
+    try:
+        apply_appearance(app_v2, {**old, 'font_size':13}); shell.resize(1800, 1000)
+        shell.navigate('today'); wait(app_v2, lambda: not shell.bridge.callbacks)
+        page = shell.today_page; settle_visuals(app_v2, shell)
+        assert not page.attention_box.isHidden() and page.warning_category.currentData() == 'all'
+        assert page.warning_result['total'] >= 8 and len(page.warning_result['items']) == 5
+        assert page._wide_columns
+        left = page.attention_box.mapTo(page.scroll.widget(), QPoint())
+        right = page.action_column.mapTo(page.scroll.widget(), QPoint())
+        assert left.x() < right.x() and abs(left.y() - right.y()) <= 2
+        shell.resize(1000, 900); settle_visuals(app_v2, shell)
+        assert not page._wide_columns and not page.attention_box.isHidden()
+        assert page.action_column.mapTo(page.scroll.widget(), QPoint()).y() > page.attention_box.mapTo(page.scroll.widget(), QPoint()).y()
+        page.pick_button.click(); picker = page.dialogs[-1]
+        wait(app_v2, lambda: not shell.bridge.callbacks)
+        choices = [picker.items.item(i) for i in range(picker.items.count())]
+        found = next(item for item in choices if item.data(Qt.ItemDataRole.UserRole)['id'] == target['id'])
+        picker.items.setCurrentItem(found)
+        picker.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+        wait(app_v2, lambda: not shell.bridge.callbacks and not page.join_pending)
+        plan = client.query('task_pool', date=day)['plan']
+        assert plan and client.query('get', id=plan['id'])['entity']['data']['blocks'][0]['target_id'] == target['id']
+        assert client.query('get', id=target['id'])['entity']['data'].get('due_date') is None
+        assert client.query('list', type='task')['total'] == 9
+    finally:
+        apply_appearance(app_v2, old)
+
+
+def test_stage_a_edit_task_chips_and_real_unsaved_close_choices(app_v2, shell, tmp_path):
+    from management.gui_forms import EntityForm
+    from management.gui_task_fields import TaskFieldEditor
+    from management.gui_workflows import SettingsDialog
+    client = Client(shell.data_dir, autostart=False)
+    shell.onboarding.set_automatic(False)
+    task = create(client, 'task', '合成：编辑属性', {'due_date':'2030-01-12','estimated_minutes':25,'completion_gate':'明确完成条件'})
+    # The task was created through an external client; first refresh the GUI's
+    # revision as normal navigation would. This case tests property clearing,
+    # while stale-revision conflict protection is exercised separately.
+    shell.refresh(); wait(app_v2, lambda: not shell.bridge.callbacks)
+    before = client.state(); form = EntityForm(shell.bridge, shell.capabilities, shell, entity=task)
+    settings = None
+    def choose(dialog, text):
+        clicked = []
+        def respond():
+            box = next(box for box in app_v2.topLevelWidgets() if isinstance(box, QMessageBox) and box.isVisible())
+            button = next(button for button in box.buttons() if text in button.text())
+            clicked.append(button.text()); button.click()
+        QTimer.singleShot(0, respond); dialog.close(); app_v2.processEvents()
+        assert clicked
+    try:
+        form.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
+        assert isinstance(form.fields['due_date'], TaskFieldEditor)
+        assert form.fields['due_date'].enabled.isHidden() and form.fields['estimated_minutes'].enabled.isHidden()
+        for button in form.task_properties.findChildren(QPushButton): button.click()
+        form.fields['due_date'].clear_button.click(); form.fields['estimated_minutes'].clear_button.click()
+        assert form.fields['due_date'].value() is None and form.fields['estimated_minutes'].value() is None
+        assert any('截止日期：未设置' in b.text() for b in form.task_properties.findChildren(QPushButton))
+        assert any('预计用时：未估计' in b.text() for b in form.task_properties.findChildren(QPushButton))
+        # Native standard-button captions depend on Qt locale; choose by identity.
+        kept = []
+        def cancel_form():
+            box = next(box for box in app_v2.topLevelWidgets() if isinstance(box, QMessageBox) and box.isVisible())
+            kept.append(True); box.button(QMessageBox.StandardButton.Cancel).click()
+        QTimer.singleShot(0, cancel_form); QTest.keyClick(form, Qt.Key.Key_Escape)
+        assert kept and form.isVisible() and form.fields['due_date'].value() is None
+        assert client.state()['revision'] == before['revision']
+        form.save(); wait(app_v2, lambda: not shell.bridge.callbacks and not form.saving)
+        assert not form.isVisible(), form.error_label.text()
+        saved = client.query('get', id=task['id'])['entity']
+        assert saved['data'].get('due_date') is None and saved['data'].get('estimated_minutes') is None
+        assert saved['data']['completion_gate'] == '明确完成条件'
+        settings = SettingsDialog(shell.bridge, shell.capabilities, shell.data_dir, shell)
+        settings.open(); wait(app_v2, lambda: not shell.bridge.callbacks)
+        settings.font_size.setValue(settings.font_size.value() + 1)
+        settings_before = client.state(); choose(settings, '继续编辑')
+        assert settings.isVisible() and settings.display_dirty
+        choose(settings, '放弃未保存修改')
+        assert not settings.isVisible() and client.state()['revision'] == settings_before['revision']
+    finally:
+        close_preview(app_v2, form); form.deleteLater()
+        if settings: close_preview(app_v2, settings); settings.deleteLater()
+
+
+@pytest.mark.parametrize('scenario', ['dashboard-bar', 'dashboard-ring', 'owner-bar', 'weekly-columns', 'weekly-rows', 'weekly-tiles'])
+def test_real_progress_styles_fill_from_empty_with_distinct_middle_frame(app_v2, shell, tmp_path, monkeypatch, scenario):
+    from PySide6.QtCore import QAbstractAnimation
+    from management import gui_progress
+    from management.gui_charts import CoverageBar, CoverageRing, VerticalCoverageBar
+    from management.gui_progress import AnimatedProgressBar
+    monkeypatch.setattr(gui_progress, 'reduce_motion', lambda: False)
+    client = Client(shell.data_dir, autostart=False)
+    shell.onboarding.set_automatic(False); shell.poll.stop(); shell.navigate('tasks')
+    day = QDate.currentDate().toString('yyyy-MM-dd')
+    owner = create(client, 'project', '合成：渐变进度验收')
+    tasks = [create(client, 'task', f'合成：进度事项 {i}', parent_id=owner['id']) for i in range(4)]
+    client.command('create_plan', {'date':day,'mode':'no_precise_time','blocks':[{'target_id':task['id']} for task in tasks]})
+    client.command('set_task_completion', {'target_id':tasks[0]['id'],'target_version':tasks[0]['version'],'business_date':day,'result':'done'})
+    style = scenario.split('-', 1)[1]
+    charts = {'dashboard_today_style':'ring' if scenario == 'dashboard-ring' else 'bar'}
+    if scenario.startswith('weekly-'): charts['weekly_style'] = style
+    client.command('settings', {'settings':{'charts':charts}})
+    shell.load_display_preferences(); wait(app_v2, lambda: not shell.bridge.callbacks)
+    before = client.state(); report = Path(os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR', str(tmp_path)))
+    if scenario.startswith('weekly-'):
+        shell.navigate('reviews'); shell.review_page.tabs.setCurrentIndex(1)
+        host = shell.review_page.week_days
+        kind = {'columns':VerticalCoverageBar,'rows':CoverageBar,'tiles':CoverageRing}[style]
+    else:
+        shell.navigate('dashboard'); host = shell.dashboard_page
+        kind = AnimatedProgressBar if scenario == 'owner-bar' else CoverageRing if style == 'ring' else CoverageBar
+    frames = {}; chosen = []
+    def capture_frame():
+        widgets = [w for w in host.findChildren(kind) if w.isVisibleTo(host) and w.reveal.ready]
+        for widget in widgets:
+            reveal = widget.reveal
+            if not chosen and .01 <= reveal.fraction <= .65:
+                chosen.append(widget); frames['early'] = widget.grab().toImage()
+                frames['early_fraction'] = reveal.fraction
+            if chosen and widget is chosen[0] and frames['early_fraction'] + .1 < reveal.fraction < .97:
+                frames['middle'] = widget.grab().toImage(); return True
+        return False
+    wait(app_v2, capture_frame)
+    widget = chosen[0]; business_value = widget.value() if isinstance(widget, AnimatedProgressBar) else getattr(widget, 'total', None)
+    wait(app_v2, lambda: widget.reveal.fraction == 1 and widget.reveal.animation.state() == QAbstractAnimation.State.Stopped)
+    frames['final'] = widget.grab().toImage()
+    assert frames['early'] != frames['middle'] != frames['final']
+    assert (widget.value() if isinstance(widget, AnimatedProgressBar) else getattr(widget, 'total', None)) == business_value
+    for name in ('early','middle','final'):
+        assert frames[name].save(str(report / f'progress-{scenario}-{name}.png'))
+    assert client.state()['revision'] == before['revision'] and client.state()['epoch'] == before['epoch']
+    # Re-reading the real service must not replay the entrance animation.
+    if scenario.startswith('weekly-'): shell.review_page.refresh()
+    else: shell.dashboard_page.refresh()
+    wait(app_v2, lambda: not shell.bridge.callbacks)
+    assert all(w.reveal.fraction == 1 for w in host.findChildren(kind) if w.isVisibleTo(host) and w.reveal.ready)

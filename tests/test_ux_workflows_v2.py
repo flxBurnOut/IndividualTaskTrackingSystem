@@ -241,7 +241,7 @@ def test_simplified_form_edit_preserves_hidden_fields_status_and_unlisted_data(a
     dialog=EntityForm(bridge,core.query('capabilities'),entity=entity)
     try:
         assert not dialog.form.isRowVisible(dialog.status_box)
-        assert not dialog.field_layout.isRowVisible(dialog.fields['priority'])
+        assert dialog.field_layout.isRowVisible(dialog.fields['priority'])
         dialog.title_edit.setText('Renamed without data loss')
         dialog.more_fields.click()
         dialog.more_fields.click()
@@ -254,7 +254,7 @@ def test_simplified_form_edit_preserves_hidden_fields_status_and_unlisted_data(a
         for key,value in entity['data'].items():
             assert updated['data'][key]==value
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def test_new_simple_form_does_not_invent_unknown_date_or_minutes(app,tmp_path):
@@ -271,7 +271,7 @@ def test_new_simple_form_does_not_invent_unknown_date_or_minutes(app,tmp_path):
         assert 'due_date' not in entity['data']
         assert entity['status']=='active'
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 
@@ -313,7 +313,7 @@ def test_disabled_extension_field_survives_simplified_builtin_edit(app,tmp_path)
         assert result['data']['external_score']==7
         assert result['data']['notes']=='Confirmed source'
     finally:
-        dialog.close()
+        dialog._discard_close=True;dialog.saving=False;dialog._uncertain=False;dialog.close()
 
 
 def conversation_result(job=None,state='available',active=None,text='Synthetic reply'):

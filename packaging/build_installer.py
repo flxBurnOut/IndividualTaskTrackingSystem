@@ -21,6 +21,7 @@ import sys
 import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workflow import runtime_directory, version_directory
+from runtime_resources import ssl_policy_file, SSL_POLICY_MEMBER
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER_VERSION = "7.1.0"
@@ -83,6 +84,9 @@ def validate_package(package: Path, version: str) -> list[dict]:
     if package not in {folder, folder / 'app'}:
         raise ValueError("Installer input must be the version's app directory or a legacy runtime")
     required = (*EXES, "_internal/management/assets/app-icon.ico", "使用说明.txt", "详细使用说明.md")
+    policy = ssl_policy_file()
+    if policy is not None:
+        required += (SSL_POLICY_MEMBER,)
     for name in required:
         if not (package / name).is_file():
             raise ValueError(f"Missing release input: {name}")
@@ -97,7 +101,9 @@ def validate_package(package: Path, version: str) -> list[dict]:
             raise ValueError(f"Private/runtime data in installer input: {relative}")
         if not path.is_file():
             continue
-        if path.name.lower().startswith(".env") or re.search(r"\.(?:sqlite3?|db)(?:-|$)", path.name, re.I) or path.suffix.lower() in {".pem", ".key", ".pfx", ".p12"}:
+        runtime_policy = (policy is not None and relative.as_posix() == SSL_POLICY_MEMBER
+                          and path.read_bytes() == policy.read_bytes())
+        if path.name.lower().startswith(".env") or re.search(r"\.(?:sqlite3?|db)(?:-|$)", path.name, re.I) or (path.suffix.lower() in {".pem", ".key", ".pfx", ".p12"} and not runtime_policy):
             raise ValueError(f"Private/runtime file in installer input: {relative}")
         entries.append({"path": relative.as_posix(), "bytes": path.stat().st_size, "sha256": digest(path)})
     for name in EXES:

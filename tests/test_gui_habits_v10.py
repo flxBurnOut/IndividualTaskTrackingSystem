@@ -13,6 +13,7 @@ from management import habits
 from management.gui_habits import HabitsPanel,HabitEditor
 from management.gui_today import TodayPage
 from management.gui_workflows import HabitsDialog, SettingsDialog
+from test_appearance_v5 import dispose_settings
 from test_ux_workflows_v2 import QueuedCoreBridge,ControlledBridge,wait
 from test_plan_assistance_v8 import cmd
 from test_recurring_v4 import event
@@ -193,7 +194,7 @@ def test_habits_is_no_longer_a_settings_tab(app, tmp_path):
         wait(app, lambda: bridge.pending == 0)
         assert '日常习惯' not in [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
     finally:
-        dialog.close(); dialog.deleteLater(); app.processEvents()
+        dispose_settings(app,dialog)
 
 
 def test_independent_reminder_editors_follow_large_font(app, tmp_path):

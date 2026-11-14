@@ -25,6 +25,12 @@ class LocalClient:
         return self.core.command(name, payload, **envelope)
 
 
+@pytest.fixture(autouse=True)
+def beta_channel(monkeypatch):
+    from management import data_space
+    monkeypatch.setattr(data_space, 'CHANNEL', 'beta')
+
+
 @pytest.fixture
 def client(tmp_path):
     return LocalClient(Core(tmp_path / 'demo'))

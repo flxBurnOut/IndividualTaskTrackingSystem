@@ -433,7 +433,7 @@ class ReviewPage(QWidget):
         self.confirm_actions = ActionRow(self.daily_body)
         self.reload_button = QPushButton('重新读取此日计划')
         self.reload_button.clicked.connect(lambda: self.reload_plan())
-        self.confirm_button = QPushButton('确认所选结果')
+        self.confirm_button = QPushButton('保存所选结果')
         self.confirm_button.setObjectName('Primary')
         self.confirm_button.clicked.connect(self.submit)
         self.confirm_actions.addWidget(self.confirm_button)
@@ -807,7 +807,7 @@ class ReviewPage(QWidget):
         if other_days:
             text += f' 另有 {other_days} 天的选择尚未提交，切回该日期可继续。'
         self.pending_label.setText(text)
-        self.confirm_button.setText('正在确认…' if self._submitting_date else '确认所选结果')
+        self.confirm_button.setText('正在保存…' if self._submitting_date else f'保存所选 {len(current)} 项' if current else '保存所选结果')
         self.confirm_button.setEnabled(bool(current) and self._submitting_date is None and self._date not in self._conflicts)
         self.reload_button.setVisible(self._date in self._conflicts)
         self.reload_button.setEnabled(self._submitting_date is None)

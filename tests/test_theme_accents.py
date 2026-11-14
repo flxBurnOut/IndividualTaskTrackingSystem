@@ -1,15 +1,20 @@
 """Portable accent preferences and their live native rendering contracts."""
+import copy
 import os
+import math
 import uuid
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest
-from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QVBoxLayout
+from PySide6.QtCore import QEvent, QObject
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout
 
 from management.appearance import ACCENT_LABELS, DEFAULT_APPEARANCE, normalize_appearance
 from management.core import Core
+from management.gui_charts import CoverageBar, CoverageRing, VerticalCoverageBar
+from management.gui_progress import gradient_colors
 from management.gui_materials import AppCanvas
 from management.gui_theme import (apply_appearance, color,
                                   current_appearance, stylesheet)
@@ -68,9 +73,9 @@ def contrast(first, second):
 
 
 @pytest.mark.parametrize('theme', ['light', 'dark'])
-def test_accent_text_contrast_and_result_semantics(theme):
+def test_accent_text_and_chart_contrast_with_distinct_result_shades(theme):
     baseline = palette_tokens(theme)
-    for accent in ACCENT_LABELS.keys() - {'default'}:
+    for accent in ACCENT_LABELS:
         tokens = palette_tokens(theme, accent)
         # These pairs are actually used by primary/calendar buttons, selected
         # fields/navigation and selected tabs/text links, including hover.
@@ -78,12 +83,25 @@ def test_accent_text_contrast_and_result_semantics(theme):
             ('primary_text', 'primary'), ('primary_text', 'primary_hover'),
             ('selection_text', 'selection'), ('selection_text', 'surface'),
             ('primary', 'surface'), ('primary', 'window'),
+            ('warning_text', 'warning_bg'),
         ):
             assert contrast(tokens[foreground], tokens[background]) >= 4.5, (
                 theme, accent, foreground, background)
-        for role in ('done', 'incomplete', 'unreported', 'other_reported', 'danger',
-                     'danger_bg', 'danger_border', 'warning_bg', 'warning_text',
-                     'warning_border', 'chart_on_color', 'chart_on_unknown'):
+        assert tokens['warning_text'] == tokens['primary']
+        assert tokens['warning_bg'] == tokens['selection']
+        assert tokens['warning_border'] == tokens['focus_soft']
+        assert tokens['done'] == tokens['primary']
+        assert tokens['chart_on_color'] == tokens['primary_text']
+        chart_roles = ('done', 'incomplete', 'other_reported', 'chart_absent')
+        assert len({tokens[role] for role in chart_roles}) == len(chart_roles)
+        hue = QColor(tokens['primary']).hsvHueF()
+        for role in chart_roles:
+            assert contrast(tokens['chart_on_color'], tokens[role]) >= 4.5, (theme, accent, role)
+            difference = abs(QColor(tokens[role]).hsvHueF() - hue)
+            assert min(difference, 1 - difference) < .025, (theme, accent, role)
+        # Unknown coverage remains neutral. Destructive actions and errors
+        # retain their separate color even though review selections use accent.
+        for role in ('unreported', 'danger', 'danger_bg', 'danger_border', 'chart_on_unknown'):
             assert tokens[role] == baseline[role], (theme, accent, role)
 
 
@@ -130,6 +148,152 @@ def test_accent_repaints_open_controls_without_losing_edits(accent_app, theme):
         assert host.backdrop().toImage() != old_image
         assert host.backdrop().cacheKey() == host.backdrop().cacheKey()
         assert color('primary') in stylesheet({**config, 'accent': 'violet'})
+    finally:
+        host.close()
+        host.deleteLater()
+        accent_app.processEvents()
+
+
+class PaintCounter(QObject):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.paints = {}
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Paint:
+            self.paints[id(watched)] = self.paints.get(id(watched), 0) + 1
+        return False
+
+
+def painted_pixel(widget, x, y):
+    pixmap = widget.grab()
+    scale = pixmap.devicePixelRatio()
+    return pixmap.toImage().pixelColor(round(x * scale), round(y * scale)).name()
+
+
+def painted_text_pixels(widget, foreground):
+    """Read checked-state text from the paint, not the unqualified QPalette.
+
+    The inset excludes rounded borders/focus outlines. Near-solid glyph pixels
+    allow antialiasing while rejecting the contrasting button background.
+    """
+    pixmap = widget.grab()
+    image = pixmap.toImage()
+    scale = pixmap.devicePixelRatio()
+    expected = QColor(foreground)
+    target = (expected.red(), expected.green(), expected.blue())
+    count = 0
+    for y in range(round(6 * scale), image.height() - round(6 * scale)):
+        for x in range(round(12 * scale), image.width() - round(12 * scale)):
+            actual = image.pixelColor(x, y)
+            if max(abs(channel - wanted) for channel, wanted in
+                   zip((actual.red(), actual.green(), actual.blue()), target)) <= 24:
+                count += 1
+                if count >= 3:
+                    return count
+    return count
+
+
+def assert_gradient_pixel(actual, role):
+    """A real painted sample must fall inside the selected role's small gradient."""
+    pixel = QColor(actual)
+    endpoints = gradient_colors(role)
+    for channel in ('red', 'green', 'blue'):
+        low, high = sorted(getattr(endpoint, channel)() for endpoint in endpoints)
+        assert low - 2 <= getattr(pixel, channel)() <= high + 2, (actual, role, low, high)
+
+
+@pytest.mark.parametrize('theme', ['light', 'dark'])
+def test_open_warning_review_choices_and_charts_follow_every_accent(accent_app, theme):
+    config = {**DEFAULT_APPEARANCE, 'theme': theme, 'accent': 'blue'}
+    apply_appearance(accent_app, config)
+    host = AppCanvas()
+    host.resize(760, 650)
+    layout = QVBoxLayout(host)
+    labels = []
+    for name in ('AttentionTitle', 'CurrentWarningTitle', 'Notice'):
+        label = QLabel('Upcoming synthetic item')
+        label.setObjectName(name)
+        layout.addWidget(label)
+        labels.append(label)
+    choices = QHBoxLayout()
+    layout.addLayout(choices)
+    buttons = []
+    for result in ('done', 'incomplete', 'attended', 'missed_needs_catchup', 'absent'):
+        button = QPushButton(result)
+        button.setObjectName('ReviewChoice')
+        button.setProperty('result', result)
+        button.setCheckable(True)
+        button.setChecked(True)
+        choices.addWidget(button)
+        buttons.append(button)
+    summary = {
+        'total': 5, 'done': 1, 'incomplete': 1, 'other_reported': 2, 'unreported': 1,
+        'breakdown': [
+            {'key': result, 'kind': kind, 'result': result, 'count': 1}
+            for kind, result in (
+                ('task', 'done'), ('course_attendance', 'missed_needs_catchup'),
+                ('course_attendance', 'attended'), ('course_attendance', 'absent'),
+                ('task', 'unreported'),
+            )
+        ],
+    }
+    bar = CoverageBar()
+    bar.set_summary(summary)
+    layout.addWidget(bar)
+    ring = CoverageRing()
+    ring.set_summary(summary)
+    layout.addWidget(ring)
+    column = VerticalCoverageBar({'date': '2026-10-08', 'can_review': True, 'summary': summary})
+    layout.addWidget(column)
+    charts = (bar, ring, column)
+    descriptions = [chart.accessibleName() for chart in charts]
+    segments = [copy.deepcopy(chart.segments) for chart in charts]
+    counter = PaintCounter(host)
+    for chart in charts:
+        chart.installEventFilter(counter)
+    host.show()
+    try:
+        accent_app.processEvents()
+        for chart in charts:
+            chart.reveal.animation.setCurrentTime(chart.reveal.animation.duration())
+        # Start with a different accent so every iteration is a live change.
+        for accent in ('violet', 'rose', 'teal', 'blue', 'coral', 'default'):
+            previous_paints = dict(counter.paints)
+            apply_appearance(accent_app, {**config, 'accent': accent})
+            accent_app.processEvents()
+            accent_app.processEvents()
+            tokens = palette_tokens(theme, accent)
+            for label in labels:
+                assert label.palette().color(QPalette.ColorRole.WindowText).name() == tokens['primary']
+            for button in buttons:
+                assert button.isChecked(), (theme, accent, button.property('result'))
+                assert painted_pixel(button, 10, button.height() / 2) == tokens['primary']
+                assert painted_text_pixels(button, tokens['primary_text']) >= 3, (
+                    theme, accent, button.property('result'))
+            for index, chart in enumerate(charts):
+                # A grab itself forces a repaint; check the normal update first.
+                assert counter.paints[id(chart)] > previous_paints.get(id(chart), 0)
+                assert chart.accessibleName() == descriptions[index]
+                assert chart.segments == segments[index]
+            roles = ('done', 'incomplete', 'other_reported', 'chart_absent', 'unreported')
+            assert [row['color'] for row in bar.segments] == list(roles)
+            for index, role in enumerate(roles):
+                assert_gradient_pixel(painted_pixel(bar, bar.width() * (index + .5) / 5, bar.height() / 2), role)
+                left = painted_pixel(bar, bar.width() * (index + .15) / 5, bar.height() / 2)
+                right = painted_pixel(bar, bar.width() * (index + .85) / 5, bar.height() / 2)
+                assert_gradient_pixel(left, role)
+                assert_gradient_pixel(right, role)
+                assert left != right, (theme, accent, role, 'gradient was not painted')
+                rect = column.segment_rects()[index][1]
+                assert_gradient_pixel(painted_pixel(column, rect.left() + 3, rect.center().y()), role)
+                diameter = min(ring.width(), ring.height()) - 16
+                radius = (diameter - max(10, diameter * .15)) / 2
+                angle = math.radians(90 - 360 * (index + .5) / 5)
+                assert_gradient_pixel(painted_pixel(ring, ring.width() / 2 + radius * math.cos(angle),
+                                     ring.height() / 2 - radius * math.sin(angle)), role)
+        assert ring.summary == summary
+        assert column.day['summary'] == summary
     finally:
         host.close()
         host.deleteLater()

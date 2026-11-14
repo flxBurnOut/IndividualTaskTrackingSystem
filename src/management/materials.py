@@ -16,6 +16,33 @@ EXTRACTOR='material/1'
 TERMINAL={'complete','partial','unsupported','failed','paused'}
 
 
+def _read_failure(error):
+    if isinstance(error,FileNotFoundError):
+        return {'code':'source_missing','message':'原件或读取缓存不存在，已保留已有进度；请核对原件位置。',
+                'details':{'progress_preserved':True}}
+    if isinstance(error,PermissionError):
+        return {'code':'source_permission','message':'当前服务没有权限读取原件或缓存；请检查文件权限，已有进度已保留。',
+                'details':{'progress_preserved':True}}
+    return {'code':getattr(error,'code','source_parse'),'message':str(error)[:600],
+            'details':getattr(error,'details',{})}
+
+
+def _worker_failure(result):
+    failure=result.get('error')
+    if not isinstance(failure,dict):failure={}
+    allowed={'source_missing','source_permission','source_parse','NOT_A_FILE','UNSAFE_PATH',
+             'INVALID_HASH','HASH_MISMATCH','RESOURCE_LIMIT','DISK_RESERVE'}
+    code=failure.get('code')
+    code=code if isinstance(code,str) and code in allowed else 'source_parse'
+    message=failure.get('message')
+    if not isinstance(message,str) or not message:
+        warnings=result.get('warnings')
+        message='；'.join(str(value) for value in warnings) if isinstance(warnings,list) else '读取器未完成原件解析。'
+    details=failure.get('details')
+    if not isinstance(details,dict) or len(encode(details).encode('utf-8'))>2048:details={}
+    return BusinessError(code,message[:600],details)
+
+
 def material_key(sha,name,layout=None):
     return hashlib.sha256(encode([EXTRACTOR,sha,Path(name).suffix.lower(),layout]).encode()).hexdigest()
 
@@ -76,7 +103,7 @@ def extract_batch(core,key):
                         if not result_path.is_file() or result_path.stat().st_size>128*1024:
                             raise BusinessError('source_parse','读取器未返回有效的批次清单。')
                         result=json.loads(result_path.read_text('utf-8'))
-                        if not result.get('ok'):raise BusinessError('source_parse','；'.join(result.get('warnings',[]))[:500])
+                        if not result.get('ok'):raise _worker_failure(result)
                     finally:
                         if process.poll() is None:
                             try:
@@ -113,7 +140,7 @@ def extract_batch(core,key):
                     (encode(result['cursor']),status,result['units_done'],len(entries),encode(coverage),now(),key))
                 c.commit()
         except Exception as error:
-            failure={'code':getattr(error,'code','source_parse'),'message':str(error)[:600]}
+            failure=_read_failure(error)
             with core.store.lock,core.store.connect() as c:
                 limited=failure['code'] in {'source_memory','source_timeout','DISK_RESERVE'}
                 coverage=json.loads(state['coverage']);coverage['complete']=False;coverage['text_complete']=False;units=coverage.get('batch_units',40)
@@ -202,7 +229,16 @@ def _source_for_read(core,p):
         else:
             source=c.execute("""SELECT s.* FROM context_sources s JOIN material_catalog m ON m.key=s.material_key
                 WHERE s.operation_id=? AND m.status='pending' ORDER BY m.updated_at,s.entity_id LIMIT 1""",(op['id'],)).fetchone()
+        if source:_check_source_version(c,source['entity_id'],source['version'])
         c.commit();return dict(source) if source else None
+
+
+def _check_source_version(c,identifier,version):
+    current=c.execute('SELECT version,archived FROM entities WHERE id=?',(identifier,)).fetchone()
+    if not current or current['archived'] or current['version']!=version:
+        raise BusinessError('context_changed','原件版本已变化或已归档，请 refresh_context 后继续同一操作，不能把旧内容当作当前原件。',
+            {'source_id':identifier,'expected_version':version,'current_version':current['version'] if current else None,
+             'next_action':'refresh_context','progress_preserved':True})
 
 
 
@@ -212,7 +248,7 @@ def delivery_token(core,c,op,step):
 
 
 def next_step(core,p):
-    from .context_service import _operation,_budget,_charge,coverage,size
+    from .context_service import _operation,_budget,_charge,_fit_page,_charge_image,coverage,size
     with core.store.connect() as c:
         op=_operation(core,c,p.get('operation_id'));_budget(op,None)
     source=_source_for_read(core,p)
@@ -229,11 +265,14 @@ def next_step(core,p):
                     'next':'query_context(collection=facts) to merge durable results, then validate_candidate'}
             result=_charge(c,op,result);c.commit();return result
         step=dict(row)
+        _check_source_version(c,step['source_id'],step['source_version'])
         if step['chunk_key']=='gap':
             error=c.execute("""SELECT m.error FROM context_sources s LEFT JOIN material_catalog m ON m.key=s.material_key
                 WHERE s.operation_id=? AND s.entity_id=?""",(op['id'],step['source_id'])).fetchone()
-            content={'kind':'gap','text':json.loads(error[0])['message'] if error and error[0] else '原件缺少可读快照，未假称已分析。',
-                     'locator':'原件解析缺口'}
+            failure=json.loads(error[0]) if error and error[0] else {
+                'code':'source_unavailable','message':'原件缺少可读快照，未假称已分析。','details':{}}
+            failure.setdefault('details',{})
+            content={'kind':'gap','text':failure['message'],'error':failure,'locator':'原件读取缺口'}
         else:
             key,seq=step['chunk_key'].rsplit(':',1)
             chunk=dict(c.execute('SELECT * FROM material_chunks WHERE material_key=? AND seq=?',(key,int(seq))).fetchone())
@@ -246,18 +285,17 @@ def next_step(core,p):
         result={'step_key':step['step_key'],'delivery_token':delivery_token(core,c,op,step),'source_id':step['source_id'],'source_version':step['source_version'],
                 'chunk':int(step['chunk_key'].rsplit(':',1)[1]) if step['chunk_key']!='gap' else None,'content':content,'instruction':'读取后 checkpoint_context(step_key,result={facts:[{key,value,evidence}],notes:...})；图片、缺口与文字分别记录。'}
         budget=_budget(op,None)
-        if size(result)>budget-512:raise BusinessError('context_checkpoint_required','先保存检查点并结束本阶段，再继续读取该资料块。')
+        _fit_page(op,size(result)+512,budget)
         # Reserve vision context conservatively, independent of compressed bytes.
         if content['kind']=='image':
-            if op['delivered_bytes']+size(result)+12000>65536-8192:raise BusinessError('context_checkpoint_required','本阶段图片预算已用完，请保存检查点后接续。')
-            c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+12000 WHERE id=?',(op['id'],))
+            _charge_image(c,op,result)
         c.execute("UPDATE context_steps SET status='delivered',updated_at=? WHERE operation_id=? AND step_key=?",(now(),op['id'],step['step_key']))
         result=_charge(c,op,result);c.commit();return result
 
 
 def read_material(core,p):
     if p.get('chunk') is None:return next_step(core,p)
-    from .context_service import _operation,_budget,_charge
+    from .context_service import _operation,_budget,_charge,_fit_page,_charge_image
     if type(p['chunk']) is not int or p['chunk']<0:raise BusinessError('material_cursor','内容块编号无效。')
     source=_source_for_read(core,p)
     if not source or source['material_key'] in {None,'unavailable'}:raise BusinessError('source_unavailable','原件没有可读取内容。')
@@ -266,6 +304,7 @@ def read_material(core,p):
     if not present:extract_batch(core,source['material_key'])
     with core.store.lock,core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE');op=_operation(core,c,p['operation_id']);budget=_budget(op,None);sync_steps(c,op)
+        _check_source_version(c,source['entity_id'],source['version'])
         row=c.execute('SELECT * FROM material_chunks WHERE material_key=? AND seq=?',(source['material_key'],p['chunk'])).fetchone()
         if not row:
             state=c.execute('SELECT status FROM material_catalog WHERE key=?',(source['material_key'],)).fetchone()[0]
@@ -274,15 +313,14 @@ def read_material(core,p):
         chunk=dict(row);key=source['entity_id']+':'+str(p['chunk'])
         content={'kind':chunk['kind'],'locator':chunk['locator'],'sha256':chunk['sha256']}
         if chunk['kind']=='image':
-            if op['delivered_bytes']+12000>65536-8192:raise BusinessError('context_checkpoint_required','图片预算需要先保存检查点后接续。')
             content['image_ref']=chunk['material_key']+':'+str(chunk['seq'])
-            c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+12000 WHERE id=?',(op['id'],))
         else:content['text']=verified_bytes(core,chunk['sha256']).decode('utf-8')
         step=c.execute('SELECT * FROM context_steps WHERE operation_id=? AND step_key=?',(op['id'],key)).fetchone()
         result={'step_key':key,'delivery_token':delivery_token(core,c,op,step),'checkpoint_fingerprint':step['fingerprint'],'source_id':source['entity_id'],'source_version':source['version'],'chunk':p['chunk'],
                 'content':content,'next_chunk':p['chunk']+1}
         from .context_service import size
-        if size(result)>budget:raise BusinessError('context_checkpoint_required','请保存检查点后重新读取当前块。')
+        _fit_page(op,size(result),budget)
+        if content['kind']=='image':_charge_image(c,op,result)
         c.execute("UPDATE context_steps SET status='delivered' WHERE operation_id=? AND step_key=? AND status='pending'",(op['id'],key))
         result=_charge(c,op,result);c.commit();return result
 
@@ -290,7 +328,9 @@ def read_material(core,p):
 def verified_bytes(core,sha):
     from .resources import ResourceError
     try:raw=core.resources._blob(sha,verify=False).read_bytes()
-    except ResourceError as error:raise BusinessError('source_integrity',str(error)) from error
+    except (ResourceError,OSError) as error:
+        failure=_read_failure(error)
+        raise BusinessError(failure['code'],failure['message'],failure['details']) from error
     if hashlib.sha256(raw).hexdigest()!=sha:raise BusinessError('source_integrity','资料内容与保存版本不一致，未将损坏缓存作为证据。')
     return raw
 
@@ -299,49 +339,56 @@ def image_bytes(core,operation_id,image_ref):
     from .context_service import _operation
     with core.store.connect() as c:
         op=_operation(core,c,operation_id)
-        row=c.execute("""SELECT m.sha256 FROM context_steps s JOIN material_chunks m
+        row=c.execute("""SELECT m.sha256,s.source_id,s.source_version FROM context_steps s JOIN material_chunks m
             ON s.chunk_key=m.material_key||':'||m.seq
             WHERE s.operation_id=? AND s.chunk_key=? AND s.status IN ('delivered','completed') AND m.kind='image'""",(op['id'],image_ref)).fetchone()
         if not row:raise BusinessError('source_scope','未向当前操作提供这张图片。')
+        _check_source_version(c,row['source_id'],row['source_version'])
     return verified_bytes(core,row[0])
 
 
-def facts_page(core,c,op,cursor=None,byte_limit=None):
-    from .context_service import _budget,_charge,size,digest
+def facts_page(core,c,op,cursor=None,byte_limit=None,*,view='results'):
+    from .context_service import _budget,_charge,_fit_page,size
     budget=_budget(op,byte_limit)
+    if view not in {'results','facts'}:raise BusinessError('context_filter','未知的事实投影。')
+    params=encode({'view':'facts'}) if view=='facts' else '{}'
     count=c.execute("SELECT count(*) FROM context_steps WHERE operation_id=? AND status='completed'",(op['id'],)).fetchone()[0]
     stamp=str(count)
-    query=c.execute("SELECT * FROM context_queries WHERE operation_id=? AND collection='facts' AND params='{}'",(op['id'],)).fetchone()
+    query=c.execute("SELECT * FROM context_queries WHERE operation_id=? AND collection='facts' AND params=?",(op['id'],params)).fetchone()
     if query and query['stamp']!=stamp:
         if cursor:raise BusinessError('context_changed','分析结果有新批次，请从 facts 第一页重新合并。')
         c.execute('DELETE FROM context_queries WHERE id=?',(query['id'],));query=None
     if not query:
         from .storage import new_id
         identifier=new_id()
-        c.execute("INSERT INTO context_queries(id,operation_id,collection,params,stamp,total) VALUES (?,?,'facts','{}',?,?)",(identifier,op['id'],stamp,count))
+        c.execute("INSERT INTO context_queries(id,operation_id,collection,params,stamp,total) VALUES (?,?,'facts',?,?,?)",(identifier,op['id'],params,stamp,count))
         query=c.execute('SELECT * FROM context_queries WHERE id=?',(identifier,)).fetchone()
     if query['last_page'] and (cursor or '')==query['last_cursor']:
-        value=json.loads(query['last_page'])
-        if size(value)>budget:raise BusinessError('context_checkpoint_required','请保存检查点后继续合并。')
+        value=json.loads(query['last_page']);_fit_page(op,size(value),budget)
         return _charge(c,op,value)
     if cursor and cursor!=query['id']+':'+query['after_key']:raise BusinessError('context_cursor','请使用 facts 返回的顺序游标。')
     after=query['after_key'] if cursor else '';items=[];last=after;exhausted=True
-    for row in c.execute("""SELECT step_key,source_id,source_version,result FROM context_steps
-        WHERE operation_id=? AND status='completed' AND step_key>? ORDER BY step_key LIMIT 81""",(op['id'],after)):
+    meaningful=" AND (coalesce(json_array_length(result,'$.facts'),0)>0 OR length(trim(coalesce(json_extract(result,'$.notes'),'')))>0)" if view=='facts' else ''
+    rows=c.execute("SELECT step_key,source_id,source_version,result FROM context_steps WHERE operation_id=? AND status='completed' AND step_key>?"+meaningful+" ORDER BY step_key LIMIT 81",(op['id'],after))
+    for row in rows:
         item=dict(row);item['result']=json.loads(item['result'] or '{}')
+        if view=='facts':item['result']={k:v for k,v in item['result'].items() if k in {'facts','notes'} and v}
         if size({'items':items+[item]})>budget-1024 or len(items)>=80:
-            if not items:raise BusinessError('context_checkpoint_required','剩余预算不足以读取该检查点，请压缩后继续。')
+            if not items:_fit_page(op,size({'items':[item]})+1024,budget)
             exhausted=False;break
         items.append(item);last=row['step_key']
+    if exhausted:
+        last=c.execute("SELECT coalesce(max(step_key),'') FROM context_steps WHERE operation_id=? AND status='completed'",(op['id'],)).fetchone()[0]
     sequential=after==query['after_key']
-    delivered=query['delivered']+len(items) if sequential else query['delivered']
+    delivered=c.execute("SELECT count(*) FROM context_steps WHERE operation_id=? AND status='completed' AND step_key<=?",(op['id'],last)).fetchone()[0] if sequential else query['delivered']
     result={'items':items,'total':count,'next_cursor':None if exhausted else query['id']+':'+last,
-        'complete':bool(exhausted and sequential and delivered==count),
-        'instruction':'同 key 的不同 value 是待核对冲突，保留各自来源；不能用最后一份摘要覆盖。'}
+            'complete':bool(exhausted and sequential and delivered==count),'view':view,
+            'instruction':'保留同 key 的不同 value 及其来源。view=facts 返回全部 facts/notes，省略空确认和独立候选动作；原检查点可用 view=results 读取。'}
     if sequential:
         c.execute('UPDATE context_queries SET after_key=?,delivered=?,complete=?,last_cursor=?,last_page=? WHERE id=?',
-            (last,delivered,int(result['complete']),cursor or '',encode(result),query['id']))
+                  (last,delivered,int(result['complete']),cursor or '',encode(result),query['id']))
     return _charge(c,op,result)
+
 
 def idle_batch(core):
     """Fair extraction backpressure: one bounded local batch between AI jobs."""

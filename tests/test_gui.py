@@ -93,8 +93,8 @@ def test_codex_connection_entry_stays_visible_across_all_enabled_states(app, win
     assert calls == ['connect_codex']
 
 def test_empty_five_navigation_and_form_create(app, window):
-    assert '个人事务管理 · Beta 测试版' in window.windowTitle()
-    assert any(label.text() == 'Beta 测试版' for label in window.findChildren(QLabel))
+    assert '个人事务管理' in window.windowTitle() and 'Beta' not in window.windowTitle()
+    assert any(label.text() == '个人事务工作台' for label in window.findChildren(QLabel))
     assert [b.text().split("  ")[0] for b in window.nav_buttons.values()] == ["总览", "今天", "任务", "项目与课程", "复盘"]
     assert not window.today_page.has_plan
     assert Client(window.data_dir, autostart=False).query("state")["counts"] == {}
@@ -111,7 +111,7 @@ def test_empty_five_navigation_and_form_create(app, window):
     assert tasks[0]["data"]["completion_gate"] == "独立完成两个核对步骤"
     assert "estimated_minutes" not in tasks[0]["data"]
 
-def test_external_update_does_not_erase_form_and_stale_save_rejected(app, window):
+def test_external_update_does_not_erase_form_and_stale_save_rejected(app, window, monkeypatch):
     external = Client(window.data_dir, autostart=False)
     task = create(external, "原始标题")
     form = EntityForm(window.bridge, window.capabilities, window, entity=task)
@@ -125,6 +125,8 @@ def test_external_update_does_not_erase_form_and_stale_save_rejected(app, window
     wait(app, lambda: "修改" in form.error_label.text() or "更新" in form.error_label.text())
     assert form.isVisible()
     assert external.query("get", id=task["id"])["entity"]["title"] == "另一入口的新标题"
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:QMessageBox.StandardButton.Discard)
     form.reject()
 
 def test_feedback_keeps_unreported_dimensions_unknown(app, window):

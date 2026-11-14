@@ -69,3 +69,31 @@ def test_current_identity_remains_available_outside_recent_history_window(tmp_pa
     assert latest['id'] not in {p['id'] for p in result['plans']}
     assert result['current_plan_id']==latest['id']
     assert result['current_plan_version']==latest['version']
+
+
+def test_warning_category_counts_cover_the_full_scan_before_pagination(tmp_path):
+    import pytest
+    from management.schemas import BusinessError
+    core = Core(tmp_path)
+    command(core, 'create', {'type': 'rule', 'title': 'Synthetic reminder scope',
+                            'data': {'rule_kind': 'warning', 'target_types': ['task'], 'days_before': 14}})
+    for title, due in [('Past', '2038-04-30'), ('Today one', DAY), ('Today two', DAY),
+                       ('Upcoming', '2038-05-05'), ('Unknown one', None), ('Unknown two', None)]:
+        command(core, 'create', {'type': 'task', 'title': title, 'data': {'due_date': due} if due else {}})
+    before = core.query('state')
+    first = core.query('warnings', date=DAY, group='all', category='all', limit=1)
+    assert first['category_counts'] == {'today': 2, 'past': 1, 'upcoming': 1, 'unknown': 2}
+    assert first['total'] == 6 and first['next_offset'] == 1 and len(first['items']) == 1
+    assert first['items'][0]['category'] == 'today'
+    past = core.query('warnings', date=DAY, category='past', limit=5)
+    assert [item['title'] for item in past['items']] == ['Past']
+    assert past['category_counts'] == first['category_counts']
+    assert '待核对' in past['items'][0]['reason']
+    unknown = core.query('warnings', date=DAY, category='unknown', limit=1, offset=1)
+    assert unknown['total'] == 2 and unknown['next_offset'] is None
+    assert unknown['items'][0].get('due_date') is None
+    legacy = core.query('warnings', date=DAY, group='current', limit=20)
+    assert legacy['total'] == 5 and legacy['counts'] == {'current': 5, 'past': 1}
+    with pytest.raises(BusinessError, match='类别'):
+        core.query('warnings', date=DAY, category='imaginary')
+    assert core.query('state') == before

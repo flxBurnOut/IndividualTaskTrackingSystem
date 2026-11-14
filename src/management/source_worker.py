@@ -195,7 +195,10 @@ def worker(workspace):
         (root/'text.txt').write_text(value.pop('text'),encoding='utf-8')
         result={'ok':True,**value}
     except Exception as error:
-        result={'ok':False,'status':'failed','coverage':{'complete':False},'warnings':['原件已保存，自动读取未完成：'+str(error)[:350]],'images':[]}
+        from .materials import _read_failure
+        failure=_read_failure(error)
+        result={'ok':False,'status':'failed','coverage':{'complete':False},
+            'warnings':['原件已保存，自动读取未完成：'+failure['message'][:350]],'error':failure,'images':[]}
     (root/'result.json').write_text(json.dumps(result,ensure_ascii=False),encoding='utf-8')
     return 0
 

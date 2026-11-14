@@ -293,6 +293,9 @@ def _recipe(b):
 
 def seed_demo(client, data_dir, *, reference_date=None):
     """Create or resume a showcase; an existing completed one is never rewritten."""
+    from .data_space import CHANNEL
+    if CHANNEL != 'beta':
+        raise DemoError('演示数据只能在独立 Beta 版本生成，正式版不会创建演示记录。')
     root = require_beta_dir(data_dir)
     if Path(client.data_dir).resolve() != root:
         raise DemoError('演示生成器与业务连接的数据目录不一致。')

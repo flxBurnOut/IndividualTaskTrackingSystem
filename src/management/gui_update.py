@@ -14,7 +14,7 @@ from .gui_settings_controls import SelectableText
 def version_summary(state):
     contract = state.get('service_contract') or {}
     version = contract.get('app_version', contract.get('version', '未核验'))
-    channel = 'Beta 测试版' if contract.get('channel') == 'beta' else '未核验为 Beta'
+    channel = {'stable': '正式版', 'beta': 'Beta 测试版'}.get(contract.get('channel'), '未核验通道')
     entrances = state.get('client_entrances') or {}
     mcp = entrances.get('mcp') or {}
     if mcp:
@@ -34,7 +34,7 @@ class UpdateDialog(QDialog):
         super().__init__(window)
         self.window = window
         self.preparing = False
-        self.setWindowTitle('Beta 版本与更新')
+        self.setWindowTitle('版本与更新')
         self.resize(680, 470)
         layout = QVBoxLayout(self)
         self.content_scroll = QScrollArea()
@@ -46,19 +46,19 @@ class UpdateDialog(QDialog):
         content.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.content_scroll.setWidget(body)
         layout.addWidget(self.content_scroll, 1)
-        self.versions = QLabel(f'{APP_NAME}\n软件版本：{__version__}\n正在核验 Beta 后台版本…')
+        self.versions = QLabel(f'{APP_NAME}\n软件版本：{__version__}\n正在核验后台版本…')
         self.versions.setWordWrap(True)
         self.versions.setTextFormat(Qt.TextFormat.PlainText)
         content.addWidget(self.versions)
-        self.location = SelectableText('Beta 数据位置（更新后继续使用）\n' + str(Path(window.data_dir).resolve()))
+        self.location = SelectableText('数据位置（更新后继续使用）\n' + str(Path(window.data_dir).resolve()))
         content.addWidget(self.location)
         steps = QLabel(
-            '当前为 Beta 源码测试版，尚未提供独立 Beta 安装包。\n\n'
-            '1. 保存并关闭 Beta 编辑窗口，等待 Beta 后台及关联的 Codex 任务完成。\n'
-            '2. 点击下方“退出 Beta 并准备更新”，再更新本 Beta 工作目录的源码和依赖。\n'
-            '3. 使用“启动个人事务管理Beta.vbs”重新打开，继续使用当前 Beta 数据位置。\n'
-            '4. 如已连接 Beta MCP，在关联任务空闲后刷新该连接，并通过接口调用核验版本。\n\n'
-            'Beta 更新不使用正式版安装包。需要保留测试记录时，可先在“设置 → 数据与高级”创建备份。')
+            '1. 保存并关闭其他编辑窗口，等待后台及 Codex 任务完成。\n'
+            '2. 点击下方“退出并准备更新”，然后运行新版安装包。安装时核对原数据位置。\n'
+            '3. 从更新后的快捷方式启动，继续使用已有记录、设置、资料和会话关联。\n'
+            '4. 在 Codex 任务空闲后刷新 MCP 连接，并通过接口调用核验版本。\n\n'
+            '首次升级旧数据库前会自动保存数据库快照；资料原件留在原目录。'
+            '需要完整业务备份时，可先在“设置 → 数据与高级”创建备份。安装器不会自动下载新版本。')
         steps.setWordWrap(True)
         content.addWidget(steps)
         content.addStretch()
@@ -67,7 +67,7 @@ class UpdateDialog(QDialog):
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
         buttons = ActionRow()
-        self.prepare = QPushButton('退出 Beta 并准备更新')
+        self.prepare = QPushButton('退出并准备更新')
         self.prepare.clicked.connect(self.prepare_update)
         self.refresh = QPushButton('重新核验版本')
         self.refresh.clicked.connect(self.check_versions)
@@ -96,11 +96,11 @@ class UpdateDialog(QDialog):
         self.cancel.setEnabled(False)
         self.window.poll.stop()
         self.window.codex_connection.timer.stop()
-        self.status.setText('正在检查 Beta 后台任务并准备退出…')
+        self.status.setText('正在检查后台任务并准备退出…')
         self.window.bridge.prepare_update(self._prepared, self._failed)
 
     def _prepared(self, result):
-        self.status.setText('Beta 后台已进入更新准备状态，窗口即将关闭。请更新 Beta 源码后重新启动。')
+        self.status.setText('后台已进入更新准备状态，窗口即将关闭。请运行新版安装包。')
         self.window.codex_connection.request_stop()
         self.accept()
         QTimer.singleShot(0, self.window.close)
