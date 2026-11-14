@@ -11,6 +11,7 @@ from shiboken6 import isValid
 
 from .agent_connections import CHANNEL_LABEL, PROFILES, apply_merge, configuration, launch_spec, preview_merge
 from .gui_layout import ActionRow
+from .gui_settings_controls import SelectableText
 
 
 class AgentConnectionsPage(QWidget):
@@ -25,12 +26,13 @@ class AgentConnectionsPage(QWidget):
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.profile = QComboBox()
         for key, name in PROFILES.items():
             self.profile.addItem(name, key)
         form.addRow('连接到', self.profile)
-        space = QLabel(str(self.data_dir))
-        space.setWordWrap(True)
+        space = SelectableText(str(self.data_dir))
         form.addRow(CHANNEL_LABEL + '数据空间', space)
         layout.addLayout(form)
         self.config_preview = QPlainTextEdit()
@@ -65,11 +67,9 @@ class AgentConnectionsPage(QWidget):
         for button in (self.choose_button, self.preview_button, self.apply_button):
             row.addWidget(button)
         layout.addWidget(row)
-        self.merge_status = QLabel('只添加当前' + CHANNEL_LABEL + '连接，保留其他服务器和设置。已有同名不同内容时会停止。')
-        self.merge_status.setWordWrap(True)
+        self.merge_status = SelectableText('只添加当前' + CHANNEL_LABEL + '连接，保留其他服务器和设置。已有同名不同内容时会停止。')
         layout.addWidget(self.merge_status)
-        self.status = QLabel('配置尚未检测。')
-        self.status.setWordWrap(True)
+        self.status = SelectableText('配置尚未检测。')
         self.status.setObjectName('Hint')
         layout.addWidget(self.status)
         layout.addStretch()
