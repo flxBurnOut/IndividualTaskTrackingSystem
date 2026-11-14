@@ -190,3 +190,34 @@ def test_cli_configuration_does_not_read_discovery_credentials(tmp_path, monkeyp
     assert main() == 0
     rendered = capsys.readouterr().out
     assert json.loads(rendered)['mcpServers'] and 'synthetic-secret' not in rendered
+
+@pytest.mark.parametrize("mode,ok", [("--mcp-config", True), ("--check-mcp", True), ("--check-mcp", False)])
+def test_cli_json_uses_utf8_even_when_windows_stdout_is_locale_encoded(tmp_path, monkeypatch, mode, ok):
+    import io
+    import sys
+    from management import agent_connections
+    from management.__main__ import main
+    root = tmp_path / '中文资料空间'
+    async def probe(*args, **kwargs):
+        if not ok:
+            raise WorkspaceError('中文路径读取失败')
+        return {'ok': True, 'data_dir': str(root)}
+    monkeypatch.setattr(agent_connections, 'probe_connection', probe)
+    monkeypatch.setattr(sys, 'argv', ['management', '--data-dir', str(root), mode, 'antigravity'])
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding='cp936')
+    with monkeypatch.context() as output_patch:
+        output_patch.setattr(sys, 'stdout', stream)
+        code = main()
+        stream.flush()
+        raw = buffer.getvalue()
+    stream.close()
+    assert code == (0 if ok else 1)
+    rendered = json.loads(raw.decode('utf-8'))
+    if mode == '--mcp-config':
+        entry = next(iter(rendered['mcpServers'].values()))
+        assert str(root) in entry['args']
+    elif ok:
+        assert rendered['data_dir'] == str(root)
+    else:
+        assert rendered == {'ok': False, 'message': '中文路径读取失败'}

@@ -397,7 +397,7 @@ async def verify_frozen_agent_profiles(client, executable, data, environment):
     """Actual frozen config/stdio/self-check paths, no external Agent accounts."""
     before = client.state()
     exported = subprocess.run([str(executable), '--data-dir', str(data), '--mcp-config', 'antigravity'],
-        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=45,
+        env=environment, capture_output=True, timeout=45,
         creationflags=subprocess.CREATE_NO_WINDOW)
     assert exported.returncode == 0, exported.stderr
     config = json.loads(exported.stdout)
@@ -407,7 +407,7 @@ async def verify_frozen_agent_profiles(client, executable, data, environment):
     assert entry['args'] == ['--mcp', '--data-dir', str(data), '--mcp-client', 'antigravity']
     assert 'PYTHONPATH' not in entry.get('env', {})
     checked = subprocess.run([str(executable), '--data-dir', str(data), '--check-mcp', 'antigravity'],
-        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=60,
+        env=environment, capture_output=True, timeout=60,
         creationflags=subprocess.CREATE_NO_WINDOW)
     assert checked.returncode == 0, checked.stdout + checked.stderr
     probe = json.loads(checked.stdout)

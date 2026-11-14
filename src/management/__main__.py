@@ -45,6 +45,11 @@ def main():
         parser.error(str(error))
     if args.demo_date and not args.seed_demo:
         parser.error('--demo-date 必须与 --seed-demo 一起使用')
+    # Frozen Python does not honor PYTHONUTF8; these machine-readable outputs
+    # must also be UTF-8 when redirected on a Windows system using a legacy code page.
+    if args.mcp_config or args.check_mcp:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
     if args.mcp_config:
         from .agent_connections import configuration
         print(configuration(args.data_dir, args.mcp_config))
