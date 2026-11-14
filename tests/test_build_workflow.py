@@ -167,3 +167,46 @@ def test_running_job_prevents_legacy_service_stop(tmp_path):
         db.execute("insert into jobs values ('running')")
     with pytest.raises(RuntimeError, match='still active'):
         maintenance.assert_idle(tmp_path)
+
+
+
+def test_upgrade_profile_selects_and_fingerprints_current_release(tmp_path, monkeypatch):
+    package = tmp_path / 'release' / 'app'
+    package.mkdir(parents=True)
+    (package / 'PersonalManagementService.exe').write_bytes(b'synthetic executable')
+    (tmp_path / 'pyproject.toml').write_text('[project]\nname="synthetic"\n')
+    monkeypatch.setattr(check, 'ROOT', tmp_path)
+    monkeypatch.setattr(check, 'runtime_directory', lambda version: package)
+    run = SimpleNamespace(work=tmp_path / 'work', folder=tmp_path / 'report')
+    old = check.commands('upgrade', [], run, '1.0.2')[0]
+    current = check.commands('upgrade', [], run, '1.3.4')[0]
+    assert current[current.index('--old-version')+1] == '1.3.4'
+    assert old[old.index('--old-version')+1] == '1.0.2'
+    assert check.fingerprint('upgrade', [], '1.0.2') != check.fingerprint('upgrade', [], '1.3.4')
+
+
+@pytest.mark.parametrize('args', [['focused', '--from-version', '1.3.4'],
+                                  ['upgrade', '--from-version', '../data']])
+def test_upgrade_baseline_option_rejects_wrong_scope(args):
+    with pytest.raises(SystemExit):
+        check.main(args)
+
+
+def test_upgrade_seed_requests_identify_the_selected_old_release(monkeypatch):
+    import upgrade_smoke
+    from management.runtime_contract import VERSION_HEADER, CHANNEL_HEADER
+    from io import BytesIO
+    owner = upgrade_smoke.OwnedService.__new__(upgrade_smoke.OwnedService)
+    owner.request_version = '1.3.4'
+    owner.runtime = lambda: {'port': 12345, 'token': 'synthetic'}
+    requests = []
+    class Opener:
+        def open(self, request, timeout):
+            requests.append({key.lower():value for key,value in request.header_items()})
+            return BytesIO(b'{}')
+    monkeypatch.setattr(upgrade_smoke.urllib.request, 'build_opener', lambda *a: Opener())
+    owner.request('query', 'settings')
+    assert requests[-1][VERSION_HEADER.lower()] == '1.3.4'
+    assert requests[-1][CHANNEL_HEADER.lower()] == 'stable'
+    owner.request('query', 'state', current=True)
+    assert requests[-1][VERSION_HEADER.lower()] == upgrade_smoke.__version__

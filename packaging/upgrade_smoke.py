@@ -29,7 +29,7 @@ from mcp.client.stdio import stdio_client
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from management import __version__
-from management.runtime_contract import client_headers
+from management.runtime_contract import VERSION_HEADER, client_headers
 
 DAY = '2038-05-01'
 
@@ -55,8 +55,9 @@ def synthetic_path(path):
 
 
 class OwnedService:
-    def __init__(self, executable, data, *, resume_token=None):
+    def __init__(self, executable, data, *, resume_token=None, request_version=None):
         self.executable, self.data = Path(executable).resolve(), synthetic_path(data)
+        self.request_version = request_version
         self.arguments = [str(self.executable), '--service', '--data-dir', str(self.data)]
         if resume_token is not None:
             self.arguments += ['--resume-update', resume_token]
@@ -97,8 +98,10 @@ class OwnedService:
     def request(self, category, name, payload=None, *, current=False, expect_error=None):
         runtime = self.runtime()
         headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token']}
-        if current:
+        if current or self.request_version:
             headers.update(client_headers('installer'))
+            if not current:
+                headers[VERSION_HEADER] = self.request_version
         request = urllib.request.Request(
             'http://127.0.0.1:%s/v1/%s/%s' % (runtime['port'], category, name),
             data=json.dumps(payload or {}, ensure_ascii=False).encode('utf-8'), headers=headers)
@@ -241,14 +244,14 @@ async def run(args):
     data = work / '自选资料 有空格'
     data.mkdir()
     report_path = checked_path(args.report, ROOT / '.build' / 'checks')
-    report = {'synthetic_only': True, 'models_started': 0, 'codex_threads_created': 0,
+    report = {'synthetic_only': True, 'from_version': args.old_version, 'to_version': __version__, 'models_started': 0, 'codex_threads_created': 0,
               'installed_product': False, 'data_dir': str(data), 'passed': False, 'checks': {}}
     owned = []
     try:
         report['old_binaries'], report['new_binaries'] = binaries(old_package), binaries(new_package)
-        assert all(item['pe_version'] == '1.0.2.0' for item in report['old_binaries'].values())
+        assert all(item['pe_version'] == args.old_version + '.0' for item in report['old_binaries'].values())
         assert all(item['pe_version'] == __version__ + '.0' for item in report['new_binaries'].values())
-        old = OwnedService(old_package / 'PersonalManagementService.exe', data)
+        old = OwnedService(old_package / 'PersonalManagementService.exe', data, request_version=args.old_version)
         owned.append(old)
         old.wait_ready()
         identifiers = seed(old, work)
@@ -340,11 +343,17 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--old-package', type=Path, default=runtime_directory('1.0.2'))
+    parser.add_argument('--old-version', default='1.0.2')
+    parser.add_argument('--old-package', type=Path)
     parser.add_argument('--new-package', type=Path, default=runtime_directory(__version__))
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--work-dir', type=Path, required=True)
-    asyncio.run(run(parser.parse_args()))
+    args = parser.parse_args()
+    selected = runtime_directory(args.old_version)
+    if tuple(map(int, args.old_version.split('.'))) >= tuple(map(int, __version__.split('.'))):
+        parser.error('Upgrade baseline must be older than the candidate version')
+    args.old_package = args.old_package or selected
+    asyncio.run(run(args))
 
 
 if __name__ == '__main__':

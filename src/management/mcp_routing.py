@@ -38,10 +38,15 @@ def _error(code, message):
 
 
 class DiscussionRouting:
-    def __init__(self, server: RoutedMCPServer, client):
+    def __init__(self, server: RoutedMCPServer, client, *, provider='codex'):
         self.server, self.client = server, client
+        self.provider = provider
 
     def thread_id(self, *, required=False):
+        if self.provider != 'codex':
+            if required:
+                raise _error('managed_discussion_unavailable', '此连接仅提供通用 MCP 业务工具，不支持受管会话。')
+            return None
         meta = self.server.request_metadata.get()
         if meta is None or isinstance(meta, Mapping) and 'threadId' not in meta:
             if required:

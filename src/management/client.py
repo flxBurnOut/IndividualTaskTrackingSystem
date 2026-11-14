@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import copy
+import math
+import random
 from pathlib import Path
 import time
 import threading
@@ -9,7 +12,7 @@ import urllib.request
 import uuid
 
 from .runtime import DataSpaceMismatch, UpdatePending, default_data_dir, discovery, read_startup_failure, require_data_dir, start_service
-from .runtime_contract import client_headers, matches_contract, mismatch_details, service_mismatch_message
+from .runtime_contract import CLIENT_ID_HEADER, AGENT_HEADER, client_headers, matches_contract, mismatch_details, service_mismatch_message
 from .data_space import BetaIsolationError, require_channel_dir
 
 
@@ -20,10 +23,14 @@ class ClientError(Exception):
 
 
 class Client:
-    def __init__(self, data_dir=None, autostart=True, *, entrance='gui'):
+    def __init__(self, data_dir=None, autostart=True, *, entrance='gui', mcp_client=None):
         if entrance not in {'gui', 'mcp', 'installer', 'tray'}:
             raise ValueError('Unknown client entrance')
+        if mcp_client not in {None, 'codex', 'antigravity', 'generic'}:
+            raise ValueError('Unknown MCP client profile')
         self.entrance = entrance
+        self.mcp_client = mcp_client
+        self.client_instance_id = str(uuid.uuid4())
         try:
             self.data_dir = require_channel_dir(data_dir if data_dir is not None else default_data_dir())
         except BetaIsolationError as error:
@@ -57,7 +64,7 @@ class Client:
                     response = self._request('query', 'state', {}, timeout=2)
                     return self._remember(response)
                 except ClientError as error:
-                    if error.code in {'data_space_mismatch', 'service_version_mismatch', 'client_version_mismatch', 'service_updating'}:
+                    if error.code in {'data_space_mismatch', 'service_version_mismatch', 'client_version_mismatch', 'service_updating', 'service_busy'}:
                         raise
             if attempted_at is not None:
                 failure = read_startup_failure(self.data_dir, not_before=attempted_at)
@@ -100,13 +107,45 @@ class Client:
             raise ClientError('data_space_mismatch', str(error)) from error
 
     def _request(self, category, name, data, timeout=35):
+        """Retry only an explicit pre-dispatch rejection, within one time budget.
+
+        A timeout/reset/500 may follow a commit and is NEVER replayed here.
+        Preserve the exact envelope, epoch, revision and business request ID.
+        """
+        # Freeze nested input before waiting: a concurrent editor must not
+        # change the payload while this request retains its original ID.
+        data = copy.deepcopy(data)
+        deadline = time.monotonic() + timeout
+        for attempt in range(3):
+            remaining = deadline - time.monotonic()
+            try:
+                return self._request_once(category, name, data, timeout=max(.01, remaining))
+            except ClientError as error:
+                if (error.code != 'service_busy' or error.details.get('request_accepted') is not False
+                        or attempt == 2):
+                    raise
+                delay = error.details.get('retry_after_seconds', 1)
+                if type(delay) not in (int, float) or not math.isfinite(delay) or not 0 < delay <= 5:
+                    raise
+                delay = delay * (attempt + 1) + random.uniform(0, .1)
+                if time.monotonic() + delay >= deadline:
+                    raise
+                time.sleep(delay)
+
+    def _request_once(self, category, name, data, timeout=35):
         runtime = self.runtime
         if not runtime:
             raise ClientError('service_unavailable', '尚未连接业务服务。')
         self._require_data_dir(runtime.get('data_dir'))
         body = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
         url = 'http://127.0.0.1:%d/v1/%s/%s' % (runtime['port'], category, name)
-        request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token'], **client_headers(getattr(self, 'entrance', 'gui'))}, method='POST')
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + runtime['token'],
+                   **client_headers(getattr(self, 'entrance', 'gui'))}
+        if getattr(self, 'client_instance_id', None):
+            headers[CLIENT_ID_HEADER] = self.client_instance_id
+        if getattr(self, 'mcp_client', None):
+            headers[AGENT_HEADER] = self.mcp_client
+        request = urllib.request.Request(url, data=body, headers=headers, method='POST')
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)

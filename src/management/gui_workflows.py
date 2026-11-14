@@ -1387,6 +1387,9 @@ class SettingsDialog(QDialog):
         data_layout.addWidget(advanced_tabs)
         data_root.addStretch()
         add_page(data, '数据与高级')
+        from .gui_agent_connections import AgentConnectionsPage
+        self.agent_connections = AgentConnectionsPage(data_dir, self)
+        add_page(self.agent_connections, "助手连接")
         self.tab_transition = TabTransition(tabs)
         self.advanced_tab_transition = TabTransition(advanced_tabs)
 

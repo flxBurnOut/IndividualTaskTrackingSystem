@@ -187,12 +187,19 @@ def _capabilities_page(value: dict[str, Any], params: dict[str, Any]) -> dict[st
         end -= 1
 
 
-def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
+def create_server(data_dir: str | Path, *, client: Any = None, client_profile: str = 'codex') -> MCPServer:
+    if client_profile not in {'codex', 'antigravity', 'generic'}:
+        raise ValueError('Unknown MCP client profile')
+    instructions = INSTRUCTIONS
+    if client_profile != 'codex':
+        instructions = INSTRUCTIONS.split('如果当前会话关联软件事项')[0] + (
+            '此连接仅提供通用 MCP 业务操作，不支持受管会话绑定、候选回传或主动派发助手。'
+            '不要假设其他助手的会话身份或配置适用于本连接。')
     if client is None:
         from .client import Client
-        client = Client(data_dir, entrance='mcp')
-    server = RoutedMCPServer("personal-management", title=APP_NAME, version=__version__, instructions=INSTRUCTIONS, log_level="WARNING")
-    routing = DiscussionRouting(server, client)
+        client = Client(data_dir, entrance='mcp', mcp_client=client_profile)
+    server = RoutedMCPServer("personal-management", title=APP_NAME, version=__version__, instructions=instructions, log_level="WARNING")
+    routing = DiscussionRouting(server, client, provider=client_profile)
 
     def raw_capabilities() -> dict[str, Any]:
         # No presentation paging or persistent context creation on this path.
@@ -247,7 +254,8 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             return routing.request('query', name='begin_context', params={'business_date': business_date})
         state=query('state')
         envelope=query('prepare_context',goal='读取当前个人事务',scope={'kind':'general',**({'date':business_date} if business_date else {})})
-        return {**state,'context':envelope,'instructions':INSTRUCTIONS,
+        return {**state,'context':envelope,'instructions':instructions,
+                'connection':{'client_profile':client_profile,'managed_discussions':client_profile=='codex'},
                 'continuity':'先按需读取本次记录和未完成操作；软件与全部对话共用同一业务服务。'}
 
     @server.tool(annotations=READ, structured_output=True)
@@ -478,7 +486,6 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
             raise ToolError(json.dumps({"code": "unknown_command", "message": "Command is not registered."}))
         return command(name, payload, request_id, epoch, expected_revision)
 
-    @server.tool(annotations=WRITE, structured_output=True)
     def begin_discussion(text: str, request_id: str) -> dict[str, Any]:
         """Begin this exact user turn in the software matter bound to this Codex
         call. Identity comes from transport metadata, never a tool argument.
@@ -487,7 +494,6 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         Returns fresh context, job_id, generation and allowed candidate commands."""
         return routing.request('begin', text=text, request_id=request_id)
 
-    @server.tool(annotations=WRITE, structured_output=True)
     def submit_candidate(job_id: str, generation: int, proposal: dict[str, Any]) -> dict[str, Any]:
         """Return a candidate for the current bound matter using begin_discussion's
         job handle. proposal contains summary, unknowns, sources and actions.
@@ -495,13 +501,17 @@ def create_server(data_dir: str | Path, *, client: Any = None) -> MCPServer:
         actual changes require the user's confirmation in the management app."""
         return routing.request('submit', job_id=job_id, generation=generation, proposal=proposal)
 
+    if client_profile == 'codex':
+        server.tool(annotations=WRITE, structured_output=True)(begin_discussion)
+        server.tool(annotations=WRITE, structured_output=True)(submit_candidate)
+
     from .context_mcp import register_tools
     register_tools(server,query)
     return server
 
 
-def run(data_dir: str | Path) -> None:
-    create_server(data_dir).run(transport="stdio")
+def run(data_dir: str | Path, *, client_profile: str = 'codex') -> None:
+    create_server(data_dir, client_profile=client_profile).run(transport="stdio")
 
 
 def main() -> None:

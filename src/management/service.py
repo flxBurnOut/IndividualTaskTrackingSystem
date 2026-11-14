@@ -11,12 +11,14 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import secrets
+import socket
+import uuid
 import threading
 import time
 
 from .core import Core
 from .runtime import OwnerLock, require_no_pending_update
-from .runtime_contract import CHANNEL_HEADER, ENTRANCE_HEADER, PROTOCOL_HEADER, VERSION_HEADER, service_contract
+from .runtime_contract import CLIENT_ID_HEADER, AGENT_HEADER, CHANNEL_HEADER, ENTRANCE_HEADER, PROTOCOL_HEADER, VERSION_HEADER, service_contract
 from . import __version__
 from .schemas import BusinessError
 from .storage import encode, now
@@ -40,6 +42,8 @@ class Server(ThreadingHTTPServer):
         self._update_finisher = None
         self._update_finished = False
         self.client_entrances = {}
+        self.client_connections = {}
+        self.busy_rejections = 0
         super().__init__(('127.0.0.1', 0), Handler)
 
     @contextmanager
@@ -68,6 +72,23 @@ class Server(ThreadingHTTPServer):
                 'protocol_version': protocol[:16] if isinstance(protocol, str) else None,
                 'channel': channel[:16] if isinstance(channel, str) else None,
                 'verified': verified, 'checked_at': now()}
+            # Caller labels are diagnostics only, never authority or conversation IDs.
+            instance = headers.get(CLIENT_ID_HEADER, '')
+            try:
+                valid_instance = str(uuid.UUID(instance)) == instance
+            except (ValueError, TypeError, AttributeError):
+                valid_instance = False
+            if valid_instance:
+                stamp = time.monotonic()
+                self.client_connections = {key: value for key, value in self.client_connections.items()
+                                           if stamp - value['_seen'] <= 300}
+                if instance not in self.client_connections and len(self.client_connections) >= 128:
+                    oldest = min(self.client_connections, key=lambda key: self.client_connections[key]['_seen'])
+                    del self.client_connections[oldest]
+                agent = headers.get(AGENT_HEADER)
+                self.client_connections[instance] = {**self.client_entrances[entrance],
+                    'client_instance_id': instance, 'entrance': entrance,
+                    'agent': agent if agent in {'codex', 'antigravity', 'generic'} else None, '_seen': stamp}
         return verified
 
     def prepare_update(self, *, drain_timeout=10, reason='update'):
@@ -153,7 +174,56 @@ class Server(ThreadingHTTPServer):
 
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
-            request.close()
+            # Reject before reading/dispatching any business command. Keep the
+            # accept loop and thread count bounded, even for stalled senders.
+            with self._activity_lock:
+                self.busy_rejections += 1
+            body = encode({'error': {'code': 'service_busy',
+                'message': '业务服务正忙，本次请求尚未受理，请稍后按原请求编号重试。',
+                'details': {'request_accepted': False, 'retry_after_seconds': 1}}}).encode('utf-8')
+            header = ('HTTP/1.1 503 Service Unavailable\r\n'
+                      'Content-Type: application/json; charset=utf-8\r\n'
+                      'Content-Length: %d\r\nRetry-After: 1\r\n'
+                      'Cache-Control: no-store\r\nConnection: close\r\n\r\n' % len(body)).encode('ascii')
+            try:
+                # Windows resets a socket closed while the HTTP client is still
+                # sending its body. Consume one bounded, framed request first;
+                # do not parse JSON or dispatch it. An absolute deadline also
+                # prevents a slow sender from blocking the accept loop.
+                deadline = time.monotonic() + .25
+                incoming = bytearray()
+                def receive(limit):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError()
+                    request.settimeout(remaining)
+                    chunk = request.recv(limit)
+                    if not chunk:
+                        raise ConnectionError()
+                    return chunk
+                while b'\r\n\r\n' not in incoming:
+                    if len(incoming) >= 65536:
+                        raise ValueError('oversize headers')
+                    incoming.extend(receive(min(8192, 65536 - len(incoming))))
+                head, received = bytes(incoming).split(b'\r\n\r\n', 1)
+                fields = [line.split(b':', 1) for line in head.split(b'\r\n')[1:]]
+                lengths = [value.strip() for key, value in fields if key.lower() == b'content-length']
+                if (len(lengths) != 1 or not lengths[0].isdigit()
+                        or any(key.lower() == b'transfer-encoding' for key, _ in fields)):
+                    raise ValueError('unframed request')
+                length = int(lengths[0])
+                if length > 1024 * 1024:
+                    raise ValueError('oversize request')
+                remaining = length - len(received)
+                while remaining > 0:
+                    remaining -= len(receive(min(65536, remaining)))
+                request.settimeout(.1)
+                request.sendall(header + body)
+                request.shutdown(socket.SHUT_WR)
+            except (OSError, ValueError):
+                pass
+            finally:
+                request.close()
             return
         try:
             super().process_request(request, address)
@@ -238,6 +308,12 @@ class Handler(BaseHTTPRequestHandler):
                              'shutdown_reason': self.server.shutdown_reason if self.server.maintenance else None}
                     if name == 'runtime_status':
                         value['client_entrances'] = dict(self.server.client_entrances)
+                        value['client_connections'] = [
+                            {key: field for key, field in item.items() if key != '_seen'}
+                            for item in self.server.client_connections.values()
+                            if time.monotonic() - item['_seen'] <= 300]
+                        value['request_capacity'] = 8
+                        value['busy_rejections'] = self.server.busy_rejections
                 if name == 'runtime_status':
                     with self.server.core.store.connect() as connection:
                         value['jobs'] = dict(connection.execute("SELECT status,count(*) FROM jobs WHERE status IN ('queued','running','awaiting_review') GROUP BY status"))

@@ -6,6 +6,7 @@ import datetime as dt
 import importlib.metadata
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from management import __version__
 PROFILES = ('focused', 'full', 'gui', 'package', 'upgrade', 'tray', 'installer')
 
 
-def fingerprint(profile, paths):
+def fingerprint(profile, paths, from_version='1.0.2'):
     files = [ROOT / 'pyproject.toml']
     for directory in ('src', 'tests', 'packaging'):
         files.extend(p for p in (ROOT / directory).rglob('*') if p.is_file()
@@ -27,7 +28,7 @@ def fingerprint(profile, paths):
     if profile in {'package', 'tray', 'upgrade'}:
         packages = [runtime_directory(__version__)]
         if profile == 'upgrade':
-            packages.append(runtime_directory('1.0.2'))
+            packages.append(runtime_directory(from_version))
         for package in packages:
             if not (package / 'PersonalManagementService.exe').is_file():
                 raise FileNotFoundError('Required existing package is missing: ' + str(package))
@@ -38,13 +39,13 @@ def fingerprint(profile, paths):
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
-    value = {'profile': profile, 'paths': paths, 'python': sys.version, 'dependencies': versions,
+    value = {'profile': profile, 'paths': paths, 'upgrade_from': from_version if profile == 'upgrade' else None, 'python': sys.version, 'dependencies': versions,
              'files': {str(p.relative_to(ROOT)): digest(p) for p in sorted(set(files))}}
     import hashlib
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def commands(profile, paths, run):
+def commands(profile, paths, run, from_version='1.0.2'):
     py = [sys.executable, '-X', 'utf8']
     def pytest_command(name, selection):
         return py + ['-m', 'pytest', '-q', *selection, '--basetemp', str(run.work / name),
@@ -59,8 +60,9 @@ def commands(profile, paths, run):
     if profile == 'installer':
         return [pytest_command('installer', ['tests/test_installer_payload.py', 'tests/test_installer_upgrade.py'])]
     script = {'package': 'smoke.py', 'upgrade': 'upgrade_smoke.py', 'tray': 'tray_smoke.py'}[profile]
+    extra = ['--old-version', from_version, '--old-package', str(runtime_directory(from_version))] if profile == 'upgrade' else []
     return [py + [str(ROOT / 'packaging' / script), '--work-dir', str(run.work),
-                  '--report', str(run.folder / 'result.json')]]
+                  '--report', str(run.folder / 'result.json'), *extra]]
 
 
 def test_counts(folder):
@@ -77,8 +79,12 @@ def main(argv=None):
     parser.add_argument('profile', choices=PROFILES)
     parser.add_argument('paths', nargs='*', help='Focused pytest files or node IDs')
     parser.add_argument('--force', action='store_true', help='Run again even when identical inputs passed before')
+    parser.add_argument('--from-version', help='Upgrade profile only: existing numeric release baseline (default 1.0.2)')
     parser.add_argument('--keep-work', action='store_true', help='Keep one fixture workspace for explicit debugging')
     args = parser.parse_args(argv)
+    if args.from_version is not None and (args.profile != 'upgrade' or not re.fullmatch(r'\d+\.\d+\.\d+', args.from_version)):
+        parser.error('--from-version requires the upgrade profile and a numeric version')
+    args.from_version = args.from_version or '1.0.2'
     if args.profile == 'focused':
         if not args.paths:
             parser.error('focused requires specific test files; full is an explicit separate command')
@@ -105,7 +111,7 @@ def run_checked(args, run):
     started = time.monotonic()
     folder = run.folder
     try:
-        signature = fingerprint(args.profile, args.paths)
+        signature = fingerprint(args.profile, args.paths, getattr(args, 'from_version', '1.0.2'))
         latest = run.folder / 'latest.json'
         if latest.is_file() and not args.force:
             old = json.loads(latest.read_text('utf-8'))
@@ -128,7 +134,9 @@ def run_checked(args, run):
             environment['PERSONAL_MANAGEMENT_INSTALLER_TEST'] = '1'
         results = []
         with (run.folder / 'latest.log').open('w', encoding='utf-8') as log:
-            for command in commands(args.profile, args.paths, run):
+            selected_commands = (commands(args.profile, args.paths, run, args.from_version) if args.profile == 'upgrade'
+                                 else commands(args.profile, args.paths, run))
+            for command in selected_commands:
                 log.write('CHECK ' + Path(command[3] if command[3] != '-m' else command[4]).name + '\n')
                 log.flush()
                 result = subprocess.run(command, cwd=ROOT, env=environment, stdout=log,
@@ -136,7 +144,8 @@ def run_checked(args, run):
                 results.append(result.returncode)
                 if result.returncode:
                     break
-        summary = {'profile': args.profile, 'version': __version__, 'passed': all(code == 0 for code in results),
+        summary = {'profile': args.profile, 'version': __version__,
+                   'upgrade_from': args.from_version if args.profile == 'upgrade' else None, 'passed': all(code == 0 for code in results),
                    'fingerprint': signature, 'tested_at': dt.datetime.now(dt.timezone.utc).isoformat(),
                    'seconds': round(time.monotonic() - started, 2), 'counts': test_counts(run.folder),
                    'exit_codes': results, 'work_retained': args.keep_work}

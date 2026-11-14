@@ -11,11 +11,14 @@ from .data_space import CHANNEL
 
 PROTOCOL_VERSION = 1
 CAPABILITIES = ('release_handshake', 'idle_update_shutdown', 'appearance_accent',
-                'ordinary_context_continuation', 'context_batch_transport')
+                'ordinary_context_continuation', 'context_batch_transport',
+                'mcp_client_profiles', 'bounded_service_busy')
 VERSION_HEADER = 'X-PersonalManagement-Version'
 PROTOCOL_HEADER = 'X-PersonalManagement-Protocol'
 ENTRANCE_HEADER = 'X-PersonalManagement-Entrance'
 CHANNEL_HEADER = 'X-PersonalManagement-Channel'
+CLIENT_ID_HEADER = 'X-PersonalManagement-Client-Id'
+AGENT_HEADER = 'X-PersonalManagement-Agent'
 
 
 def service_contract():
@@ -52,4 +55,4 @@ def service_mismatch_message(value):
             '请先保存并关闭主窗口；若后台还有任务，等待完成后，在托盘选择“退出软件与后台”。'
             '确认后台退出后，完成正式版更新，再从原数据空间的启动入口重新打开。'
             '仅重新打开窗口不会替换仍在运行的旧后台。'
-            '如果提示来自 Codex，请在任务空闲后重启其 MCP 连接，加载新版事务助手接口。')
+            '如果提示来自外部助手，请在任务空闲后重启其 MCP 连接，加载新版业务接口。')

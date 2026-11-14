@@ -615,3 +615,50 @@ def test_rule_selection_field_roundtrip_uses_plain_comma_text(app):
     editor.editor.setText(",".join(f"kind{i}" for i in range(31)))
     with pytest.raises(ValueError, match="30"):
         editor.value()
+
+
+
+def test_agent_connection_settings_merge_and_real_mcp_probe(app, window, tmp_path):
+    from PySide6.QtGui import QFontDatabase
+    for name in ('msyh.ttc', 'msyhbd.ttc'):
+        font = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / name
+        if font.is_file(): QFontDatabase.addApplicationFont(str(font))
+    dialog = SettingsDialog(window.bridge, window.capabilities, window.data_dir, window)
+    dialog.show()
+    page = dialog.agent_connections
+    assert page.profile.currentData() == 'antigravity'
+    from management.data_space import CHANNEL
+    assert 'personal_management_' + CHANNEL + '_' in page.config_preview.toPlainText()
+    assert '--mcp-client' in page.config_preview.toPlainText()
+    assert '尚未检测' in page.status.text()
+    target = tmp_path / 'client-config' / 'mcp_config.json'
+    target.parent.mkdir()
+    target.write_text('{"mcpServers":{"formal":{"command":"unchanged.exe"}}}', encoding='utf-8')
+    page.target.setText(str(target))
+    page.preview_button.click()
+    assert page.apply_button.isEnabled()
+    assert len(json.loads(target.read_text('utf-8'))['mcpServers']) == 1
+    page.apply_button.click()
+    merged = json.loads(target.read_text('utf-8'))['mcpServers']
+    assert merged['formal'] == {'command': 'unchanged.exe'} and len(merged) == 2
+    before = Client(window.data_dir, autostart=False).state()
+    page.probe_button.click()
+    assert not page.probe_button.isEnabled()
+    wait(app, lambda: page.last_probe is not None, timeout=55)
+    assert page.last_probe['ok'], page.status.text()
+    assert '尚未验证外部助手' in page.status.text()
+    assert page.last_probe['external_agent_verified'] is False
+    report_dir = os.environ.get('PERSONAL_MANAGEMENT_CHECK_REPORT_DIR')
+    if report_dir:
+        index = next(i for i in range(dialog.tabs.count()) if dialog.tabs.tabText(i) == '助手连接')
+        dialog.tabs.setCurrentIndex(index)
+        QTest.qWait(800)
+        assert page.target.text() == str(target)
+        page.target.setCursorPosition(0)
+        app.processEvents()
+        dialog.grab().save(str(Path(report_dir) / 'agent-connections.png'))
+    assert Client(window.data_dir, autostart=False).state() == before
+    page.profile.setCurrentIndex(page.profile.findData('codex'))
+    assert not page.preview_button.isEnabled()
+    assert '[mcp_servers.personal_management_' + CHANNEL + '_' in page.config_preview.toPlainText()
+    dialog.reject()

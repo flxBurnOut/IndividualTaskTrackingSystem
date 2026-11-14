@@ -21,6 +21,10 @@ def main():
     parser.add_argument('--tray', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--show-update', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mcp', action='store_true')
+    parser.add_argument('--mcp-client', choices=['codex', 'antigravity', 'generic'], default='codex',
+                        help='MCP 客户端配置；非 Codex 仅提供通用业务工具')
+    parser.add_argument('--mcp-config', choices=['codex', 'antigravity', 'generic'], help='输出当前数据空间的 MCP 配置')
+    parser.add_argument('--check-mcp', choices=['codex', 'antigravity', 'generic'], help='自检 MCP 握手与业务读取，不修改业务记录')
     parser.add_argument('--mcp-discussion')
     parser.add_argument('--discussion-epoch')
     parser.add_argument('--diagnose', action='store_true')
@@ -36,11 +40,25 @@ def main():
         from .document_worker import worker
         return worker(args.document_worker)
     try:
-        args.data_dir = require_channel_dir(args.data_dir if args.data_dir is not None else default_data_dir())
+        args.data_dir = require_channel_dir(args.data_dir if args.data_dir is not None else default_data_dir(), inspect_runtime=not bool(args.mcp_config))
     except BetaIsolationError as error:
         parser.error(str(error))
     if args.demo_date and not args.seed_demo:
         parser.error('--demo-date 必须与 --seed-demo 一起使用')
+    if args.mcp_config:
+        from .agent_connections import configuration
+        print(configuration(args.data_dir, args.mcp_config))
+        return 0
+    if args.check_mcp:
+        import asyncio
+        from .agent_connections import probe_connection
+        try:
+            result = asyncio.run(probe_connection(args.data_dir, args.check_mcp))
+        except Exception as error:
+            print(json.dumps({'ok': False, 'message': str(error)}, ensure_ascii=False))
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.seed_demo:
         from .data_space import CHANNEL
         if CHANNEL != 'beta':
@@ -67,7 +85,7 @@ def main():
         return create_server(args.data_dir,args.mcp_discussion,args.discussion_epoch).run(transport='stdio')
     if args.mcp:
         from .mcp_server import run
-        return run(args.data_dir)
+        return run(args.data_dir, client_profile=args.mcp_client)
     if args.diagnose:
         from .client import Client
         print(json.dumps(Client(args.data_dir).query('diagnostics'), ensure_ascii=False, indent=2))

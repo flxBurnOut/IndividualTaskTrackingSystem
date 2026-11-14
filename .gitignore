@@ -32,6 +32,7 @@
 !/docs/发布说明_1.3.2.md
 !/docs/发布说明_1.3.3.md
 !/docs/发布说明_1.3.4.md
+!/docs/发布说明_1.3.5.md
 
 # Required build inputs and reusable package verification.
 /packaging/*
@@ -92,3 +93,8 @@ config.local.*
 settings.local.*
 .DS_Store
 Thumbs.db
+
+# Local MCP setup and cross-channel configuration locks.
+mcp_config.json
+*.personal-management-beta.lock
+*.personal-management.lock

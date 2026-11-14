@@ -393,6 +393,59 @@ async def verify_frozen_mcp_material_continuation(client, params):
     return evidence
 
 
+async def verify_frozen_agent_profiles(client, executable, data, environment):
+    """Actual frozen config/stdio/self-check paths, no external Agent accounts."""
+    before = client.state()
+    exported = subprocess.run([str(executable), '--data-dir', str(data), '--mcp-config', 'antigravity'],
+        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=45,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    assert exported.returncode == 0, exported.stderr
+    config = json.loads(exported.stdout)
+    name, entry = next(iter(config['mcpServers'].items()))
+    assert name.startswith('personal_management_stable_')
+    assert Path(entry['command']).resolve() == executable.resolve()
+    assert entry['args'] == ['--mcp', '--data-dir', str(data), '--mcp-client', 'antigravity']
+    assert 'PYTHONPATH' not in entry.get('env', {})
+    checked = subprocess.run([str(executable), '--data-dir', str(data), '--check-mcp', 'antigravity'],
+        env=environment, capture_output=True, text=True, encoding='utf-8', timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    probe = json.loads(checked.stdout)
+    assert probe['ok'] and probe['service_contract']['channel'] == 'stable'
+    assert probe['external_agent_verified'] is False and not probe['managed_discussions']
+    assert client.state() == before
+    barrier = asyncio.Barrier(3)
+    request_id = 'frozen-shared-' + __import__('uuid').uuid4().hex
+    async def worker(profile):
+        params = StdioServerParameters(command=str(executable),
+            args=['--mcp', '--data-dir', str(data), '--mcp-client', profile], env=environment)
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                names = {tool.name for tool in (await session.list_tools()).tools}
+                assert ('begin_discussion' in names) == (profile == 'codex')
+                state = await session.call_tool('query_business', {'name': 'state'})
+                assert not state.is_error and state.structured_content['epoch'] == before['epoch']
+                await barrier.wait()
+                created = await session.call_tool('create_entity', {'type':'task',
+                    'title':'Synthetic shared packaged MCP task','request_id':request_id,
+                    'epoch':before['epoch'],'expected_revision':before['revision']})
+                assert not created.is_error, created.content
+                invalid = await session.call_tool('update_entity', {'id':'missing-fields'})
+                assert invalid.is_error
+                alive = await session.call_tool('query_business', {'name':'state'})
+                assert not alive.is_error
+                return created.structured_content
+    results = await asyncio.wait_for(asyncio.gather(*(worker(p) for p in ('codex','antigravity','generic'))), 60)
+    assert len({r['result']['entity']['id'] for r in results}) == 1
+    assert sum(not r['replayed'] for r in results) == 1
+    assert client.query('receipt', request_id=request_id)['found']
+    assert client.state()['revision'] == before['revision'] + 1
+    return {'frozen_config':True,'source_environment_required':False,'readonly_probe':True,
+            'three_client_profiles':True,'one_committed_write':True,'invalid_call_isolated':True,
+            'service_survives_mcp_exit':True,'external_agent_verified':False}
+
+
 async def main(work_dir, report_path):
     root = require_test_workspace(work_dir) / 'package'
     root.mkdir(parents=True)
@@ -566,6 +619,7 @@ async def main(work_dir, report_path):
         report['frozen_document_worker'] = job['result']['metadata']['validation']
         report['mcp_generic_plan_revision'] = await verify_frozen_mcp_plan_revision(client, params)
         report['mcp_material_continuation'] = await verify_frozen_mcp_material_continuation(client, params)
+        report['mcp_client_profiles'] = await verify_frozen_agent_profiles(client, EXE, data, environment)
         report['service_survives_both_entrances'] = service.is_running()
         report['passed'] = True
     except Exception as error:
