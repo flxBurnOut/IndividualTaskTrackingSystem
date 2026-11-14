@@ -551,3 +551,20 @@ def test_draining_service_exits_without_gui_retry_and_explicit_launch_can_resume
             server.shutdown()
         for thread in services:
             thread.join(5)
+
+
+
+def test_mcp_self_check_reports_old_beta_service_before_stdio_eof(live, monkeypatch):
+    import asyncio
+    import mcp
+    from management.agent_connections import probe_connection
+    live.server.contract = {**live.server.contract, 'capabilities': ['release_handshake', 'idle_update_shutdown', 'appearance_accent']}
+    def no_stdio(*args, **kwargs):
+        pytest.fail('Old service should be diagnosed before launching a disposable MCP')
+    monkeypatch.setattr(mcp, 'Client', no_stdio)
+    with pytest.raises(ClientError) as caught:
+        asyncio.run(probe_connection(live.core.root, 'antigravity'))
+    assert caught.value.code == 'service_version_mismatch'
+    assert 'Beta' in caught.value.message and '重新启动' in caught.value.message
+    assert live.starts == []
+    assert live.core.query('state')['revision'] == 0

@@ -326,3 +326,142 @@ def test_interrupted_restore_blocked_before_old_jobs_run(tmp_path):
     assert (target / 'restore_pending.json').exists()
     with pytest.raises(BusinessError):
         Core(target)
+
+
+@pytest.fixture
+def bounded_service(tmp_path, monkeypatch):
+    """Real HTTP handler with controllable admission; no production process."""
+    import os
+    from types import SimpleNamespace
+    from management import client as client_module
+    from management.service import Server
+    from management.runtime_contract import service_contract
+    core = Core(tmp_path / 'bounded-service')
+    server = Server(core, 'synthetic-bounded-token')
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+    thread.start()
+    record = {'host': '127.0.0.1', 'port': server.server_port, 'pid': os.getpid(),
+              'token': server.token, 'data_dir': str(core.root), 'service_contract': service_contract()}
+    (core.root / 'runtime.json').write_text(json.dumps(record), encoding='utf-8')
+    starts = []
+    monkeypatch.setattr(client_module, 'start_service', lambda root: starts.append(root))
+    client = Client(core.root, autostart=False)
+    try:
+        yield SimpleNamespace(core=core, server=server, client=client, starts=starts)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+
+
+def test_saturated_service_returns_busy_before_accepting_write_and_recovers(bounded_service):
+    live = bounded_service
+    client = live.client
+    initial = client.state()
+    for _ in range(8):
+        assert live.server.slots.acquire(timeout=2)
+    try:
+        payload = {'request_id': 'synthetic-overload-request', 'epoch': initial['epoch'],
+                   'expected_revision': initial['revision'],
+                   'payload': {'type': 'task', 'title': 'Must not be accepted'}}
+        status, result, headers = raw_post(client, json.dumps(payload).encode(), path='/v1/commands/create')
+        assert status == 503 and headers['Retry-After'] == '1'
+        assert result['error']['code'] == 'service_busy'
+        assert result['error']['details']['request_accepted'] is False
+        assert live.core.query('state')['revision'] == initial['revision']
+    finally:
+        for _ in range(8):
+            live.server.slots.release()
+    assert client.state() == initial
+    assert not client.query('receipt', request_id='synthetic-overload-request')['found']
+    assert client.command('create', payload['payload'], request_id=payload['request_id'])['revision'] == 1
+
+
+def test_busy_discovery_does_not_bootstrap_a_live_service(bounded_service):
+    from management.client import ClientError
+    live = bounded_service
+    for _ in range(8):
+        assert live.server.slots.acquire(timeout=2)
+    try:
+        with pytest.raises(ClientError, match='正忙') as caught:
+            Client(live.core.root, autostart=True)
+        assert caught.value.code == 'service_busy'
+        assert live.starts == []
+    finally:
+        for _ in range(8):
+            live.server.slots.release()
+    assert live.client.state()['revision'] == 0
+
+
+def test_busy_retry_is_bounded_and_reuses_exact_write_envelope(monkeypatch):
+    from management import client as module
+    from management.client import ClientError
+    client = Client.__new__(Client)
+    calls, sleeps = [], []
+    import copy
+    body = {'request_id': 'synthetic-stable-request', 'epoch': 'old-epoch', 'expected_revision': 7,
+            'payload': {'title': 'Original edit'}}
+    original = copy.deepcopy(body)
+    def send(category, name, data, timeout):
+        calls.append((category, name, data, copy.deepcopy(data)))
+        body['payload']['title'] = 'Changed by another UI callback'
+        if len(calls) < 3:
+            raise ClientError('service_busy', 'busy', {'request_accepted': False, 'retry_after_seconds': 1})
+        return {'replayed': False}
+    monkeypatch.setattr(client, '_request_once', send)
+    monkeypatch.setattr(module.time, 'sleep', sleeps.append)
+    assert client._request('commands', 'create', body) == {'replayed': False}
+    assert len(calls) == 3 and len(sleeps) == 2
+    assert all(call[2] is calls[0][2] and call[3] == original for call in calls)
+    assert calls[0][2] is not body
+    calls.clear()
+    def busy(*args, **kwargs):
+        calls.append(1)
+        raise ClientError('service_busy', 'busy', {'request_accepted': False, 'retry_after_seconds': 1})
+    monkeypatch.setattr(client, '_request_once', busy)
+    with pytest.raises(ClientError):
+        client._request('commands', 'create', body)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('code,details', [
+    ('connection_lost', {}), ('internal_error', {}), ('service_busy', {}),
+    ('service_busy', {'request_accepted': True}), ('revision_conflict', {}),
+    ('service_busy', {'request_accepted': False, 'retry_after_seconds': float('nan')})])
+def test_uncertain_or_conflicting_write_is_not_replayed(monkeypatch, code, details):
+    from management.client import ClientError
+    client = Client.__new__(Client)
+    calls = []
+    def send(*args, **kwargs):
+        calls.append(1)
+        raise ClientError(code, 'synthetic', details)
+    monkeypatch.setattr(client, '_request_once', send)
+    with pytest.raises(ClientError):
+        client._request('commands', 'create', {'request_id': 'synthetic-original'})
+    assert len(calls) == 1
+
+
+def test_commit_then_disconnect_recovers_one_receipt(bounded_service):
+    from management.client import ClientError
+    from management.service import Handler
+    live = bounded_service
+    dropped = []
+    class DropFirstReply(Handler):
+        def send_json(self, value, status=200):
+            if self.path == '/v1/commands/create' and status == 200 and not dropped:
+                dropped.append(True)
+                self.close_connection = True
+                return
+            super().send_json(value, status)
+    live.server.RequestHandlerClass = DropFirstReply
+    state = live.client.state()
+    options = {'request_id': 'synthetic-lost-response', 'epoch': state['epoch'], 'expected_revision': state['revision']}
+    payload = {'type': 'task', 'title': 'Committed exactly once'}
+    with pytest.raises(ClientError) as caught:
+        live.client.command('create', payload, **options)
+    assert caught.value.code == 'connection_lost'
+    assert caught.value.details['request_id'] == options['request_id']
+    assert live.core.query('state')['revision'] == 1
+    assert live.client.query('receipt', request_id=options['request_id'])['found']
+    assert live.client.command('create', payload, **options)['replayed']
+    assert live.core.query('list', type='task')['total'] == 1
