@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QWidget
 from management.gui_codex_connection import CodexConnectionController
 from management.gui_theme import apply_appearance, current_appearance
 from management.gui_workflows import SettingsDialog
+from test_appearance_v5 import dispose_settings
 from test_gui_codex_connection_v14_2 import app, stop, wait
 from test_ux_workflows_v2 import ControlledBridge
 
@@ -34,9 +35,8 @@ def connected_settings(app, tmp_path):
     try:
         yield dialog, bridge, connection, calls
     finally:
-        dialog.close()
+        dispose_settings(app,dialog)
         stop(app, connection)
-        dialog.deleteLater()
         parent.deleteLater()
         apply_appearance(app, previous_appearance)
         app.processEvents()
@@ -150,6 +150,4 @@ def test_project_receipt_alone_never_reports_desktop_readiness(app, tmp_path):
         assert '已连接' not in dialog.message.text()
         assert '已连接' not in dialog.codex_project_note.text()
     finally:
-        dialog.close()
-        dialog.deleteLater()
-        app.processEvents()
+        dispose_settings(app,dialog)

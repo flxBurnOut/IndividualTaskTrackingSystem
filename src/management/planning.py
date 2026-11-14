@@ -313,7 +313,7 @@ def _warning_now():
 
 
 def warning_query(core,c,p):
-    """Current warnings first, with past occurrences retained behind a group."""
+    """Full-scan counts and paged warnings; categories never imply completion."""
     day=_date(p.get('date') or core.today(c)).isoformat()
     items=warning_scan(core,c,day)
     instant=_warning_now()
@@ -335,15 +335,24 @@ def warning_query(core,c,p):
                         finish=local_datetime(due,_minute(end),ZoneInfo(effective.get('timezone') or core.store.meta(c,'settings')['timezone']))
                         if finish<=instant:item['group']='past'
                     except ValueError:pass
-    items.sort(key=lambda item:(item['group']=='past',{'urgent':0,'warning':1,'unknown':2}[item['severity']],item.get('due_date') or '9999-12-31',item['owner_label'],item['id']))
+    for item in items:
+        item['category'] = ('unknown' if not item.get('due_date') else 'past' if item['group']=='past'
+                            else 'today' if item['due_date']==day else 'upcoming')
+    category=p.get('category')
+    if category not in (None,'all','today','past','upcoming','unknown'):
+        raise BusinessError('validation','警戒类别无效。')
+    items.sort(key=lambda item:(({'today':0,'past':1,'upcoming':2,'unknown':3}[item['category']] if category else item['group']=='past'),{'urgent':0,'warning':1,'unknown':2}[item['severity']],item.get('due_date') or '9999-12-31',item['owner_label'],item['id']))
     counts={group:sum(item['group']==group for item in items) for group in ('current','past')}
+    category_counts={key:sum(item['category']==key for item in items) for key in ('today','past','upcoming','unknown')}
     group=p.get('group')
     if group not in (None,'all','current','past'):
         raise BusinessError('validation','警戒分组无效。')
     selected=items if group in (None,'all') else [item for item in items if item['group']==group]
+    if category not in (None,'all'):
+        selected=[item for item in selected if item['category']==category]
     offset=max(0,int(p.get('offset',0)));limit=max(1,min(500,int(p.get('limit',100))))
     page=selected[offset:offset+limit]
-    return {'date':day,'items':page,'counts':counts,'group':group or 'all','total':len(selected),
+    return {'date':day,'items':page,'counts':counts,'category_counts':category_counts,'category':category or 'all','group':group or 'all','total':len(selected),
             'scan_complete':True,'occurrences_complete':all(item.get('occurrences_complete',True) for item in items),
             'returned_complete':offset==0 and len(selected)<=limit,
             'next_offset':offset+len(page) if offset+len(page)<len(selected) else None}

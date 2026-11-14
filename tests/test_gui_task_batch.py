@@ -211,7 +211,7 @@ def test_task_page_exposes_batch_and_disables_split_for_completed_task(app):
         page.batch_button.click();assert len(page.dialogs)==1 and page.dialogs[0].mode=='create'
         assert page.dialogs[0].parent_entity is None
         page.dialogs[0].close()
-        page.refresh()
+        page.open_library()
         row={**task(), 'owner_label':'未归属','in_plan':False,'completion_state':'done'}
         bridge.deliver('task_pool',{'items':[row],'total':1,'group':'all','date':'2030-01-07','next_offset':None})
         assert not page.split_button.isEnabled()
@@ -271,14 +271,13 @@ def test_batch_dialog_light_dark_large_font_and_long_source_layout(app,tmp_path)
             fill(dialog,'补齐先修笔记\t能复述三个关键概念\t30\n完成练习\t独立完成并纠正错题')
             dialog.sequential.setChecked(True);dialog.request_preview();preview(bridge,dialog)
             dialog.show();app.processEvents()
-            assert dialog.table.geometry().bottom()<dialog.sequential.geometry().top()
-            dialog.editor_scroll.ensureWidgetVisible(dialog.sequential);app.processEvents()
-            assert dialog.editor_scroll.viewport().rect().contains(dialog.sequential.mapTo(dialog.editor_scroll.viewport(),dialog.sequential.rect().bottomRight()))
-            assert 90<=dialog.context_scroll.height()<=100
+            assert dialog.table.isHidden() and not dialog.paste.isVisible()
+            assert dialog.pages.currentWidget() is dialog.editor_scroll
+            assert len(dialog.cards)==2 and all(card.gate.isVisible() for card in dialog.cards)
+            dialog.editor_scroll.ensureWidgetVisible(dialog.relation);app.processEvents()
+            assert dialog.editor_scroll.viewport().rect().contains(dialog.relation.mapTo(dialog.editor_scroll.viewport(),dialog.relation.rect().bottomRight()))
+            assert 90<=dialog.context_scroll.height()<=130
             assert dialog.context_scroll.verticalScrollBar().maximum()>0
-            header=dialog.table.horizontalHeader()
-            for column in (2,3,4):
-                assert header.sectionSize(column)>=header.fontMetrics().horizontalAdvance(dialog.table.horizontalHeaderItem(column).text())+28
             assert dialog.save_button.isVisible() and dialog.rect().contains(dialog.save_button.mapTo(dialog,dialog.save_button.rect().bottomRight()))
             assert dialog.width()<=1100 and dialog.height()<=1000
             assert dialog.grab().save(str(folder/f'task-batch-{theme}.png'))
@@ -288,7 +287,7 @@ def test_batch_dialog_light_dark_large_font_and_long_source_layout(app,tmp_path)
         apply_appearance(app,previous)
 
 
-def test_batch_toolbar_wraps_at_large_font_without_hiding_actions(app):
+def test_batch_steps_wrap_at_large_font_without_losing_optional_fields(app):
     from PySide6.QtTest import QTest
     from management.gui_theme import apply_appearance, current_appearance
 
@@ -297,23 +296,182 @@ def test_batch_toolbar_wraps_at_large_font_without_hiding_actions(app):
     bridge = ControlledBridge()
     dialog = TaskBatchDialog(bridge)
     try:
-        dialog.paste.setPlainText('保留尚未导入的任务草稿')
-        dialog.show()
-        for width in (980, 650, 980):
-            dialog.resize(width, 680)
-            QTest.qWait(60)
-            assert dialog.editor_scroll.horizontalScrollBar().maximum() == 0
-            actions = (dialog.import_button, dialog.add_button, dialog.remove_button,
-                       dialog.up_button, dialog.down_button)
-            for action in actions:
-                assert action.width() >= action.sizeHint().width()
-                assert action.height() >= action.sizeHint().height()
+        dialog.paste.setPlainText('整理阅读笔记\n购买活动材料')
+        dialog.show();QTest.qWait(60)
+        assert dialog.pages.currentWidget() is dialog.input_page
+        assert not dialog.table.isVisible() and not dialog.save_button.isVisible()
+        dialog.preview_button.click();preview(bridge,dialog)
+        assert dialog.pages.currentWidget() is dialog.editor_scroll
+        assert not dialog.paste.isVisible() and not dialog.table.isVisible()
+        card=dialog.cards[0];card.details_button.click();card.minutes.setText('30')
+        assert not dialog.save_button.isEnabled()
+        for width in (980,650,980):
+            dialog.resize(width,680);QTest.qWait(60)
+            assert dialog.editor_scroll.horizontalScrollBar().maximum()==0
+            assert card.title.width()>=160
+            for action in (dialog.preview_button,dialog.save_button,dialog.back_button,dialog.close_button):
+                assert action.height()>=action.sizeHint().height()
                 assert action.parentWidget().rect().contains(action.geometry())
-            toolbar = dialog.import_button.parentWidget()
-            if toolbar.width() < toolbar.layout().sizeHint().width():
-                assert len({action.y() for action in (*actions, dialog.count)}) > 1
-            assert dialog.paste.toPlainText() == '保留尚未导入的任务草稿'
-        assert bridge.commands == []
+        dialog.back_button.click()
+        assert dialog.pages.currentWidget() is dialog.input_page
+        assert dialog.table.item(0,2).text()=='30'
+        dialog.paste.setPlainText('联系场地负责人');dialog.preview_button.click();preview(bridge,dialog)
+        assert dialog.table.rowCount()==3 and dialog.table.item(0,2).text()=='30'
+        assert bridge.commands==[]
     finally:
-        dispose(app, dialog)
-        apply_appearance(app, previous)
+        dispose(app,dialog);apply_appearance(app,previous)
+
+
+def test_plain_batch_next_step_checks_current_titles_and_saved_navigation(app):
+    opened=[];planned=[];shown=[]
+    bridge=ControlledBridge()
+    dialog=TaskBatchDialog(bridge,on_open=opened.append,on_plan=planned.append,on_saved_ids=shown.append)
+    try:
+        dialog.paste.setPlainText('整理阅读笔记\n购买活动材料\n联系场地负责人')
+        dialog.next_step();first=preview(bridge,dialog)
+        assert [item['title'] for item in first['items']]==['整理阅读笔记','购买活动材料','联系场地负责人']
+        assert all('scheduled_date' not in item and 'estimated_minutes' not in item for item in first['items'])
+        assert len(dialog.cards)==3 and dialog.step=='review'
+        dialog.cards[0].title.setText('整理两篇阅读笔记')
+        assert dialog.preview_result is None
+        dialog.request_preview();second=preview(bridge,dialog)
+        assert second['items'][0]['title']=='整理两篇阅读笔记'
+        dialog.save()
+        assert bridge.commands[0]['payload']['items'][0]['title']=='整理两篇阅读笔记'
+        items=[task(str(i),item['title']) for i,item in enumerate(second['items'])]
+        bridge.commands[0]['callback']({'result':{'items':items,'links':[]}})
+        assert dialog.pages.currentWidget() is dialog.results and '尚未加入每日计划' in dialog.status.text()
+        dialog.view_saved();dialog.plan_saved()
+        assert shown==[['0','1','2']] and planned==[['0','1','2']]
+        assert len(bridge.commands)==1  # Navigation does not implicitly arrange tasks.
+    finally:dispose(app,dialog)
+
+
+def test_split_has_independent_task_cards_and_parent_navigation(app):
+    bridge=ControlledBridge();opened=[]
+    source=task();dialog=TaskBatchDialog(bridge,source=source,on_open=opened.append)
+    try:
+        bridge.deliver('get',{'entity':source},id='source')
+        bridge.deliver('list',{'items':[],'total':2},parent_id='source')
+        assert dialog.step=='review' and len(dialog.cards)==2
+        assert dialog.mode=='split' and dialog.table.isHidden()
+        dialog.cards[0].title.setText('确认场地');dialog.cards[0].gate.setText('收到场地确认')
+        dialog.cards[1].title.setText('准备材料');dialog.cards[1].gate.setText('材料清单齐全')
+        dialog.relation.setCurrentIndex(1)
+        assert '确认场地 → 准备材料' in dialog.sequence_hint.text()
+        assert '前后依赖' in dialog.sequence_hint.text()
+        dialog.request_preview();value=preview(bridge,dialog)
+        assert value['payload']['source_id']=='source' and value['payload']['sequential'] is True
+        dialog.save();bridge.commands[0]['callback']({'result':{'items':[task('c1'),task('c2')],'links':[]}})
+        dialog.view_saved();assert opened==['source']
+        assert '原任务仍需单独确认完成' in dialog.status.text()
+    finally:dispose(app,dialog)
+
+
+def test_plain_task_remove_preserves_remaining_metadata_and_invalidates_review(app):
+    bridge=ControlledBridge();dialog=TaskBatchDialog(bridge)
+    try:
+        fill(dialog);dialog.request_preview();preview(bridge,dialog)
+        dialog.cards[0].remove()
+        assert dialog.table.rowCount()==1 and len(dialog.cards)==1
+        assert dialog.cards[0].title.text()=='Do exercises'
+        assert dialog.cards[0].gate.text()=='Correct every error'
+        assert dialog.preview_result is None and not dialog.save_button.isEnabled()
+        dialog.cards[0].details_button.setChecked(True)
+        dialog.cards[0].due.setText('2030-01-10');dialog.cards[0].due.clear()
+        assert 'due_date' not in dialog.collect_items()[0]
+        assert bridge.commands==[]
+    finally:dispose(app,dialog)
+
+
+def test_advanced_table_paste_retains_five_columns_and_checks_limit_before_import(app):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QPushButton, QTextEdit
+    from management.gui_task_batch import SpreadsheetDraftDialog
+    bridge=ControlledBridge();dialog=TaskBatchDialog(bridge)
+    try:
+        def paste_modal():
+            modal=next(widget for widget in app.topLevelWidgets() if isinstance(widget,SpreadsheetDraftDialog))
+            text=modal.findChild(QTextEdit)
+            confirm=next(button for button in modal.findChildren(QPushButton) if button.text()=='下一步：核对这些任务')
+            text.setPlainText('\n'.join('Task '+str(i) for i in range(51)))
+            confirm.click()
+            assert dialog.table.rowCount()==0 and len(text.toPlainText().splitlines())==51
+            text.setPlainText('整理资料\t能找到三份原始文件\t30\t2030-01-10\t2030-01-09')
+            confirm.click()
+        QTimer.singleShot(0,paste_modal);dialog.paste_spreadsheet()
+        value=preview(bridge,dialog)
+        assert value['items']==[{'title':'整理资料','completion_gate':'能找到三份原始文件','estimated_minutes':30,'due_date':'2030-01-10','scheduled_date':'2030-01-09'}]
+        assert dialog.step=='review' and not bridge.commands
+    finally:dispose(app,dialog)
+
+
+def test_spreadsheet_draft_escape_and_window_close_keep_input_when_declined(app,monkeypatch):
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox, QTextEdit, QVBoxLayout
+    from management.gui_task_batch import SpreadsheetDraftDialog
+    dialog=SpreadsheetDraftDialog();dialog.input=QTextEdit();QVBoxLayout(dialog).addWidget(dialog.input)
+    dialog.input.setPlainText('尚未核对的任务');dialog.show();app.processEvents()
+    prompts=[]
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:prompts.append(args) or QMessageBox.StandardButton.No)
+    try:
+        QTest.keyClick(dialog,Qt.Key.Key_Escape);assert dialog.isVisible()
+        dialog.close();assert dialog.isVisible() and dialog.input.toPlainText()=='尚未核对的任务'
+        assert len(prompts)==2
+    finally:
+        dialog.input.clear();dialog.close();dialog.deleteLater();app.processEvents()
+
+
+def test_nested_detail_split_results_share_library_and_plan_actions(app, tmp_path):
+    from PySide6.QtWidgets import QWidget
+    core = Core(tmp_path)
+    parent = cmd(core,'create',{'type':'task','title':'Parent task','data':{'completion_gate':'Parent condition'}})['result']['entity']
+    source = cmd(core,'create',{'type':'task','title':'Nested task','parent_id':parent['id'],'data':{'completion_gate':'Nested condition'}})['result']['entity']
+    bridge=QueuedCoreBridge(core)
+    class Library:
+        def __init__(self): self.ids=[]
+        def show_batch_tasks(self, ids): self.ids=list(ids)
+    class Host(QWidget):
+        def __init__(self):
+            super().__init__(); self.tasks_page=Library(); self.plans=[]; self.sections=[]
+        def navigate(self, section): self.sections.append(section)
+        def manual_plan(self, day, task_ids=None): self.plans.append((day,list(task_ids or [])))
+    host=Host(); outer=TaskDetailDialog(bridge,parent,host); inner=TaskDetailDialog(bridge,source,outer); dialog=None
+    try:
+        wait(app,lambda:bridge.pending==0);inner.split_task();dialog=inner.dialogs[-1]
+        wait(app,lambda:bridge.pending==0);fill(dialog);dialog.request_preview();wait(app,lambda:bridge.pending==0)
+        dialog.save();wait(app,lambda:bridge.pending==0)
+        identifiers=list(dialog.saved_ids);before=core.query('state')
+        assert not dialog.plan_button.isHidden() and dialog.view_batch_button.text()=='查看这批子任务'
+        dialog.plan_button.click();wait(app,lambda:bridge.pending==0)
+        assert host.plans==[(core.query('task_pool')['date'],identifiers)]
+        assert core.query('list',type='plan')['total']==0 and core.query('state')==before
+        dialog.view_batch_button.click();wait(app,lambda:bridge.pending==0)
+        assert host.sections==['tasks'] and host.tasks_page.ids==identifiers
+        assert inner.closed and outer.closed and core.query('state')==before
+    finally:
+        wait(app,lambda:bridge.pending==0)
+        if dialog:dispose(app,dialog)
+        dispose(app,inner);dispose(app,outer);host.close();host.deleteLater()
+
+
+def test_standalone_detail_split_plan_opens_unsaved_editor(app, tmp_path):
+    from management.gui_workflows import PlanDialog
+    core=Core(tmp_path)
+    source=cmd(core,'create',{'type':'task','title':'Standalone task','data':{'completion_gate':'Condition'}})['result']['entity']
+    bridge=QueuedCoreBridge(core);detail=TaskDetailDialog(bridge,source);dialog=None
+    try:
+        wait(app,lambda:bridge.pending==0);detail.split_task();dialog=detail.dialogs[-1]
+        wait(app,lambda:bridge.pending==0);fill(dialog);dialog.request_preview();wait(app,lambda:bridge.pending==0)
+        dialog.save();wait(app,lambda:bridge.pending==0);identifiers=list(dialog.saved_ids)
+        before=core.query('state');dialog.plan_button.click();wait(app,lambda:bridge.pending==0)
+        editor=next(child for child in detail.dialogs if isinstance(child,PlanDialog))
+        wait(app,lambda:editor.table.rowCount()==2 and bridge.pending==0)
+        assert editor.isVisible() and editor.table.rowCount()==2
+        assert {editor.table.cellWidget(i,0).property('entity')['id'] for i in range(editor.table.rowCount())}==set(identifiers)
+        assert core.query('list',type='plan')['total']==0 and core.query('state')==before
+        editor.close();wait(app,lambda:bridge.pending==0)
+    finally:
+        wait(app,lambda:bridge.pending==0)
+        if dialog:dispose(app,dialog)
+        dispose(app,detail)

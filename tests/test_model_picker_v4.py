@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication, QComboBox
 
 from management import ai, model_catalog, __version__
 from management.gui_workflows import SettingsDialog
+from test_appearance_v5 import dispose_settings
 
 
 def remote(model='exact-model-v1', *, id='catalog-row-id', default=False):
@@ -128,7 +129,7 @@ def app():return QApplication.instance() or QApplication([])
 def picker(app,tmp_path):
     bridge=Bridge();dialog=SettingsDialog(bridge,{'types':[]},tmp_path/'synthetic-picker')
     yield dialog,bridge
-    dialog.close();dialog.deleteLater();app.processEvents()
+    dispose_settings(app,dialog)
 
 
 def load(dialog,bridge,model='saved-model',path='old.exe'):

@@ -394,8 +394,66 @@ def test_large_today_retains_explicit_current_plan_identity(business):
     async def scenario():
         async with MCPClient(create_server(core.root, client=client)) as sdk:
             result = await call(sdk,'query_business',{'name':'today','params':{'date':DAY}})
-            assert result['requested_view']=='today' and 'context' in result
+            assert result['format']==FORMAT and result['query']=='today'
             assert result['current_plan_id']==plan['id']
             assert result['current_plan_version']==plan['version']
             assert size(result)<=MAX_PAGE_BYTES
+            assert await collect(sdk,result)==client.query('today',date=DAY)
     asyncio.run(scenario())
+
+
+
+def test_larger_business_page_preserves_exact_view_and_reduces_round_trips(business):
+    core,client=business
+    entity=create(client,data={'content':LONG})
+    expected=client.query('get',id=entity['id'])
+    async def scenario():
+        counts=[]
+        async with MCPClient(create_server(core.root,client=client)) as sdk:
+            for capacity in (16384,65536):
+                page=await call(sdk,'read_business_page',{'name':'get','params':{'id':entity['id']},'byte_limit':capacity})
+                parts=[];count=0
+                while True:
+                    assert size(page)<=capacity
+                    parts.append(page['json_fragment']);count+=1
+                    if page['complete']:break
+                    page=await call(sdk,page['continuation']['tool'],page['continuation']['arguments'])
+                assert json.loads(''.join(parts))==expected
+                counts.append(count)
+        assert counts[1]*2<counts[0]
+    asyncio.run(scenario())
+
+
+def test_batch_material_tool_transmits_native_images_and_keeps_summary(business,tmp_path):
+    from PIL import Image
+    from test_context_materials_v14 import source
+    from test_context_service_v14 import open_context
+    core,client=business;ids=[]
+    for i in range(2):
+        path=tmp_path/f'visual-{i}.png';Image.new('RGB',(40,40),(i*100,40,50)).save(path)
+        ids.append(source(core,path)['id'])
+    op=open_context(core,sources=ids)['operation_id']
+    async def scenario():
+        async with MCPClient(create_server(core.root,client=client)) as sdk:
+            raw=await sdk.call_tool('read_material_batch',{'operation_id':op})
+            assert not raw.is_error
+            assert sum(getattr(b,'type',None)=='image' for b in raw.content)==2
+            batch=json.loads(raw.content[0].text)
+            assert len(batch['items'])==2
+            await call(sdk,'checkpoint_context',{'operation_id':op,'summary':'Resume from this useful summary'})
+            first=batch['items'][0]
+            await call(sdk,'checkpoint_context',{'operation_id':op,'step_key':first['step_key'],'delivery_token':first['delivery_token'],'result':{}})
+            assert core.query('operation_status',operation_id=op)['checkpoint']['summary']=='Resume from this useful summary'
+            saved=await call(sdk,'checkpoint_context_batch',{'operation_id':op,'items':[
+                {'step_key':x['step_key'],'delivery_token':x['delivery_token'],'result':{}} for x in batch['items']]})
+            assert saved['acknowledged']==2 and saved['reused_count']==1
+            views=await call(sdk,'read_context_batch',{'operation_id':op,'requests':[{'collection':'facts','view':'facts'},{'id':ids[0]}]})
+            assert views['requests_complete'] and views['items'][0]['result']['complete']
+    asyncio.run(scenario())
+
+
+def test_builtin_large_view_coverage_is_explicit():
+    from typing import get_args
+    from management.mcp_server import QueryName
+    from management.mcp_pages import PAGE_QUERIES
+    assert set(get_args(QueryName))-{'state','settings','capabilities'}==PAGE_QUERIES

@@ -8,6 +8,7 @@ NAMES = {'tutorial':'Tutorial','tut':'Tutorial','tutorials':'Tutorial','lecture'
 class Presenter:
     def __init__(self, core, c):
         self.core, self.c, self.cache = core, c, {}
+        self.location_cache = {}
 
     def get(self, identifier):
         if not identifier:return None
@@ -51,6 +52,27 @@ class Presenter:
 
     def entity(self, entity):
         return {**entity,**self.fields(entity)}
+
+    def location_path(self, entity):
+        """A bounded, structural path for location pickers, without body data."""
+        path, seen, candidate = [], set(), entity
+        complete = True
+        while candidate:
+            if candidate['id'] in seen or len(path) >= 64:
+                complete = False
+                break
+            seen.add(candidate['id'])
+            path.append({key: candidate[key] for key in ('id', 'type', 'title')})
+            parent_id = candidate.get('parent_id')
+            if not parent_id:
+                break
+            if parent_id not in self.location_cache:
+                row = self.c.execute('SELECT id,type,title,parent_id FROM entities WHERE id=?', (parent_id,)).fetchone()
+                self.location_cache[parent_id] = dict(row) if row else None
+            candidate = self.location_cache[parent_id]
+            if candidate is None:
+                complete = False
+        return {'location_path': list(reversed(path)), 'location_path_complete': complete}
 
 # Correlated ancestry lookup is used only for compact SQL sorting metadata.
 # Whole entity bodies are loaded only for the requested page.

@@ -15,6 +15,14 @@ def task(identifier='task-a',title='Synthetic preparation',**data):return {'id':
 
 def texts(widget):return '\n'.join(w.text() for w in widget.findChildren(QLabel))+ '\n'+'\n'.join(w.text() for w in widget.findChildren(QPushButton))
 
+def _dispose_detail(app,dialog):
+    from PySide6.QtCore import QCoreApplication,QEvent
+    dialog.saving_plan=dialog.completion_saving=False
+    dialog._completion_request=dialog._plan_request=None
+    dialog.close();dialog.deleteLater()
+    QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()
+
+
 def test_task_detail_waits_for_snapshot_and_creates_only_explicit_plan(app):
     bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
     try:
@@ -24,7 +32,7 @@ def test_task_detail_waits_for_snapshot_and_creates_only_explicit_plan(app):
         assert len(bridge.commands)==1
         assert bridge.commands[0]['name']=='add_to_plan'
         assert bridge.commands[0]['payload']=={'date':'2030-01-07','target_id':'task-a','plan_id':None,'plan_version':None}
-    finally:dialog.close()
+    finally:_dispose_detail(app,dialog)
 
 def test_task_detail_old_date_reply_cannot_replace_current_plan_version(app):
     bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
@@ -35,7 +43,7 @@ def test_task_detail_old_date_reply_cannot_replace_current_plan_version(app):
         dialog.join_plan();assert bridge.commands[-1]['payload']['plan_id']=='plan-new'
         assert bridge.commands[-1]['payload']['plan_version']==7
         assert bridge.commands[-1]['payload']['date']=='2030-01-08'
-    finally:dialog.close()
+    finally:_dispose_detail(app,dialog)
 
 def test_task_detail_failed_write_preserves_date_and_requires_fresh_read(app):
     bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
@@ -47,7 +55,7 @@ def test_task_detail_failed_write_preserves_date_and_requires_fresh_read(app):
         dialog.join_plan_button.click();assert len(bridge.commands)==1
         bridge.deliver('daily_tasks',{'plan':{'id':'plan','version':3}});dialog.join_plan_button.click()
         assert bridge.commands[-1]['payload']['plan_version']==3
-    finally:dialog.close()
+    finally:_dispose_detail(app,dialog)
 
 def test_today_candidates_show_reason_and_join_exact_selected_day(app):
     bridge=ControlledBridge();page=TodayPage(bridge);page.set_date('2030-01-07')
@@ -57,6 +65,8 @@ def test_today_candidates_show_reason_and_join_exact_selected_day(app):
         assert '当天候选待办' in texts(page.tasks_box) and '截止在这一天' in texts(page.tasks_box)
         assert '是否今天处理由你决定' in texts(page.tasks_box)
         add=next(w for w in page.tasks_box.findChildren(QPushButton) if w.text()=='加入这天计划');add.click();page.add_task(task(),'2030-01-07',result['plan'])
+        assert bridge.commands==[]
+        bridge.deliver('task_pool',{'date':'2030-01-07','plan':{'id':'plan','version':4},'epoch':bridge.epoch,'revision':bridge.revision})
         assert len(bridge.commands)==1
         assert bridge.commands[-1]['payload']=={'date':'2030-01-07','target_id':'task-a','plan_id':'plan','plan_version':4}
         page.set_tasks_page(10)
@@ -184,7 +194,7 @@ def test_real_task_detail_append_retains_original_block_and_duplicate_is_reused(
         assert current['data']['blocks'][1].get('minutes') is None
         count=core.query('list',type='plan')['total'];dialog.join_plan();wait(app,lambda:bridge.pending==0)
         assert core.query('list',type='plan')['total']==count
-    finally:dialog.close()
+    finally:_dispose_detail(app,dialog)
 
 
 def test_real_recurring_form_generates_candidate_without_plan_or_feedback(app,tmp_path):
@@ -272,7 +282,7 @@ def test_today_chinese_warning_and_empty_plan_text_fit_after_resize(app, font_si
             labels = [label for section in (page.plan_box, page.attention_box, page.tasks_box)
                       for label in section.findChildren(QLabel) if label.isVisible() and label.text()]
             assert any(label.objectName() == 'AttentionText' for label in labels)
-            assert any('未定日期的任务' in label.text() for label in labels)
+            assert any('未填写日期的任务' in label.text() for label in labels)
             for label in labels:
                 assert_label_fits(label)
             for row in page.attention_box.findChildren(QFrame, 'TimelineRow'):
@@ -323,3 +333,349 @@ def test_preparation_anchor_confirmation_fits_large_font_without_sideways_scroll
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
         apply_appearance(app, previous)
+
+
+def _dispose_entity_form(app,dialog):
+    from PySide6.QtCore import QCoreApplication,QEvent
+    dialog.saving=False;dialog._uncertain=False;dialog._discard_close=True
+    dialog.close();dialog.deleteLater()
+    QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()
+
+
+def _task_capabilities():
+    import copy
+    from management.schemas import TYPES
+    return {'types':{'task':copy.deepcopy(TYPES['task'])}}
+
+
+def test_task_properties_are_discoverable_without_enable_boxes_or_guessed_dates(app):
+    from PySide6.QtWidgets import QCheckBox
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();dialog=EntityForm(bridge,_task_capabilities())
+    try:
+        dialog.show();app.processEvents()
+        due=dialog.fields['due_date'];minutes=dialog.fields['estimated_minutes']
+        buttons={button.accessibleName():button for button in dialog.task_properties.findChildren(QPushButton)}
+        assert '未设置' in buttons['编辑截止日期'].text()
+        assert '未估计' in buttons['编辑预计用时'].text()
+        assert not any(box.isVisible() for field in dialog.fields.values() for box in field.findChildren(QCheckBox))
+        buttons['编辑截止日期'].click();app.processEvents()
+        assert due.editor.isVisible() and due.value() is None
+        due.editor.calendarWidget().show();app.processEvents()
+        due.editor.calendarWidget().hide()
+        assert due.value() is None  # Opening the date control alone is not a date fact.
+        due.editor.setDate(QDate(2030,1,12));assert due.value()=='2030-01-12'
+        due.clear_button.click();assert due.value() is None
+        buttons['编辑预计用时'].click();minutes.editor.setValue(25)
+        assert minutes.value()==25 and '25' in buttons['编辑预计用时'].text()
+        minutes.clear_button.click();assert minutes.value() is None
+        assert bridge.commands==[]
+    finally:_dispose_entity_form(app,dialog)
+
+
+@pytest.mark.parametrize('kind,minimum,zero_value', [('integer',0,0),('number',0,0.0),('integer',1,None)])
+def test_nullable_numeric_task_fields_distinguish_empty_from_legal_zero(app,kind,minimum,zero_value):
+    from management.gui_task_fields import TaskFieldEditor
+    field=TaskFieldEditor('amount',{'type':kind,'minimum':minimum,'maximum':100})
+    try:
+        assert field.value() is None
+        field.editor.setValue(0);assert field.value()==zero_value
+        field.editor.setValue(12);assert field.value()==12
+        field.clear_button.click();assert field.value() is None
+        assert field.enabled.isHidden()
+    finally:field.close();field.deleteLater();app.processEvents()
+
+
+def test_nullable_boolean_task_field_preserves_false_separately_from_unknown(app):
+    from management.gui_task_fields import TaskFieldEditor
+    field=TaskFieldEditor('verified',{'type':'boolean'},False)
+    try:
+        assert field.value() is False
+        field.editor.setCurrentIndex(field.editor.findData(True));assert field.value() is True
+        field.clear_button.click();assert field.value() is None
+        field.editor.setCurrentIndex(field.editor.findData(False));assert field.value() is False
+    finally:field.close();field.deleteLater();app.processEvents()
+
+
+def test_edit_existing_task_shows_saved_extras_and_preserves_unlisted_extension_data(app,tmp_path):
+    from management.core import Core
+    from management.gui_forms import EntityForm
+    core=Core(tmp_path/'task-edit-extra')
+    old=cmd(core,'create',{'type':'task','title':'有既有记录的任务','data':{
+        'priority':'high','notes':'保留这份明确说明','custom_extension_data':{'confirmed':False,'source':'synthetic'}}})['result']['entity']
+    bridge=QueuedCoreBridge(core);dialog=EntityForm(bridge,core.query('capabilities'),entity=old)
+    try:
+        assert dialog.field_layout.isRowVisible(dialog.fields['priority'])
+        assert dialog.field_layout.isRowVisible(dialog.fields['notes'])
+        assert 'custom_extension_data' not in dialog.fields
+        dialog.title_edit.setText('仅修改标题');dialog.save();wait(app,lambda:bridge.pending==0)
+        actual=core.query('get',id=old['id'])['entity']
+        assert actual['title']=='仅修改标题' and actual['data']==old['data']
+    finally:_dispose_entity_form(app,dialog)
+
+
+@pytest.mark.parametrize('exit_method',['escape','window','cancel_button'])
+def test_entity_form_cancel_then_discard_protects_input_without_writes(app,monkeypatch,exit_method):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialogButtonBox,QMessageBox
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();dialog=EntityForm(bridge,_task_capabilities())
+    answers=[QMessageBox.StandardButton.Cancel,QMessageBox.StandardButton.Discard]
+    prompts=[]
+    def answer(*args):prompts.append(args);return answers.pop(0)
+    monkeypatch.setattr(QMessageBox,'warning',answer)
+    def exit_once():
+        if exit_method=='escape':QTest.keyClick(dialog,Qt.Key.Key_Escape)
+        elif exit_method=='window':dialog.close()
+        else:dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+        app.processEvents()
+    try:
+        dialog.show();dialog.title_edit.setText('尚未保存的任务');app.processEvents()
+        exit_once();assert dialog.isVisible() and dialog.title_edit.text()=='尚未保存的任务'
+        assert not bridge.commands and len(prompts)==1
+        exit_once();assert not dialog.isVisible() and len(prompts)==2
+        assert bridge.commands==[]
+    finally:_dispose_entity_form(app,dialog)
+
+
+def test_entity_form_save_on_close_waits_for_receipt_then_closes(app,monkeypatch):
+    from PySide6.QtWidgets import QMessageBox,QDialog
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();dialog=EntityForm(bridge,_task_capabilities())
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:QMessageBox.StandardButton.Save)
+    try:
+        dialog.show();dialog.title_edit.setText('保存再关闭');dialog.close();app.processEvents()
+        assert dialog.isVisible() and dialog.saving and len(bridge.commands)==1
+        dialog.reject();assert dialog.isVisible() and len(bridge.commands)==1
+        bridge.commands[0]['callback']({'result':{'entity':task(title='保存再关闭')}})
+        assert dialog.result()==QDialog.DialogCode.Accepted and not dialog.isVisible()
+    finally:_dispose_entity_form(app,dialog)
+
+
+def test_entity_form_no_changes_closes_without_prompt_or_write(app,monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();dialog=EntityForm(bridge,_task_capabilities(),entity=task())
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:pytest.fail('Merely viewing must not ask to save'))
+    try:
+        dialog.show();dialog.close();assert not dialog.isVisible() and bridge.commands==[]
+    finally:_dispose_entity_form(app,dialog)
+
+
+@pytest.mark.parametrize('code',['connection_lost','timeout','protocol_error'])
+def test_entity_form_uncertain_save_keeps_submission_and_prevents_close(app,code):
+    import copy
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();dialog=EntityForm(bridge,_task_capabilities())
+    try:
+        dialog.show();dialog.title_edit.setText('原始任务名称');dialog.save()
+        first=copy.deepcopy({key:bridge.commands[0][key] for key in ('name','payload','options')})
+        bridge.commands[0]['error']({'code':code,'message':'Response unavailable'})
+        assert dialog._uncertain and not dialog.body.isEnabled()
+        dialog.close();assert dialog.isVisible()
+        dialog.title_edit.setText('超时后不应成为新请求的名称')
+        dialog.save()
+        second={key:bridge.commands[1][key] for key in ('name','payload','options')}
+        assert second==first
+        bridge.commands[1]['error']({'code':'authentication','message':'Reconnect not ready'})
+        assert dialog._uncertain and not dialog.body.isEnabled()
+        dialog.reject();assert dialog.isVisible()
+    finally:_dispose_entity_form(app,dialog)
+
+
+def test_entity_form_changes_parent_only_after_content_save_and_uses_new_version(app):
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();old={**task(),'parent_id':'old-project'}
+    dialog=EntityForm(bridge,_task_capabilities(),entity=old)
+    try:
+        dialog.title_edit.setText('修改名称并移动');dialog.parent_id='new-course';dialog.save()
+        first=bridge.commands[0]
+        assert first['name']=='update' and first['payload']['patch']['title']=='修改名称并移动'
+        assert 'parent_id' not in first['payload']['patch']
+        saved={**old,'title':'修改名称并移动','version':2}
+        first['callback']({'result':{'entity':saved}})
+        assert len(bridge.commands)==2
+        assert bridge.commands[1]['name']=='move'
+        assert bridge.commands[1]['payload']=={'id':'task-a','version':2,'parent_id':'new-course'}
+        bridge.commands[1]['error']({'code':'entity_conflict','message':'Moved elsewhere'})
+        assert '内容已保存' in dialog.error_label.text() and '所属位置' in dialog.error_label.text()
+        assert dialog.title_edit.text()=='修改名称并移动' and dialog.parent_id=='new-course'
+    finally:_dispose_entity_form(app,dialog)
+
+
+@pytest.mark.parametrize('definition,value',[
+    ({'type':'number'},-2.12345678912345),
+    ({'type':'integer'},-25),
+    ({'type':'selection'},['alpha','beta']),
+    ({'type':'object'},{'zero':0,'false':False}),
+])
+def test_task_field_opening_preserves_original_extension_value_exactly(app,definition,value):
+    from management.gui_task_fields import TaskFieldEditor
+    field=TaskFieldEditor('extension',definition,value)
+    try:
+        field.show();app.processEvents()
+        assert field.value()==value
+        if definition['type']=='selection':assert field.editor.text()=='alpha，beta'
+        field.clear_button.click();assert field.value() is None
+    finally:field.close();field.deleteLater();app.processEvents()
+
+
+def test_entity_form_partial_move_failure_retries_only_move_with_fresh_version(app):
+    from management.gui_forms import EntityForm
+    bridge=ControlledBridge();old={**task(),'parent_id':'old-project'}
+    dialog=EntityForm(bridge,_task_capabilities(),entity=old)
+    try:
+        dialog.title_edit.setText('已确认保存的内容');dialog.parent_id='new-course';dialog.save()
+        saved={**old,'title':'已确认保存的内容','version':2}
+        bridge.commands[0]['callback']({'result':{'entity':saved},'epoch':bridge.epoch,'revision':11})
+        bridge.commands[1]['error']({'code':'entity_conflict','message':'Concurrent modification'})
+        dialog.save()
+        assert len(bridge.commands)==2  # The completed content update is never resent.
+        bridge.deliver('get',{'entity':{**saved,'version':4},'epoch':bridge.epoch,'revision':13},id='task-a')
+        assert len(bridge.commands)==3 and [command['name'] for command in bridge.commands]==['update','move','move']
+        assert bridge.commands[-1]['payload']=={'id':'task-a','version':4,'parent_id':'new-course'}
+        assert bridge.commands[-1]['options']['expected_revision']==13
+        assert bridge.commands[-1]['options']['request_id']!=bridge.commands[1]['options']['request_id']
+    finally:_dispose_entity_form(app,dialog)
+
+
+@pytest.mark.parametrize('operation',['complete','plan'])
+@pytest.mark.parametrize('code',['connection_lost','timeout','protocol_error'])
+def test_task_detail_unknown_write_keeps_exact_request_and_guards_all_close_routes(app,operation,code):
+    import copy
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
+    try:
+        dialog.show();app.processEvents()
+        bridge.deliver('daily_tasks',{'plan':{'id':'plan','version':4},'epoch':bridge.epoch,'revision':12})
+        action=dialog.mark_complete if operation=='complete' else dialog.join_plan
+        action();action();assert len(bridge.commands)==1
+        first=bridge.commands[0];snapshot=copy.deepcopy({key:first[key] for key in ('name','payload','options')})
+        dialog.accept();assert dialog.isVisible()
+        first['error']({'code':code,'message':'No receipt'})
+        assert not dialog.plan_date.isEnabled() and not dialog.edit_button.isEnabled()
+        QTest.keyClick(dialog,Qt.Key.Key_Escape);dialog.close();assert dialog.isVisible()
+        dialog.completion_date='2030-02-01';dialog.plan_date.setDate(QDate(2030,2,1))
+        action();retry=bridge.commands[-1]
+        assert {key:retry[key] for key in ('name','payload','options')}==snapshot
+        retry['error']({'code':'authentication','message':'Reconnect not ready'})
+        dialog.reject();assert dialog.isVisible()
+        action();assert {key:bridge.commands[-1][key] for key in ('name','payload','options')}==snapshot
+        bridge.commands[-1]['callback']({'result':{},'epoch':bridge.epoch,'revision':13})
+        if operation=='complete':assert not dialog.isVisible()
+        else:
+            assert dialog.plan_date.isEnabled() and '2030-01-07' in dialog.plan_note.text()
+            dialog.accept();assert not dialog.isVisible()
+    finally:_dispose_detail(app,dialog)
+
+
+def test_task_detail_rest_day_does_not_change_mode_or_add_task(app):
+    bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
+    try:
+        bridge.deliver('daily_tasks',{'plan':{'id':'rest-plan','version':2,'mode':'rest'}})
+        dialog.join_plan()
+        assert not bridge.commands and '休息日' in dialog.plan_note.text()
+        assert dialog.plan_date.date()==QDate(2030,1,7)
+    finally:_dispose_detail(app,dialog)
+
+
+def test_task_detail_completion_conflict_reads_new_state_before_any_new_write(app):
+    bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
+    try:
+        dialog.mark_complete();bridge.commands[0]['error']({'code':'entity_conflict','message':'Changed elsewhere'})
+        assert dialog.complete_button.text()=='重新读取任务'
+        dialog.mark_complete();assert len(bridge.commands)==1
+        bridge.deliver('get',{'entity':{**task(),'version':3,'completion_state':'done'},'epoch':bridge.epoch,'revision':14},id='task-a')
+        assert dialog.complete_button.text()=='标记未完成' and len(bridge.commands)==1
+        dialog.mark_complete()
+        assert bridge.commands[1]['payload']['result']=='incomplete' and bridge.commands[1]['payload']['target_version']==3
+        assert bridge.commands[1]['options']['expected_revision']==14
+    finally:_dispose_detail(app,dialog)
+
+
+@pytest.mark.parametrize('operation,code',[('plan','plan_conflict'),('plan','rest_plan'),('plan','plan_target'),('plan','capacity'),('complete','completion_target'),('complete','review_plan_conflict'),('complete','context_changed')])
+def test_task_detail_exact_business_rejection_releases_unknown_request(app,operation,code):
+    bridge=ControlledBridge();dialog=TaskDetailDialog(bridge,task(),business_date='2030-01-07')
+    try:
+        bridge.deliver('daily_tasks',{'plan':None})
+        action=dialog.join_plan if operation=='plan' else dialog.mark_complete
+        action();first=bridge.commands[-1];first['error']({'code':'connection_lost','message':'Unknown'})
+        action();retry=bridge.commands[-1]
+        assert retry['options']==first['options'] and retry['payload']==first['payload']
+        retry['error']({'code':code,'message':'Explicit business rejection'})
+        assert not dialog._detail_write_locked() and dialog.plan_date.isEnabled()
+        dialog.reject();assert dialog.closed
+    finally:_dispose_detail(app,dialog)
+
+
+def test_nullable_date_popup_browses_current_month_without_creating_a_date(app):
+    from PySide6.QtCore import QPoint, Qt, QCoreApplication, QEvent
+    from PySide6.QtTest import QTest, QSignalSpy
+    from PySide6.QtWidgets import QToolButton
+    from management.gui_task_fields import TaskFieldEditor
+    field=TaskFieldEditor('due_date',{'type':'date'})
+    field.resize(470,55);field.show();app.processEvents()
+    editor=field.editor;calendar=editor.calendarWidget();changes=QSignalSpy(editor.dateChanged)
+    today=QDate.currentDate()
+    def open_popup():
+        QTest.mouseClick(editor,Qt.MouseButton.LeftButton,pos=QPoint(editor.width()-9,editor.height()//2))
+        wait(app,lambda:calendar.isVisible())
+    def escape():
+        QTest.keyClick(calendar,Qt.Key.Key_Escape)
+        wait(app,lambda:not calendar.isVisible())
+    try:
+        original=editor.date()
+        open_popup()
+        assert (calendar.yearShown(),calendar.monthShown())==(today.year(),today.month())
+        assert field.value() is None and editor.date()==original and changes.count()==0
+        calendar.findChild(QToolButton,'qt_calendar_nextmonth').click();app.processEvents()
+        assert (calendar.yearShown(),calendar.monthShown())==(today.addMonths(1).year(),today.addMonths(1).month())
+        assert field.value() is None and changes.count()==0
+        escape();assert field.value() is None and changes.count()==0
+        open_popup()
+        assert (calendar.yearShown(),calendar.monthShown())==(today.year(),today.month())
+        escape();assert editor.date()==original and changes.count()==0
+        editor.setDate(QDate(2030,7,12));recorded=changes.count()
+        open_popup()
+        assert (calendar.yearShown(),calendar.monthShown())==(2030,7)
+        calendar.findChild(QToolButton,'qt_calendar_prevmonth').click();escape()
+        assert field.value()=='2030-07-12' and changes.count()==recorded
+        field.clear_button.click();cleared=changes.count()
+        assert field.value() is None
+        open_popup()
+        assert (calendar.yearShown(),calendar.monthShown())==(today.year(),today.month())
+        escape();assert field.value() is None and changes.count()==cleared
+    finally:
+        if calendar.isVisible():QTest.keyClick(calendar,Qt.Key.Key_Escape)
+        field.close();field.deleteLater();QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()
+
+
+def test_nullable_popup_keeps_existing_date_month_and_other_date_edits_unchanged(app):
+    from PySide6.QtCore import QPoint, Qt, QCoreApplication, QEvent
+    from PySide6.QtTest import QTest, QSignalSpy
+    from PySide6.QtWidgets import QDateEdit
+    from management.gui_task_fields import TaskFieldEditor
+    from management.gui_calendar import install_calendar
+    field=TaskFieldEditor('due_date',{'type':'date'},'2029-02-18');field.resize(470,55);field.show()
+    ordinary=QDateEdit(QDate(2028,11,3));ordinary.resize(240,40)
+    regular=install_calendar(ordinary);app.processEvents()
+    changed=QSignalSpy(field.editor.dateChanged)
+    try:
+        QTest.mouseClick(field.editor,Qt.MouseButton.LeftButton,pos=QPoint(field.editor.width()-9,field.editor.height()//2))
+        calendar=field.editor.calendarWidget();wait(app,lambda:calendar.isVisible())
+        assert (calendar.yearShown(),calendar.monthShown())==(2029,2)
+        QTest.keyClick(calendar,Qt.Key.Key_Escape);wait(app,lambda:not calendar.isVisible())
+        assert field.value()=='2029-02-18' and changed.count()==0
+        assert install_calendar(ordinary) is regular and regular._nullable_editor is None
+        ordinary.show();app.processEvents()
+        QTest.mouseClick(ordinary,Qt.MouseButton.LeftButton,pos=QPoint(ordinary.width()-9,ordinary.height()//2))
+        wait(app,lambda:regular.isVisible())
+        assert (regular.yearShown(),regular.monthShown())==(2028,11) and ordinary.date()==QDate(2028,11,3)
+        QTest.keyClick(regular,Qt.Key.Key_Escape)
+    finally:
+        for editor in (field.editor,ordinary):
+            if editor.calendarWidget().isVisible():QTest.keyClick(editor.calendarWidget(),Qt.Key.Key_Escape)
+        field.close();ordinary.close();field.deleteLater();ordinary.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()

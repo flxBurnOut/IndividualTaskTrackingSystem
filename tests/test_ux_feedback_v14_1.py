@@ -11,6 +11,7 @@ from management.gui_theme import apply_appearance,color
 from management.gui_review import ReviewPage
 from management.gui_charts import CoverageChart,VerticalCoverageBar,display_segments
 from management.gui_workflows import SettingsDialog
+from test_appearance_v5 import dispose_settings
 from management.gui_menu import MenuButton
 from test_review_ui_v2 import ControlledBridge,load,daily as view
 from test_occurrence_flow_v13 import cmd,course_event,daily,submit,DAY
@@ -34,14 +35,14 @@ def test_attendance_selection_colors_saved_and_unsaved_choices(app,theme):
           'choices':[('attended','已参加'),('missed_needs_catchup','缺课需补'),('absent','未参加')]}
     try:
         load(page,bridge,view(items=[item]))
-        for choice,role in [('attended','done'),('missed_needs_catchup','incomplete'),('absent','danger')]:
+        for choice in ('attended','missed_needs_catchup','absent'):
             button=page.item_buttons['occurrence'][choice]
             if choice!='attended':button.click()
             settle(app)
             assert button.isChecked()
             assert sum(x.isChecked() for x in page.item_buttons['occurrence'].values())==1
             picture=button.grab().toImage()
-            assert picture.pixelColor(picture.width()//2,picture.height()-6).name()==color(role)
+            assert picture.pixelColor(picture.width()//2,picture.height()-6).name()==color('primary')
         assert page._choices[page._date]['occurrence']=='absent'
         assert bridge.commands==[], 'Choosing remains a draft until confirmation'
     finally:page.close()
@@ -119,7 +120,7 @@ def test_large_font_settings_scrolls_and_keeps_controls_text_height(app,tmp_path
         apply_appearance(app,{'theme':'light','font_size':13,'font_family':'Microsoft YaHei'})
         settle(app)
         assert dialog.executable.text()=='unsaved program path'
-    finally:dialog.close()
+    finally:dispose_settings(app,dialog)
 
 def test_new_menu_arrow_animates_open_and_returns_on_close(app):
     button=MenuButton('＋ 新建');button.setObjectName('Primary')

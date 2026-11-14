@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import copy
 import csv
 import io
 import uuid
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from .gui_calendar import install_calendar
+from .gui_write_state import write_result_unknown
 from .gui_forms import EntityForm, EntityPicker, FormDialog, FIELD_LABELS, label_status, readable
 
 
@@ -48,7 +50,7 @@ def fit_input_fields(container):
 
 class PlanDialog(FormDialog):
     """A dated plan editor with visible candidates and preserved existing blocks."""
-    def __init__(self, bridge, parent=None, on_saved=None, date=None):
+    def __init__(self, bridge, parent=None, on_saved=None, date=None, task_ids=None):
         super().__init__("安排一天", parent, 1040)
         self.bridge, self.on_saved = bridge, on_saved
         self.epoch = bridge.epoch
@@ -59,7 +61,19 @@ class PlanDialog(FormDialog):
         self.context_ready = False
         self.closed = self.dirty = self.loading_fields = False
         self.saving = False
+        self._plan_submission = None
+        self._plan_uncertain = False
         self.checked_candidates = {}
+        self._initial_task_ids = list(dict.fromkeys(task_ids or []))
+        self._prefill_pending = bool(self._initial_task_ids)
+        self._prefill_reading = False
+        self._prefill_generation = 0
+        self._prefill_results, self._prefill_failures = {}, {}
+        self._initial_task_date = date.toString('yyyy-MM-dd') if date else QDate.currentDate().toString('yyyy-MM-dd')
+        self._prefill_timer = QTimer(self)
+        self._prefill_timer.setInterval(80)
+        self._prefill_timer.timeout.connect(self._prefill_tasks)
+        if self._initial_task_ids: self._prefill_timer.start()
         self.candidate_history = []
         self.candidate_next = None
         self.candidate_loading = False
@@ -92,6 +106,15 @@ class PlanDialog(FormDialog):
         self.context.setTextFormat(Qt.TextFormat.PlainText)
         self.context.setObjectName("ContextCard");self.context.setWordWrap(True)
         self.body_layout.addWidget(self.context)
+        self.prefill_note = QLabel('正在读取本批任务；全部读回并核对后才能保存计划。')
+        self.prefill_note.setWordWrap(True); self.prefill_note.setObjectName('Hint')
+        self.prefill_note.setVisible(self._prefill_pending)
+        self.body_layout.addWidget(self.prefill_note)
+        prefill_actions = ActionRow()
+        self.cancel_prefill_button = QPushButton('取消带入这批任务')
+        self.cancel_prefill_button.clicked.connect(lambda:self._cancel_prefill('已取消本次带入；任务仍保存在任务库，现有计划和草稿保持原样。'))
+        self.cancel_prefill_button.setVisible(self._prefill_pending);prefill_actions.addWidget(self.cancel_prefill_button)
+        self.body_layout.addWidget(prefill_actions)
         self.unknown_toggle = QPushButton("查看时间待确认的安排")
         self.unknown_toggle.setCheckable(True);self.unknown_toggle.hide()
         self.unknowns = QLabel();self.unknowns.setTextFormat(Qt.TextFormat.PlainText);self.unknowns.setWordWrap(True);self.unknowns.hide()
@@ -172,19 +195,75 @@ class PlanDialog(FormDialog):
         self.mark_dirty();self.load_context()
 
     def update_save_state(self):
-        self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self.context_ready and not self.plan_loading and not self.saving and not self.draft_blocked)
+        save = self.buttons.button(QDialogButtonBox.StandardButton.Save)
+        save.setText('正在保存…' if self.saving else '核对上次保存结果' if self._plan_uncertain else '保存计划')
+        save.setEnabled(not self.saving and not self._prefill_pending and (self._plan_uncertain or (self.context_ready and not self.plan_loading and not self.draft_blocked)))
+        self.body.setEnabled(not self.saving and not self._plan_uncertain)
         for widget in (self.mode,self.table,self.source,self.new_task_button,self.candidates,*self.edit_actions):widget.setEnabled(self.can_edit())
         self.add_candidate_button.setEnabled(self.can_edit() and bool(self.checked_candidates))
 
     def can_edit(self):
-        return self.draft_ready and not self.plan_loading and not self.saving
+        return self.draft_ready and not self.plan_loading and not self.saving and not self._plan_uncertain
+
+    def _cancel_prefill(self, message):
+        if not self._prefill_pending:return
+        self._prefill_pending = self._prefill_reading = False
+        self._prefill_generation += 1
+        self._initial_task_ids = []
+        self._prefill_timer.stop();self.cancel_prefill_button.hide()
+        self.prefill_note.setText(message);self.update_save_state()
+
+    def _prefill_tasks(self):
+        if self.closed or not self._prefill_pending:
+            self._prefill_timer.stop();return
+        if self.context_day != self._initial_task_date:
+            self._cancel_prefill('日期已切换，本批任务尚未加入任何一天。请在选定日期从任务库重新选择。');return
+        if not self.can_edit() or not self.context_ready:return
+        if self.draft_blocked:
+            self._cancel_prefill('现有草稿需先核对，本批任务尚未加入。任务仍在任务库中。');return
+        identifiers = self._initial_task_ids
+        if self._prefill_reading:
+            if len(self._prefill_results) + len(self._prefill_failures) != len(identifiers):return
+            before = self.table.rowCount()
+            for identifier in identifiers:
+                if identifier in self._prefill_results:self.insert_block(self._prefill_results[identifier])
+            added = self.table.rowCount()-before
+            failures = len(self._prefill_failures)
+            self._prefill_pending = self._prefill_reading = False
+            self._initial_task_ids=[];self._prefill_timer.stop();self.cancel_prefill_button.hide()
+            note=f'已将本批 {added} 项任务放入草稿；核对日期并点击“保存计划”后才加入当天安排。'
+            if self.mode.currentData()=='rest':note+=' 当前仍为休息日；若要安排工作，请先明确选择其他安排方式。'
+            self.prefill_note.setText(note);self.draft_note.setText(note)
+            if failures:self.error(f'本批有 {failures} 项未能读取，尚未加入草稿。其余任务仍保留，请从任务库核对缺少的项目。')
+            self.update_save_state();return
+        self._prefill_reading=True;self._prefill_generation+=1
+        day,epoch,generation=self.context_day,self.epoch,self._prefill_generation
+        self._prefill_results,self._prefill_failures={},{}
+        def received(identifier, result=None, error=None):
+            if self.closed or not self._prefill_pending or generation!=self._prefill_generation or self.context_day!=day:return
+            entity=(result or {}).get('entity')
+            if result and result.get('epoch',epoch)!=epoch:error={'message':'数据空间已变化，未带入该任务。'}
+            if error or not entity or entity.get('type')!='task' or entity.get('archived'):
+                self._prefill_failures[identifier]=error or {'message':'任务已删除或不可安排。'}
+            else:self._prefill_results[identifier]=entity
+            # A same-day mode/context refresh can finish later. The timer keeps
+            # collected results until that context is ready, without losing IDs.
+            self._prefill_tasks()
+        for identifier in identifiers:
+            self.bridge.query('get',lambda result,identifier=identifier:received(identifier,result),
+                              lambda error,identifier=identifier:received(identifier,error=error),id=identifier,display=True)
 
     def load_context(self,*_):
+        if self.saving or self._plan_uncertain:
+            self.date.blockSignals(True); self.date.setDate(QDate.fromString(self.context_day, 'yyyy-MM-dd')); self.date.blockSignals(False)
+            return
         day=self.date.date().toString("yyyy-MM-dd")
         new_day=day!=self.context_day
         if new_day and self.context_day and self.dirty:
             if not self.persist_draft():
                 self.date.blockSignals(True);self.date.setDate(QDate.fromString(self.context_day,"yyyy-MM-dd"));self.date.blockSignals(False);return
+        if new_day and self.context_day and self._prefill_pending:
+            self._cancel_prefill('日期已切换，本批任务尚未加入任何一天。请在选定日期从任务库重新选择。')
         self.context_generation+=1;generation=self.context_generation
         self.context_ready=False;self.error_label.hide()
         if new_day:
@@ -482,7 +561,7 @@ class PlanDialog(FormDialog):
         QTimer.singleShot(0,lambda:self.load_context() if not self.closed else None)
 
     def discard_draft(self):
-        if self.saving:return
+        if self.saving or self._plan_uncertain:return
         if QMessageBox.question(self,'放弃当前草稿','放弃此窗口的编辑并重新读取？已保存的计划和反馈不变。',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         try:
             current=self.drafts.read(self.epoch,self.context_day)
@@ -494,41 +573,60 @@ class PlanDialog(FormDialog):
 
     def error(self,error):
         if self.closed:return
-        if self.saving:
+        if self.saving or self._plan_uncertain:
             self.error_label.setText(error.get('message',str(error)) if isinstance(error,dict) else str(error));self.error_label.show();return
         super().error(error)
         self.update_save_state()
 
     def reject(self):
-        if self.saving:
-            self.error_label.setText('正在保存计划，请等待结果后关闭。');self.error_label.show();return
+        if self._prefill_pending:
+            self.prefill_note.setText('本批任务仍在读取，尚未完整写入草稿。请等待读取完成，或先点击“取消带入这批任务”再关闭。');return
+        if self.saving or self._plan_uncertain:
+            self.error_label.setText('正在保存计划，请等待结果后关闭。' if self.saving else '保存结果尚未确认，请先点击“核对上次保存结果”，避免重复安排。');self.error_label.show();return
         if self.persist_draft():super().reject()
 
     def closeEvent(self,event):
-        if self.saving or not self.persist_draft():event.ignore();return
+        if self._prefill_pending:event.ignore();self.reject();return
+        if self.saving or self._plan_uncertain:event.ignore();self.reject();return
+        if not self.persist_draft():event.ignore();return
         super().closeEvent(event)
 
     def save(self):
-        if self.plan_loading or not self.context_ready or self.saving or self.draft_blocked:return
-        if not self.persist_draft():return
-        blocks=self.block_values()
+        if self.saving or self._prefill_pending:return
+        if self._plan_submission is None:
+            if self.plan_loading or not self.context_ready or self.draft_blocked:return
+            if not self.persist_draft():return
+            payload={'date':self.context_day,'mode':self.mode.currentData(),'blocks':self.block_values(),'source_text':self.source.toPlainText().strip()}
+            if self.plan:payload.update(plan_id=self.plan['id'],plan_version=self.plan['version'])
+            self._plan_submission = {
+                'command': 'revise_plan' if self.plan else 'create_plan', 'payload': copy.deepcopy(payload),
+                'options': {'epoch': self.epoch, 'expected_revision': getattr(self, 'context_revision', None), 'request_id': str(uuid.uuid4())},
+                'draft_token': self.draft_token,
+            }
+        request = self._plan_submission
         self.saving=True
         self.busy()
+        self.update_save_state()
         def saved(result):
             self.saving=False
+            self._plan_submission = None; self._plan_uncertain = False
             if self.closed:return
             self.dirty=False
             self.draft_timer.stop()
-            try:self.drafts.clear(self.epoch,self.context_day,self.draft_token)
+            try:self.drafts.clear(request['options']['epoch'],request['payload']['date'],request['draft_token'])
             except (OSError,ValueError,RuntimeError):pass  # Preserve any newer window's draft.
             if self.on_saved:self.on_saved(result)
             self.accept()
-        payload={'date':self.context_day,'mode':self.mode.currentData(),'blocks':blocks,'source_text':self.source.toPlainText().strip()}
-        if self.plan:payload.update(plan_id=self.plan['id'],plan_version=self.plan['version'])
         def failed(error):
             self.saving=False
+            code = error.get('code')
+            self._plan_uncertain = write_result_unknown(error, self._plan_uncertain)
+            if not self._plan_uncertain: self._plan_submission = None
             self.error(error)
-        self.bridge.command('revise_plan' if self.plan else 'create_plan',payload,saved,failed,epoch=self.epoch,expected_revision=getattr(self,'context_revision',None))
+            if self._plan_uncertain:
+                self.error_label.setText(error.get('message', str(error)) + '\n结果尚未确认，草稿和原请求已保留。请核对本次保存，勿重新创建计划。')
+            self.update_save_state()
+        self.bridge.command(request['command'],copy.deepcopy(request['payload']),saved,failed,**request['options'])
 
 
 from .gui_assistant import AssistanceDialog
@@ -983,6 +1081,14 @@ class SettingsDialog(QDialog):
         self._model_items = []
         self._ai_settings_ready = False
         self._ai_configuring = False
+        self._ai_baseline = None
+        self._other_save_uncertain = False
+        self._ai_uncertain = self._visibility_uncertain = False
+        self._settings_generation = 0
+        self._visibility_baseline = None
+        self._ai_submission = self._visibility_request = None
+        self._visibility_pending = False
+        self._discard_close = False
         self._visibility_dirty = False
         self.setWindowTitle("设置")
         self.resize(900, 760)
@@ -1323,6 +1429,41 @@ class SettingsDialog(QDialog):
         from .gui_tutorials import install_dialog_tutorial
         install_dialog_tutorial(self, 'settings')
 
+    def _ai_values(self):
+        return (self.ai_enabled.isChecked(), self.ai_mode.currentData(),
+                self.executable.text().strip(), self.model.currentData() or '', self.timeout.value())
+
+    def unsaved_sections(self):
+        sections = []
+        selection = self._display_selection()
+        if self.display_dirty and (any(value != self._display_snapshot.get(key) for key, value in selection['appearance'].items())
+                                   or selection['charts'] != self._chart_snapshot):
+            sections.append('显示与图表')
+        if self._visibility_dirty and self.show_assistants.isChecked() != self._visibility_baseline: sections.append('助手入口显示')
+        if self._ai_baseline is not None and self._ai_values() != self._ai_baseline:
+            sections.append('Codex 协助授权与连接设置')
+        return sections
+
+    def _allow_settings_close(self):
+        if self._display_saving or self._ai_configuring or self._visibility_pending or self._display_request is not None or self._ai_submission is not None or self._visibility_request is not None:
+            self.message.setText('请先等待保存结束或核对上次保存结果，再关闭设置。')
+            return False
+        sections = self.unsaved_sections()
+        if not sections or self._discard_close: return True
+        box = QMessageBox(self); box.setWindowTitle('设置尚未保存')
+        box.setText('这些分区有未保存的修改：\n' + '、'.join(sections))
+        box.addButton('返回保存', QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton('放弃未保存修改', QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton('继续编辑', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep); box.exec()
+        return box.clickedButton() == discard
+
+    def reject(self):
+        if self._allow_settings_close(): super().reject()
+
+    def closeEvent(self, event):
+        event.ignore(); self.reject()
+
     def fit_settings_fields(self):
         # Scroll pages keep the content's natural height; font changes must
         # never squeeze edit fields below their text and padding.
@@ -1346,34 +1487,40 @@ class SettingsDialog(QDialog):
         self.message.setText(error.get("message", str(error)))
 
     def load(self):
+        self._settings_generation += 1
+        generation = self._settings_generation
         def loaded(result):
-            if self._models_closed:
+            if self._models_closed or generation != self._settings_generation:
                 return
             self.current_settings = result.get("settings", {})
             if not self.display_dirty and not self._display_saving and self._display_request is None:
                 self.set_display_preferences(result)
-            if not self._visibility_dirty:
+            if not self._visibility_dirty and self._visibility_request is None:
                 from .appearance import assistants_visible
                 self.show_assistants.blockSignals(True)
                 self.show_assistants.setChecked(assistants_visible(self.current_settings))
                 self.show_assistants.blockSignals(False)
+                self._visibility_baseline = self.show_assistants.isChecked()
             config = self.current_settings.get("ai", {})
             if self.codex_connection is not None:
                 self.codex_connection.configure(self.current_settings)
             self.show_codex_project(self.current_settings.get("codex_project"), enabled=config.get("enabled", False))
-            self.ai_enabled.setChecked(config.get("enabled", False))
-            self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(config.get("execution_mode", "background"))))
-            self.executable.blockSignals(True)
-            self.executable.setText(config.get("executable") or "")
-            self.executable.blockSignals(False)
-            self._replace_model_choices([], config.get("model") or "")
+            preserve_ai = self._ai_submission is not None or (self._ai_baseline is not None and self._ai_values() != self._ai_baseline)
+            if not preserve_ai:
+                self.ai_enabled.setChecked(config.get("enabled", False))
+                self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(config.get("execution_mode", "background"))))
+                self.executable.blockSignals(True)
+                self.executable.setText(config.get("executable") or "")
+                self.executable.blockSignals(False)
+                self._replace_model_choices([], config.get("model") or "")
+                self.timeout.setValue(config.get("timeout_seconds", 180))
+                self._ai_baseline = self._ai_values()
             self._ai_settings_ready = True
-            self.ai_save.setEnabled(True)
-            self.assistant_visibility_save.setEnabled(True)
-            self.model_refresh.setEnabled(True)
+            self.ai_save.setEnabled(not self._ai_configuring)
+            self.assistant_visibility_save.setEnabled(not self._visibility_pending)
+            self.model_refresh.setEnabled(not self._ai_configuring and not self._ai_uncertain and not self._models_loading)
             self.model_note.setText('进入 Codex 协助后读取可选模型；原选择会保留。')
             self._model_tab_changed(self.tabs.currentIndex())
-            self.timeout.setValue(config.get("timeout_seconds", 180))
             self.modules.clear()
             modules = result.get("modules", [])
             if isinstance(modules, dict):
@@ -1446,16 +1593,26 @@ class SettingsDialog(QDialog):
         if not self.assistant_visibility_save.isEnabled():
             return
         selected = self.show_assistants.isChecked()
+        if self._visibility_request is None:
+            self._visibility_request = (selected, {'request_id': str(uuid.uuid4()), 'epoch': self.bridge.epoch, 'expected_revision': self.bridge.revision})
+        selected, options = self._visibility_request
+        self._visibility_pending = True
         self.assistant_visibility_save.setEnabled(False)
         self.show_assistants.setEnabled(False)
         def saved(result):
             if self._models_closed:
                 return
+            self._visibility_request = None
+            self._settings_generation += 1
+            self._visibility_pending = self._visibility_uncertain = False
+            self._other_save_uncertain = self._ai_uncertain
             self.assistant_visibility_save.setEnabled(True)
             self.show_assistants.setEnabled(True)
             self.current_settings.setdefault('appearance', {})['show_assistants'] = selected
             self._display_snapshot['show_assistants'] = selected
-            self._visibility_dirty = False
+            self._visibility_baseline = selected
+            self._visibility_dirty = self.show_assistants.isChecked() != selected
+            self.assistant_visibility_save.setText('保存入口显示')
             # An unrelated preference saved by this window can safely advance
             # its snapshot only if no other revision intervened.
             if isinstance(self.chart_revision, int) and result.get('epoch') == self.chart_epoch and result.get('revision') == self.chart_revision + 1:
@@ -1465,10 +1622,16 @@ class SettingsDialog(QDialog):
         def failed(error):
             if self._models_closed:
                 return
+            self._visibility_pending = False
+            code = error.get('code')
+            self._visibility_uncertain = code in {'connection_lost', 'timeout', 'request_timeout', 'protocol_error', 'connection_error', 'response_limit', 'internal_error'} or (self._visibility_uncertain and code not in {'revision_conflict', 'entity_conflict', 'validation'})
+            self._other_save_uncertain = self._visibility_uncertain or self._ai_uncertain
+            if not self._visibility_uncertain: self._visibility_request = None
             self.assistant_visibility_save.setEnabled(True)
-            self.show_assistants.setEnabled(True)
+            self.show_assistants.setEnabled(not self._visibility_uncertain)
+            self.assistant_visibility_save.setText('核对上次保存结果' if self._visibility_uncertain else '保存入口显示')
             self.error(error)
-        self.bridge.command('settings', {'settings': {'appearance': {'show_assistants': selected}}}, saved, failed)
+        self.bridge.command('settings', {'settings': {'appearance': {'show_assistants': selected}}}, saved, failed, **options)
 
     def set_display_preferences(self, result):
         settings=result.get('settings',{})
@@ -1683,7 +1846,7 @@ class SettingsDialog(QDialog):
             self._model_debounce.start()
 
     def refresh_models(self):
-        if not self._ai_settings_ready or self._models_closed or self._ai_configuring:
+        if not self._ai_settings_ready or self._models_closed or self._ai_configuring or self._ai_uncertain:
             return
         self._model_debounce.stop()
         if self._models_loading:
@@ -1699,7 +1862,7 @@ class SettingsDialog(QDialog):
 
         def current_response():
             self._models_loading = False
-            if self._models_closed or self._ai_configuring:
+            if self._models_closed or self._ai_configuring or self._ai_uncertain:
                 return False
             self.model_refresh.setEnabled(True)
             stale = generation != self._models_generation or path != self.executable.text().strip()
@@ -1806,6 +1969,9 @@ class SettingsDialog(QDialog):
                   "executable": self.executable.text().strip(), "model": self.model.currentData() or ''}
         if self.ai_mode.currentData() == 'desktop_shared' or 'execution_mode' in self.current_settings.get('ai', {}):
             config['execution_mode'] = self.ai_mode.currentData()
+        if self._ai_submission is None:
+            self._ai_submission = (dict(config), {'request_id': str(uuid.uuid4()), 'epoch': self.bridge.epoch, 'expected_revision': self.bridge.revision})
+        config, options = self._ai_submission
         self._ai_configuring = True
         self._models_generation += 1
         self._model_debounce.stop()
@@ -1816,6 +1982,12 @@ class SettingsDialog(QDialog):
             if self._models_closed:
                 return
             self._ai_configuring = False
+            self._ai_submission = None
+            self._settings_generation += 1
+            self._ai_uncertain = False
+            self._other_save_uncertain = self._visibility_uncertain
+            self._ai_baseline = (config['enabled'], config.get('execution_mode', 'background'), config['executable'], config['model'], config['timeout_seconds'])
+            self.ai_save.setText('保存 Codex 协助设置')
             self._ai_fields_enabled(True)
             if isinstance(self.chart_revision, int) and result.get('epoch') == self.chart_epoch and result.get('revision') == self.chart_revision + 1:
                 self.chart_revision = result['revision']
@@ -1841,11 +2013,17 @@ class SettingsDialog(QDialog):
             if self._models_closed:
                 return
             self._ai_configuring = False
-            self._ai_fields_enabled(True)
+            code = error.get('code')
+            self._ai_uncertain = code in {'connection_lost', 'timeout', 'request_timeout', 'protocol_error', 'connection_error', 'response_limit', 'internal_error'} or (self._ai_uncertain and code not in {'revision_conflict', 'entity_conflict', 'validation'})
+            self._other_save_uncertain = self._visibility_uncertain or self._ai_uncertain
+            if not self._ai_uncertain: self._ai_submission = None
+            self._ai_fields_enabled(not self._ai_uncertain)
+            self.ai_save.setEnabled(True)
+            self.ai_save.setText('核对上次保存结果' if self._ai_uncertain else '保存 Codex 协助设置')
             if config['enabled']:
                 self.codex_project_note.setText('本次设置尚未确认保存。当前填写内容已保留，请检查提示后重试。')
             self.error(error)
-        self.bridge.command("configure_codex", {"ai": config}, saved, failed)
+        self.bridge.command("configure_codex", {"ai": config}, saved, failed, **options)
 
     def saved(self, result):
         self.message.setText("已保存。")

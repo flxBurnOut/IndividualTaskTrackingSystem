@@ -89,15 +89,16 @@ def test_recovery_stale_write_preserves_quantity_without_overwriting_new_feedbac
     finally:dispose(app,dialog)
 
 
-def test_historical_warnings_are_lazy_folded_and_old_day_callback_is_ignored(app):
+def test_historical_warnings_are_visible_by_default_and_old_day_callback_is_ignored(app):
     bridge=ControlledBridge();page=TodayPage(bridge);page.set_date('2030-01-07')
     try:
-        bridge.deliver('warnings',{'items':[{'title':'Upcoming exam','reason':'In two days'}],'counts':{'current':1,'past':8},'total':1},group='current')
-        assert 'Upcoming exam' in words(page.attention_box) and not page.past_expanded
+        bridge.deliver('warnings',{'items':[{'title':'Upcoming exam','reason':'In two days','category':'upcoming'}, {'title':'Previous unknown outcome','reason':'Result needs checking','category':'past'}],'counts':{'current':1,'past':8},'category_counts':{'today':0,'past':8,'upcoming':1,'unknown':0},'total':9},group='all')
+        assert 'Upcoming exam' in words(page.attention_box) and page.past_expanded
+        assert 'Previous unknown outcome' in words(page.attention_box)
         assert not any(q['params'].get('group')=='past' for q in bridge.queries)
-        page.toggle_past_warnings();old=bridge.take('warnings',group='past')
+        page.warning_category.setCurrentIndex(page.warning_category.findData('past'));old=bridge.take('warnings',category='past')
         page.set_date('2030-01-08');old['callback']({'items':[{'title':'Wrong date historical warning'}]})
-        assert page.past_warnings is None and not page.past_expanded
+        assert page.past_warnings is None and page.past_expanded
         assert 'Wrong date historical warning' not in words(page.attention_box)
         assert bridge.commands==[]
     finally:dispose(app,page)
@@ -110,8 +111,31 @@ def test_today_snapshot_feedback_is_version_checked(app):
     try:
         bridge.deliver('daily_review',snapshot);bridge.revision=9;page.complete_plan_item(item,'done')
         request=bridge.commands[-1]
-        assert request['payload']['plan_version']==4 and request['options']=={'epoch':'captured','expected_revision':3}
+        assert request['payload']['plan_version']==4
+        assert request['options']['epoch']=='captured' and request['options']['expected_revision']==3
+        assert request['options']['request_id']
         assert request['payload']['answers']==[{'target_id':'task','result':'done'}]
+    finally:dispose(app,page)
+
+
+def test_today_unknown_feedback_keeps_original_date_and_request_for_retry(app):
+    import copy
+    bridge=ControlledBridge();page=TodayPage(bridge);page.set_date('2030-01-07')
+    item={'target_id':'task','title':'Original task','can_review':True}
+    try:
+        bridge.deliver('daily_review',{'epoch':'captured','revision':3,'has_plan':True,'plan':{'id':'plan','version':4},'items':[item]})
+        page.complete_plan_item(item,'done')
+        original=bridge.commands[-1]
+        expected=copy.deepcopy({key:original[key] for key in ('name','payload','options')})
+        original['error']({'code':'connection_lost','message':'Missing receipt'})
+        page.set_date('2030-01-08')
+        page.complete_plan_item(item,'incomplete')
+        assert len(bridge.commands)==1 and page.pending_writes()
+        page.retry_review()
+        assert {key:bridge.commands[-1][key] for key in ('name','payload','options')}==expected
+        bridge.commands[-1]['callback']({'result':{}})
+        assert not page.pending_writes() and '2030-01-07' in page.review_note.text()
+        assert page.date_iso()=='2030-01-08'
     finally:dispose(app,page)
 
 

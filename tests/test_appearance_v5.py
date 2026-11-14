@@ -110,12 +110,17 @@ def test_calendar_and_chart_repaint_and_preserve_semantics(app):
     editor=QDateEdit(QDate(2030,2,3));calendar=install_calendar(editor)
     bar=CoverageBar();bar.resize(200,22);bar.set_summary({'total':1,'done':1});bar.show()
     try:
+        app.processEvents()
+        bar.reveal.animation.setCurrentTime(bar.reveal.animation.duration())
         light=bar.grab().toImage().pixelColor(50,10).name()
         selected=calendar.selectedDate();minimum=calendar.minimumDate()
         apply_appearance(app,{'theme':'dark','font_size':20})
         app.processEvents()
         dark=bar.grab().toImage().pixelColor(50,10).name()
-        assert dark==color('done') and dark!=light
+        from test_theme_accents import assert_gradient_pixel
+        assert_gradient_pixel(dark,'done')
+        assert dark!=light
+        assert bar.total==1 and bar.values['done']==1 and bar.reveal.fraction==1
         assert calendar.headerTextFormat().background().color().name()==color('calendar_header')
         assert calendar.selectedDate()==selected and calendar.minimumDate()==minimum
         assert calendar.minimumWidth()>336
@@ -132,12 +137,21 @@ class Bridge:
         q=next(q for q in self.queries if q['name']==name and not q['delivered']);q['delivered']=True;return q
 
 
+def dispose_settings(app,dialog):
+    # Test cleanup only: assertions exercise the production close guards first.
+    dialog._discard_close=True
+    dialog._display_saving=dialog._ai_configuring=dialog._visibility_pending=False
+    dialog._display_request=dialog._ai_submission=dialog._visibility_request=None
+    dialog._other_save_uncertain=dialog._ai_uncertain=dialog._visibility_uncertain=False
+    dialog.close();dialog.deleteLater();app.processEvents()
+
+
 @pytest.fixture
 def settings(app,tmp_path):
     bridge=Bridge();dialog=SettingsDialog(bridge,{'types':[]},tmp_path/'synthetic')
     bridge.take('settings')['callback']({'settings':{'appearance':dict(DEFAULT_APPEARANCE)},'epoch':'synthetic','revision':10})
     yield dialog,bridge
-    dialog.close();dialog.deleteLater();app.processEvents()
+    dispose_settings(app,dialog)
 
 
 def display_read(bridge, settings=None, *, revision=10, epoch='synthetic'):
@@ -284,31 +298,47 @@ class LocalClient:
 
 def test_workspace_collapse_persists_and_external_theme_refreshes(app,tmp_path):
     core=Core(tmp_path/'synthetic-main')
+    from PySide6.QtCore import QCoreApplication, QEvent
     window=MainWindow(core.root,client_factory=lambda _:LocalClient(core));window.show()
+    # This case explicitly delivers an external settings refresh. Recurring
+    # polls are unrelated and can enqueue fresh reads at the five-second wait
+    # boundary while a global font/style change is repolishing native widgets.
+    window.poll.stop()
+    errors=[];window.bridge.failed.connect(errors.append)
+    def retire(view):
+        view.poll.stop();wait(app,lambda:not view.bridge.callbacks)
+        view.close()
+        wait(app,lambda:not view.isVisible() and not view.bridge.workers_running() and not view.codex_connection.workers_running())
+        view.deleteLater();QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()
     try:
         wait(app,lambda:bool(window.type_map) and not window.bridge.callbacks)
         window.navigate('projects');wait(app,lambda:not window.bridge.callbacks)
         window.workspace_page.toggle_sidebar(True)
-        wait(app,lambda:not window.bridge.callbacks and not window._sidebar_pending)
+        wait(app,lambda:not window._sidebar_pending and window._saved_appearance['workspace_sidebar_collapsed'])
         assert core.query('settings')['settings']['appearance']['workspace_sidebar_collapsed']
         assert window.workspace_page.expand_directory_button.isVisible()
-        cmd(core,'settings',{'settings':{'appearance':{'theme':'dark','font_size':16}}})
-        window.load_display_preferences();wait(app,lambda:not window.bridge.callbacks)
-        assert current_appearance()['theme']=='dark'
-        assert window.workspace_page.sidebar_collapsed
+        changed=cmd(core,'settings',{'settings':{'appearance':{'theme':'dark','font_size':16}}})
+        window.load_display_preferences()
+        # Verify the actual settings revision and rendered choice, not the
+        # momentary emptiness of a queue shared with assistant-activity reads.
+        wait(app,lambda:window._display_revision==changed['revision'] and
+             window._saved_appearance['theme']=='dark' and current_appearance()['theme']=='dark' and
+             current_appearance()['font_size']==16 and window.workspace_page.sidebar_collapsed)
+        assert errors==[]
         # Reopen a new window over the same persisted synthetic settings.
-        second=MainWindow(core.root,client_factory=lambda _:LocalClient(core));second.show()
+        second=MainWindow(core.root,client_factory=lambda _:LocalClient(core));second.show();second.poll.stop()
+        second.bridge.failed.connect(errors.append)
         try:
-            wait(app,lambda:bool(second.type_map) and not second.bridge.callbacks)
-            assert second.workspace_page.sidebar_collapsed
-            assert current_appearance()['font_size']==16
+            wait(app,lambda:bool(second.type_map) and second._display_revision==changed['revision'] and
+                 second.workspace_page.sidebar_collapsed and current_appearance()['font_size']==16)
             second.workspace_page.toggle_sidebar(False)
-            wait(app,lambda:not second.bridge.callbacks and not second._sidebar_pending)
+            wait(app,lambda:not second._sidebar_pending and not second.workspace_page.sidebar_collapsed)
             assert not core.query('settings')['settings']['appearance']['workspace_sidebar_collapsed']
+            assert errors==[]
         finally:
-            second.poll.stop();wait(app,lambda:not second.bridge.callbacks);second.close()
+            retire(second)
     finally:
-        window.poll.stop();wait(app,lambda:not window.bridge.callbacks);window.close()
+        retire(window)
 
 
 def test_theme_registration_does_not_own_or_cycle_widgets(app):
@@ -451,7 +481,7 @@ def test_display_save_after_unrelated_business_write_uses_real_core_fence(app, t
         assert actual['appearance']['workspace_sidebar_collapsed']
         assert core.query('get', id=task['id'])['entity'] == task
     finally:
-        dialog.close(); dialog.deleteLater(); app.processEvents()
+        dispose_settings(app,dialog)
 
 
 def test_display_save_keeps_core_race_rejection_then_checks_again(settings):
@@ -574,7 +604,7 @@ def test_retired_visual_request_keeps_current_ui_drafts_and_native_window(app, t
         assert not (core.root / 'ui-visual.json').exists()
     finally:
         if dialog:
-            dialog.close(); dialog.deleteLater()
+            dispose_settings(app,dialog)
         window.tasks_page.quick_input.clear()
         window.review_pending = False
         window.close()
@@ -640,3 +670,194 @@ def test_settings_all_sections_keep_text_height_at_actual_width(settings, app, t
         assert not bridge.commands
     finally:
         set_visual_style(previous)
+
+
+@pytest.mark.parametrize('choice',['返回保存','继续编辑','放弃未保存修改'])
+@pytest.mark.parametrize('exit_method',['window','escape','close_button'])
+def test_settings_unsaved_sections_close_does_not_silently_authorize_or_save(settings,app,choice,exit_method):
+    from PySide6.QtCore import Qt,QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox,QDialogButtonBox
+    dialog,bridge=settings
+    dialog.font_size.setValue(18)
+    dialog.show_assistants.setChecked(not dialog.show_assistants.isChecked())
+    dialog.ai_enabled.setChecked(True)
+    assert set(dialog.unsaved_sections())=={'显示与图表','助手入口显示','Codex 协助授权与连接设置'}
+    before=current_appearance();dialog.show();app.processEvents();seen=[]
+    def choose():
+        boxes=dialog.findChildren(QMessageBox)
+        if not boxes:return
+        box=boxes[-1];seen.append(box.text())
+        button=next((button for button in box.buttons() if button.text()==choice),None)
+        if button:button.click()
+        else:box.reject()
+    QTimer.singleShot(0,choose)
+    if exit_method=='window':dialog.close()
+    elif exit_method=='escape':QTest.keyClick(dialog,Qt.Key.Key_Escape)
+    else:
+        buttons=[box.button(QDialogButtonBox.StandardButton.Close) for box in dialog.findChildren(QDialogButtonBox)]
+        next(button for button in buttons if button is not None).click()
+    app.processEvents()
+    assert seen and all(section in seen[0] for section in ('显示与图表','助手入口显示','Codex 协助授权与连接设置'))
+    assert dialog.isVisible()==(choice!='放弃未保存修改')
+    assert dialog.font_size.value()==18 and dialog.ai_enabled.isChecked()
+    assert bridge.commands==[] and current_appearance()==before
+
+
+def test_settings_unmodified_browsing_closes_without_prompt(settings,app,monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    dialog,bridge=settings
+    monkeypatch.setattr(QMessageBox,'exec',lambda *args:pytest.fail('Viewing saved settings must not ask to save'))
+    dialog.show();app.processEvents()
+    assert dialog.unsaved_sections()==[]
+    dialog.reject();assert not dialog.isVisible() and bridge.commands==[]
+
+
+def test_settings_pending_and_uncertain_display_save_prevents_close(settings,app):
+    dialog,bridge=settings
+    dialog.show();dialog.font_size.setValue(17);dialog.save_chart_style()
+    dialog.close();assert dialog.isVisible() and '保存' in dialog.message.text()
+    display_read(bridge)
+    first=bridge.commands[-1]
+    first['error']({'code':'connection_lost','message':'No acknowledgement'})
+    dialog.reject();assert dialog.isVisible() and dialog._display_request is not None
+    assert not dialog.accent_picker.isEnabled()
+    dialog.save_chart_style()
+    assert bridge.commands[-1]['options']==first['options'] and bridge.commands[-1]['payload']==first['payload']
+    assert all('ai' not in command['payload'].get('settings',{}) for command in bridge.commands)
+
+
+@pytest.mark.parametrize('unknown_operation',['ai','visibility'])
+def test_settings_independent_save_receipts_cannot_unlock_other_uncertain_request(settings,app,unknown_operation):
+    dialog,bridge=settings
+    dialog.show();dialog.ai_enabled.setChecked(True);dialog.show_assistants.setChecked(True)
+    if unknown_operation=='ai':dialog.save_ai()
+    else:dialog.save_assistant_visibility()
+    unknown=bridge.commands[-1]
+    unknown['error']({'code':'connection_lost','message':'No receipt'})
+    if unknown_operation=='ai':dialog.save_assistant_visibility()
+    else:dialog.save_ai()
+    other=bridge.commands[-1]
+    other['callback']({'epoch':'synthetic','revision':11,'result':{}})
+    assert dialog._ai_uncertain if unknown_operation=='ai' else dialog._visibility_uncertain
+    dialog.close();assert dialog.isVisible()
+    if unknown_operation=='ai':
+        assert not dialog.ai_enabled.isEnabled()
+        dialog.save_ai()
+    else:
+        assert not dialog.show_assistants.isEnabled()
+        dialog.save_assistant_visibility()
+    retry=bridge.commands[-1]
+    assert retry['name']==unknown['name'] and retry['payload']==unknown['payload'] and retry['options']==unknown['options']
+    retry['error']({'code':'revision_conflict','message':'Original request definitely not applied'})
+    assert not dialog._ai_uncertain and not dialog._visibility_uncertain
+    assert dialog._ai_submission is None and dialog._visibility_request is None
+
+
+def test_settings_reload_keeps_unsaved_ai_fields_and_pending_ai_request(settings):
+    dialog,bridge=settings
+    dialog.ai_enabled.setChecked(True);dialog.executable.setText('C:/Synthetic/Uncommitted/codex.exe');dialog.timeout.setValue(321)
+    draft=dialog._ai_values();baseline=dialog._ai_baseline
+    dialog.load()
+    bridge.take('settings')['callback']({'settings':{'appearance':dict(DEFAULT_APPEARANCE),'ai':{'enabled':False,'timeout_seconds':180}},'epoch':'synthetic','revision':11})
+    assert dialog._ai_values()==draft and dialog._ai_baseline==baseline
+    dialog.save_ai();original=bridge.commands[-1]
+    original['error']({'code':'timeout','message':'Unknown'})
+    dialog.load()
+    bridge.take('settings')['callback']({'settings':{'appearance':dict(DEFAULT_APPEARANCE),'ai':{'enabled':False}},'epoch':'synthetic','revision':12})
+    assert dialog._ai_values()==draft and dialog._ai_submission is not None and not dialog.ai_enabled.isEnabled()
+    dialog.save_ai();assert bridge.commands[-1]['payload']==original['payload'] and bridge.commands[-1]['options']==original['options']
+
+
+def test_settings_late_reload_cannot_replace_successfully_saved_ai_snapshot(settings):
+    dialog,bridge=settings
+    dialog.load();old=bridge.take('settings')
+    dialog.ai_enabled.setChecked(True);dialog.timeout.setValue(321);dialog.save_ai()
+    bridge.commands[-1]['callback']({'epoch':'synthetic','revision':11,'result':{}})
+    old['callback']({'settings':{'appearance':dict(DEFAULT_APPEARANCE),'ai':{'enabled':False,'timeout_seconds':180}},'epoch':'synthetic','revision':10})
+    assert dialog.ai_enabled.isChecked() and dialog.timeout.value()==321
+    assert dialog._ai_values()==dialog._ai_baseline and not dialog._ai_submission
+
+
+def test_main_close_preserves_unknown_child_request_until_reconciled(app, tmp_path, monkeypatch):
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from management.gui_forms import EntityForm
+    core = Core(tmp_path / 'unknown-child-main')
+    window = MainWindow(core.root, client_factory=lambda _: LocalClient(core)); window.poll.stop(); window.onboarding.set_automatic(False); window.show()
+    form = None; requests = []
+    try:
+        wait(app, lambda: bool(window.type_map) and not window.bridge.callbacks)
+        form = EntityForm(window.bridge, window.capabilities, window, default_type='task'); form.open()
+        form.title_edit.setText('Synthetic task awaiting receipt')
+        def command(name, payload, callback=None, error=None, **options):
+            requests.append((name, copy.deepcopy(payload), callback, error, dict(options)))
+        monkeypatch.setattr(window.bridge, 'command', command)
+        before = core.query('state'); form.save()
+        requests[0][3]({'code':'timeout','message':'Synthetic response interrupted'})
+        assert form._uncertain and not window.bridge.callbacks
+        window.close(); app.processEvents()
+        assert window.isVisible() and not window.closed and not window.bridge._closing
+        assert form.isVisible() and form.title_edit.text() == 'Synthetic task awaiting receipt'
+        assert core.query('state') == before
+        # Explicitly retry the original request and deliver its real receipt.
+        form.save(); first, retry = requests
+        assert retry[0:2] == first[0:2] and retry[4] == first[4]
+        receipt = core.command(retry[0], retry[1], **retry[4]); retry[2](receipt)
+        assert not form.isVisible() and not form._uncertain
+        window.close(); wait(app, lambda: not window.isVisible() and not window.bridge.workers_running())
+        assert core.query('list', type='task')['total'] == 1
+    finally:
+        if form:
+            form._uncertain = form.saving = False; form._discard_close = True; form.close()
+        window.poll.stop(); wait(app, lambda: not window.bridge.callbacks); window.close()
+        wait(app, lambda: not window.bridge.workers_running())
+        window.deleteLater(); QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
+
+
+def test_main_close_consults_deepest_editor_and_leaves_other_window_untouched(app, tmp_path):
+    from PySide6.QtCore import QCoreApplication, QEvent, QTimer
+    from PySide6.QtWidgets import QMessageBox
+    from management.gui_forms import EntityForm
+    core = Core(tmp_path / 'two-independent-main-windows')
+    windows=[]; editors=[]; wrappers=[]; confirmation=None
+    try:
+        for _ in range(2):
+            window=MainWindow(core.root, client_factory=lambda _: LocalClient(core));window.poll.stop();window.onboarding.set_automatic(False);window.show();windows.append(window)
+            wait(app,lambda:bool(window.type_map) and not window.bridge.callbacks)
+        first, second=windows
+        wrapper=QDialog(first);wrapper.setWindowTitle('Synthetic nested editor owner');wrapper.open();wrappers.append(wrapper)
+        owned=EntityForm(first.bridge,first.capabilities,wrapper,default_type='task');owned.open();owned.title_edit.setText('Unsaved in first window');editors.append(owned)
+        foreign=EntityForm(second.bridge,second.capabilities,second,default_type='task');foreign.open();foreign.title_edit.setText('Keep the other window intact');editors.append(foreign)
+        order=[];owned.finished.connect(lambda *_:order.append('editor'));wrapper.finished.connect(lambda *_:order.append('wrapper'))
+        before=core.query('state')
+        confirmation=QMessageBox(first);confirmation.setText('An existing confirmation belongs to the user');confirmation.open()
+        first.close();app.processEvents()
+        assert confirmation.isVisible() and owned.isVisible() and not first.closed
+        assert order==[] and not first.bridge._closing
+        confirmation.reject()
+        choices=[]
+        def answer(standard):
+            def respond():
+                box=next(box for box in app.topLevelWidgets() if isinstance(box,QMessageBox) and box.isVisible())
+                choices.append(standard);box.button(standard).click()
+            QTimer.singleShot(0,respond)
+        answer(QMessageBox.StandardButton.Cancel);first.close();app.processEvents()
+        assert choices==[QMessageBox.StandardButton.Cancel]
+        assert owned.isVisible() and wrapper.isVisible() and first.isVisible() and not first.closed
+        assert foreign.isVisible() and not second.bridge._closing and order==[]
+        answer(QMessageBox.StandardButton.Discard);first.close()
+        wait(app,lambda:not first.isVisible() and not first.bridge.workers_running())
+        assert choices==[QMessageBox.StandardButton.Cancel,QMessageBox.StandardButton.Discard]
+        assert order==['editor','wrapper']
+        assert second.isVisible() and foreign.isVisible() and not second.closed and not second.bridge._closing
+        assert foreign.title_edit.text()=='Keep the other window intact'
+        assert core.query('state')==before
+    finally:
+        if confirmation:confirmation.reject()
+        for editor in editors:
+            editor.saving=editor._uncertain=False;editor._discard_close=True;editor.close()
+        for wrapper in wrappers:wrapper.close()
+        for window in windows:
+            window.poll.stop();wait(app,lambda:not window.bridge.callbacks);window.close()
+            wait(app,lambda:not window.bridge.workers_running());window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete);app.processEvents()

@@ -7,7 +7,7 @@ import pytest
 from PySide6.QtCore import QDate,QCoreApplication,QEvent,QPoint,QRect
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QLabel,QDateEdit,QPushButton
+from PySide6.QtWidgets import QApplication,QLabel,QDateEdit,QPushButton,QProgressBar
 from management.core import Core
 from management.gui_dashboard import DashboardPage
 from management.gui_today import TodayPage
@@ -91,6 +91,10 @@ def test_dashboard_long_owner_warning_and_event_text_survives_resize(app, font_s
                         ancestor = ancestor.parentWidget()
             owner_labels = [label for label in page.owner_section.findChildren(QLabel) if label.text() == title]
             assert len(owner_labels) == 1 and owner_labels[0].wordWrap(), 'full owner name must be visible rather than clipped in a capped button'
+            owner_bar = page.owner_section.findChild(QProgressBar, 'OwnerProgress')
+            assert owner_bar.height() == 12, 'owner progress must remain visibly thicker in both themes and font sizes'
+            assert owner_bar.width() == owner_bar.maximumWidth() == 280, 'thicker bars must retain their existing length across layouts'
+            assert (owner_bar.minimum(), owner_bar.maximum(), owner_bar.value()) == (0, 2, 1)
         owner_action = page.owner_section.findChild(QPushButton, 'OwnerOpen')
         owner_action.click(); assert opened == ['owner-long']
         section_layout = page.attention_section.layout()
@@ -253,21 +257,22 @@ def test_today_actions_keep_content_width_and_wrap_without_wide_cards(app, font_
         assert title.wordWrap() and title.height() >= title.heightForWidth(title.width()) - 2
         assert content.geometry().right() < task_row.width()
 
-        # Removing attention items must leave the empty plan at the viewport's
-        # top, even when more vertical space is available. No hidden section or
-        # flow row may turn the first half of the page into a blank spacer.
+        # Even with no warnings the visible warning region explains the empty
+        # state; in a wide window it stays next to the plan instead of hiding.
         page.warning_result = {'items': [], 'total': 0}
         page.today_result = {'notifications': [], 'unknowns': []}
         page.render_attention()
         page.render_tasks({'items': [], 'total': 0, 'next_offset': None})
         page.render_events([])
-        page.resize(page.width(), 1200)
+        page.resize(1600, 1200)
         page.scroll.verticalScrollBar().setValue(0)
         heading = page.plan_layout.itemAt(0).widget()
         top_limit = page.body.contentsMargins().top() + page.plan_layout.contentsMargins().top() + page.body.spacing()
         settled_top = lambda: heading.mapTo(page.scroll.widget(), QPoint()).y() <= top_limit
         settle_today_layout(app, settled_top)
         assert heading.mapTo(page.scroll.widget(), QPoint()).y() <= top_limit
+        assert page.attention_box.isVisible() and page.columns.getItemPosition(1)[:2] == (0, 1)
+        assert any('目前没有需要留意' in label.text() for label in page.attention_box.findChildren(QLabel))
         natural_height = max(page.plan_layout.sizeHint().height(), page.plan_layout.totalHeightForWidth(page.plan_box.width()))
         assert page.plan_box.height() <= natural_height + 6
         assert bridge.commands == []
@@ -312,3 +317,44 @@ def test_today_legacy_profile_request_preserves_current_controls_pending_state_a
         page.close(); page.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete); app.processEvents()
         apply_appearance(app, old_appearance)
+
+
+@pytest.mark.parametrize('theme', ['light', 'dark'])
+def test_today_warning_columns_stay_expanded_and_use_full_counts_without_losing_capture(app, theme):
+    from management.gui_theme import apply_appearance, current_appearance
+    previous = current_appearance()
+    apply_appearance(app, {**previous, 'theme': theme, 'font_size': 20})
+    bridge = ControlledBridge(); page = TodayPage(bridge)
+    page.quick_input.setText('Still writing this task')
+    page.warning_result = {'category_counts': {'today': 2, 'past': 18, 'upcoming': 4, 'unknown': 7},
+                           'total': 31, 'next_offset': 5, 'occurrences_complete': False,
+                           'items': [{'id': 'old', 'title': '结果尚待核对的较长项目名称' * 5,
+                                      'reason': '已过日期，结果待核对', 'category': 'past'}]}
+    page.render_attention()
+    page.review_result = {'has_plan': True, 'plan': {'id': 'plan', 'title': 'Today', 'mode': 'no_precise_time'},
+                          'items': [{'target_id': 'task', 'title': '需要完整换行的任务标题' * 7,
+                                     'completion_gate': '检查完成条件' * 10, 'can_review': True}],
+                          'summary': {'total': 1, 'done': 0, 'unreported': 1}}
+    page.render_plan(page.review_result)
+    try:
+        page.resize(1700, 1000); page.show(); app.processEvents()
+        assert page.columns.getItemPosition(1)[:2] == (0, 1)
+        assert .32 < page.attention_box.width() / (page.attention_box.width() + page.action_column.width()) < .48
+        assert page.attention_box.isVisible() and page.past_expanded
+        assert page.warning_category.itemText(page.warning_category.findData('past')).endswith('（18）')
+        assert any('尚未完整核查' in label.text() for label in page.attention_box.findChildren(QLabel))
+        assert not any('展开' in button.text() or '收起' in button.text() for button in page.attention_box.findChildren(QPushButton))
+        page.resize(660, 920); app.processEvents()
+        assert page.columns.getItemPosition(1)[:2] == (1, 0)
+        assert page.attention_box.isVisible() and page.quick_input.text() == 'Still writing this task'
+        assert page.scroll.horizontalScrollBar().maximum() == 0
+        labels = [label for label in page.plan_box.findChildren(QLabel) if label.wordWrap() and label.text()]
+        settle_today_layout(app, lambda: all(label.height() >= label.heightForWidth(label.width()) - 2 for label in labels))
+        assert all(label.height() >= label.heightForWidth(label.width()) - 2 for label in labels)
+        page.refresh()
+        query = bridge.take('warnings')
+        assert query['params']['group'] == 'all' and query['params']['limit'] == 5
+        assert query['params']['category'] == 'all'
+        assert page.quick_input.text() == 'Still writing this task' and not bridge.commands
+    finally:
+        page.close(); page.deleteLater(); app.processEvents(); apply_appearance(app, previous)

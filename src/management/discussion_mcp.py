@@ -45,7 +45,7 @@ def create_server(data_dir, conversation_id, epoch, *, client=None):
     def request(action,**params):
         try:
             routing.guard_fixed_binding(conversation_id, epoch)
-            return client._request('discussion',action,{'conversation_id':conversation_id,'epoch':epoch,**params},timeout=100 if params.get('name') in {'next_context_step','read_material'} else 35)
+            return client._request('discussion',action,{'conversation_id':conversation_id,'epoch':epoch,**params},timeout=100 if params.get('name') in {'next_context_step','read_material','read_material_batch'} else 35)
         except Exception as exc:
             if hasattr(exc,'code'):raise ToolError(json.dumps({'code':exc.code,'message':str(exc),'details':getattr(exc,'details',{})},ensure_ascii=False)) from exc
             raise

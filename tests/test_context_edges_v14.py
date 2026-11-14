@@ -117,17 +117,49 @@ def test_changed_generation_rejects_previous_worker_checkpoint(running,tmp_path)
     assert err.value.code=='context_changed'
 
 
-def test_input_checkpoints_consume_stage_budget_but_remain_durable(tmp_path):
-    core=Core(tmp_path/'data');op=open_context(core)['operation_id']
+@pytest.mark.parametrize('managed',[False,True])
+def test_input_checkpoints_consume_stage_budget_but_remain_durable(tmp_path,managed):
+    core=Core(tmp_path/'data')
+    if managed:
+        command(core,'settings',{'settings':{'ai':{'enabled':True}}})
+        sent=command(core,'send_message',{'scope':{'kind':'general'},'text':'Read data'})
+        op=sent['job']['input']['context_operation_id']
+    else:op=open_context(core)['operation_id']
     for i in range(8):
         core.query('checkpoint_context',operation_id=op,result={'notes':'x'*8500})
     with core.store.connect() as c:
         current=cs._operation(core,c,op)
-        assert current['delivered_bytes']>cs.STAGE_BYTES and current['phase']=='budget_stop'
-    with pytest.raises(BusinessError) as err:core.query('query_context',operation_id=op,collection='tasks')
-    assert err.value.code=='context_checkpoint_required'
-    cs.compacted(core,op)
+        assert current['delivered_bytes']>cs.STAGE_BYTES
+        assert current['phase']==('budget_stop' if managed else 'reading')
+    if managed:
+        with pytest.raises(BusinessError) as err:core.query('query_context',operation_id=op,collection='tasks')
+        assert err.value.code=='context_checkpoint_required'
+        saved=core.query('checkpoint_context',operation_id=op,summary='Managed checkpoint',**{'yield':True})
+        assert saved['end_turn_for_compaction'] and saved['mode']=='managed_job'
+        with pytest.raises(BusinessError):core.query('query_context',operation_id=op,collection='tasks')
+        cs.compacted(core,op)  # Synthetic confirmed provider event, managed job only.
     assert core.query('query_context',operation_id=op,collection='tasks')['coverage_complete']
+
+
+def test_history_images_use_ordinary_advisory_budget_without_changing_origin(tmp_path):
+    from PIL import Image
+    core=Core(tmp_path/'data');path=tmp_path/'past.png';Image.new('RGB',(32,32),'blue').save(path)
+    asset=source(core,path);command(core,'settings',{'settings':{'ai':{'enabled':True}}})
+    sent=command(core,'send_message',{'scope':{'kind':'general'},'text':'Read image','source_ids':[asset['id']]})
+    old=sent['job']['input']['context_operation_id']
+    step=core.query('next_context_step',operation_id=old);acknowledge(core,old,step)
+    with core.store.connect() as c:
+        before=dict(c.execute('SELECT * FROM context_operations WHERE id=?',(old,)).fetchone())
+    current=open_context(core)['operation_id']
+    for _ in range(6):
+        value=core.query('read_material',operation_id=current,source_id=asset['id'],chunk=0,from_job=sent['job']['id'])
+        assert value['historical'] and value['content']['kind']=='image'
+        from management.context_history import image
+        assert image(core,current,sent['job']['id'],value['content']['image_ref']).startswith(b'\x89PNG')
+    status=core.query('operation_status',operation_id=current)
+    assert status['delivered_bytes']>cs.STAGE_BYTES and status['stage']==0 and not status['checkpoint_required']
+    with core.store.connect() as c:
+        assert dict(c.execute('SELECT * FROM context_operations WHERE id=?',(old,)).fetchone())==before
 
 
 def test_quota_stops_after_tool_return_and_continues_same_operation():
@@ -264,3 +296,19 @@ def test_single_medium_candidate_is_fragmented_and_cache_lifecycle_bounded(tmp_p
         assert c.execute('SELECT count(*) FROM context_reads WHERE operation_id=?',(op,)).fetchone()[0]==0
         assert c.execute('SELECT last_page FROM context_queries WHERE operation_id=?',(op,)).fetchone()[0] is None
         assert c.execute('SELECT count(*) FROM context_actions WHERE operation_id=?',(op,)).fetchone()[0]==1
+
+
+
+def test_action_description_fragments_pin_the_schema_version(tmp_path,monkeypatch):
+    core=Core(tmp_path/'data')
+    from test_context_service_v14 import open_context
+    op=open_context(core)['operation_id']
+    monkeypatch.setattr(core,'types',lambda c:{'task':{'description':'Synthetic contract. '*2000}})
+    first=core.query('describe_action',operation_id=op,command='create',type='task')
+    assert first['next_offset'] and first['version']
+    args={'operation_id':op,'command':'create','type':'task','offset':first['next_offset']}
+    with pytest.raises(Exception) as error:core.query('describe_action',**args)
+    assert error.value.code=='context_version'
+    monkeypatch.setattr(core,'types',lambda c:{'task':{'description':'Changed contract. '*2000}})
+    with pytest.raises(Exception) as error:core.query('describe_action',**args,version=first['version'])
+    assert error.value.code=='context_changed'

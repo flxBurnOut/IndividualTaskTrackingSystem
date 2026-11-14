@@ -185,4 +185,4 @@ def test_normal_task_edit_preserves_dedicated_recovery_metadata(app,core):
         assert current['title']=='Clearer catch-up task title'
         assert current['data']['catchup_enabled'] and current['data']['catchup_total_quantity']==8
         assert core.query('recovery_summary',task_id=task['id'])['items'][0]['progress']['completed_quantity']==3
-    finally:form.close()
+    finally:form._discard_close=True;form.saving=False;form._uncertain=False;form.close()

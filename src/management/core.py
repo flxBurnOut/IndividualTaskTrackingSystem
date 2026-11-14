@@ -216,6 +216,8 @@ class Core:
             return {"api_version": 1, "types": list(self.types(c).values()), "commands": COMMANDS + list(self.extensions.commands), "code_extensions": self.extensions.describe(),
                     "workflows": [dict(w, module_id=m["id"]) for m in modules if m["enabled"] for w in m["manifest"].get("workflows", [])], "modules": modules}
         if name == "list":
+            if 'include_path' in p and type(p['include_path']) is not bool:
+                raise BusinessError('validation', '是否显示完整位置需要布尔值。')
             limit = max(1, min(500, int(p.get("limit", 100))))
             offset = max(0, int(p.get("offset", 0)))
             clauses, args = ["archived=?"], [int(bool(p.get("archived", False)))]
@@ -242,10 +244,22 @@ class Core:
             where = " AND ".join(clauses)
             total = c.execute("SELECT count(*) FROM entities WHERE " + where, args).fetchone()[0]
             rows = c.execute("SELECT * FROM entities WHERE " + where + " ORDER BY updated_at DESC,id LIMIT ? OFFSET ?", [*args, limit, offset])
+            if p.get('include_path'):
+                from .presentation import Presenter
+                presenter, items, size = Presenter(self, c), [], 0
+                for row in rows:
+                    entity = self.store.entity(row)
+                    entity.update(presenter.location_path(entity))
+                    cost = len(json.dumps(entity, ensure_ascii=False).encode('utf-8'))
+                    if items and size + cost > 512000: break
+                    items.append(entity); size += cost
+                return {'items': items, 'total': total, 'next_offset': offset + len(items) if offset + len(items) < total else None}
             return {"items": [self.store.entity(r) for r in rows], "total": total, "next_offset": offset + limit if offset + limit < total else None}
         if name == "get":
             from .presentation import Presenter
             entity = self.store.get(c,p["id"])
+            if p.get('include_path') is True:
+                entity.update(Presenter(self, c).location_path(entity))
             if p.get('display') and entity['type'] in {'task','event','milestone','assessment'}:
                 entity = Presenter(self,c).entity(entity)
             if p.get('display') and entity['type']=='task':

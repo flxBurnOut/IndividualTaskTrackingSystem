@@ -1,4 +1,5 @@
 """Shared native month popup; styling never changes the editor's date semantics."""
+import weakref
 from PySide6.QtCore import QDate, QLocale, Qt, QPoint, QSize
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QIcon, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import QCalendarWidget, QDateEdit, QToolButton
@@ -38,16 +39,31 @@ class ManagementCalendar(QCalendarWidget):
     def refresh_theme(self):
         refresh_calendar(self)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        reference = getattr(self, '_nullable_editor', None)
+        editor = reference() if reference is not None else None
+        if editor is None:
+            return
+        # The minimum date is the task editor's empty sentinel, not a user
+        # choice in 1752. Only move the page being browsed; selecting today
+        # would invent a deadline and emit dateChanged before any user choice.
+        date = QDate.currentDate() if editor.date() == editor.minimumDate() else editor.date()
+        date = max(editor.minimumDate(), min(date, editor.maximumDate()))
+        self.setCurrentPage(date.year(), date.month())
 
-def install_calendar(date_edit):
+
+def install_calendar(date_edit, *, nullable=False):
     """Install once and return the calendar; preserve selected/min/max dates."""
     if not isinstance(date_edit, QDateEdit):
         raise TypeError('install_calendar expects QDateEdit')
     existing = getattr(date_edit, '_management_calendar', None)
     if existing is not None:
+        if nullable: existing._nullable_editor = weakref.ref(date_edit)
         return existing
     selected, minimum, maximum = date_edit.date(), date_edit.minimumDate(), date_edit.maximumDate()
     calendar = ManagementCalendar(date_edit)
+    calendar._nullable_editor = weakref.ref(date_edit) if nullable else None
     calendar.setObjectName('ManagementCalendar')
     calendar.setLocale(QLocale(QLocale.Language.Chinese, QLocale.Country.China))
     calendar.setFirstDayOfWeek(Qt.DayOfWeek.Monday)

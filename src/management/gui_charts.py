@@ -6,6 +6,7 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from .gui_theme import color, LIGHT
+from .gui_progress import ProgressReveal, progress_brush
 from .review_display import KIND_LABELS, RESULT_LABELS, label as review_label, color_role
 
 COLORS = {key: LIGHT[key] for key in ('done','incomplete','unreported','other_reported')}
@@ -43,6 +44,8 @@ def display_segments(summary):
         if values['unreported']:rows.append({'key':'unreported','kind':'task','result':'unreported','count':values['unreported']})
     for row in rows:
         row['label']=row.get('label') or review_label(row);row['color']=color_role(row)
+        # An attendance result is a chart series, not a destructive action.
+        if row['color'] == 'danger':row['color'] = 'chart_absent'
     return rows
 
 
@@ -54,12 +57,14 @@ class CoverageBar(QWidget):
         self.setMinimumHeight(18)
         self.setMaximumHeight(22)
         self.setMinimumWidth(100)
+        self.reveal = ProgressReveal(self)
 
     def set_summary(self, summary):
         self.total, self.values = coverage(summary)
         self.segments=display_segments(summary)
         self.setAccessibleName('；'.join(f"{row['label']} {row['count']} 项" for row in self.segments))
         self.setToolTip(self.accessibleName())
+        self.reveal.set_ready(self.total > 0)
         self.update()
 
     def paintEvent(self, event):
@@ -71,11 +76,13 @@ class CoverageBar(QWidget):
         painter.setClipPath(path)
         painter.fillRect(rect, QColor(color('chart_track')))
         if self.total:
+            painter.setClipRect(QRectF(rect.left(), rect.top(), rect.width() * self.reveal.fraction, rect.height()), Qt.ClipOperation.IntersectClip)
             left = 0.0
             for row in self.segments:
                 width = self.width() * row['count'] / self.total
                 if width:
-                    painter.fillRect(QRectF(left, 2, width, rect.height()), QColor(color(row['color'])))
+                    segment = QRectF(left, 2, width, rect.height())
+                    painter.fillRect(segment, progress_brush(segment, row['color']))
                     left += width
         painter.end()
 
@@ -203,6 +210,7 @@ class CoverageRing(QWidget):
         self.empty_label = '暂无项目'
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._fit_font()
+        self.reveal = ProgressReveal(self)
 
     def _fit_font(self):
         height=max(124, self.fontMetrics().height() * 6)
@@ -225,6 +233,7 @@ class CoverageRing(QWidget):
         description = '；'.join(f"{row['label']} {row['count']} 项" for row in self.segments)
         self.setAccessibleName((f'分母 {self.total} 项；' + description) if self.total else empty_label + '；不计算完成占比。')
         self.setToolTip(self.accessibleName())
+        self.reveal.set_ready(self.total > 0)
         self.update()
 
     def segment_angles(self):
@@ -243,9 +252,12 @@ class CoverageRing(QWidget):
         painter.setPen(QPen(QColor(color('chart_track')), thickness))
         painter.drawEllipse(rect)
         position = 90.0
+        remaining = 360 * self.reveal.fraction
         for row, angle in self.segment_angles():
-            painter.setPen(QPen(QColor(color(row['color'])), thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-            painter.drawArc(rect, round(position * 16), -round(angle * 16))
+            painted_angle = min(angle, max(0.0, remaining))
+            painter.setPen(QPen(progress_brush(rect, row['color'], vertical=True), thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            painter.drawArc(rect, round(position * 16), -round(painted_angle * 16))
+            remaining -= angle
             position -= angle
         painter.setPen(QColor(color('chart_label')))
         text = f'{self.total}\n项' if self.total else '暂无\n项目' if self.empty_label == '暂无项目' else self.empty_label
@@ -266,6 +278,8 @@ class VerticalCoverageBar(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAccessibleName(self.description())
         self.setToolTip(self.description())
+        self.reveal = ProgressReveal(self)
+        self.reveal.set_ready(self.kind == 'data')
 
     def description(self):
         if self.kind == 'missing_plan':
@@ -307,15 +321,18 @@ class VerticalCoverageBar(QWidget):
         else:
             painter.setClipPath(path)
             painter.fillRect(rect, QColor(color('chart_track')))
+            filled = QRectF(rect.left(), rect.bottom() - rect.height() * self.reveal.fraction,
+                            rect.width(), rect.height() * self.reveal.fraction)
+            painter.setClipRect(filled, Qt.ClipOperation.IntersectClip)
             for key, segment, ratio in self.segment_rects():
                 row=next(row for row in self.segments if row['key']==key)
-                painter.fillRect(segment, QColor(color(row['color'])))
+                painter.fillRect(segment, progress_brush(segment, row['color'], vertical=True))
                 painter.setPen(QColor(color('chart_on_unknown' if row['color']=='unreported' else 'chart_on_color')))
                 percent = f'{ratio:.0%}'
                 lines=[KIND_LABELS.get(row['kind'],'事项'),RESULT_LABELS.get(str(row['result']),str(row['result'])),percent]
                 fits=segment.height()>=self.fontMetrics().height()*len(lines)+4 and segment.width()>=max(self.fontMetrics().horizontalAdvance(line) for line in lines)+4
                 text='\n'.join(lines) if fits else percent
-                if segment.height() >= self.fontMetrics().height() + 2 and segment.width() >= self.fontMetrics().horizontalAdvance(percent) + 2:
+                if filled.contains(segment) and segment.height() >= self.fontMetrics().height() + 2 and segment.width() >= self.fontMetrics().horizontalAdvance(percent) + 2:
                     painter.drawText(segment.adjusted(1, 1, -1, -1), Qt.AlignmentFlag.AlignCenter, text)
         painter.end()
 
@@ -340,7 +357,10 @@ class WeekDaysChart(QWidget):
             self._render()
 
     def set_days(self, days):
-        self.days = [dict(day) for day in days]
+        updated = [dict(day) for day in days]
+        if self.days == updated and self.layout.count():
+            return
+        self.days = updated
         self._render()
 
     @staticmethod
@@ -407,6 +427,7 @@ class WeekDaysChart(QWidget):
             title.setObjectName('Hint')
             layout.addWidget(title)
             bar = VerticalCoverageBar(day)
+            bar.reveal.set_scope(self, ('columns', date))
             layout.addWidget(bar)
             layout.addWidget(self._date_button(date))
             text = '缺计划' if bar.kind == 'missing_plan' else '空计划' if bar.kind == 'empty_plan' else f'{bar.total} 项'
@@ -434,6 +455,7 @@ class WeekDaysChart(QWidget):
             button.setFixedWidth(65)
             line.addWidget(button)
             bar = CoverageBar()
+            bar.reveal.set_scope(self, ('rows', date))
             bar.set_summary(day.get('summary') or {})
             line.addWidget(bar, 1)
             label = QLabel(self._detail(day))
@@ -459,6 +481,7 @@ class WeekDaysChart(QWidget):
             total, _ = coverage(day.get('summary') or {})
             has_plan = day.get('can_review', day.get('has_plan'))
             ring = CoverageRing()
+            ring.reveal.set_scope(self, ('tiles', date))
             ring.set_summary(day.get('summary') or {}, empty_label='无计划' if not has_plan else '空计划')
             layout.addWidget(ring)
             label = QLabel(self._detail(day))

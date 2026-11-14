@@ -2,6 +2,8 @@
 from __future__ import annotations
 import html
 import re
+import copy
+import uuid
 from pathlib import Path
 from PySide6.QtCore import QDate, QSize, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath
@@ -13,7 +15,9 @@ from PySide6.QtWidgets import (
 from .gui_forms import label_type, label_status, DeleteTaskDialog, EntityPicker, EntityForm
 from .gui_calendar import install_calendar
 from .gui_theme import color, bind_theme
+from .gui_progress import AnimatedProgressBar
 from .gui_layout import ActionRow
+from .gui_write_state import write_result_unknown
 from .gui_sources import AddSourceDialog, RefileSourceDialog, SourceContentDialog, extraction_label, source_origin
 
 BASE_TYPES = ("task", "project", "course", "activity", "domain", "goal")
@@ -53,7 +57,7 @@ def plain_label(text, name=None):
 
 class CountProgress(QFrame):
     """A count of confirmed task outcomes; never a time or mastery percentage."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, reveal_scope=None, reveal_key='progress'):
         super().__init__(parent)
         self.setObjectName("ProgressCard")
         layout = QVBoxLayout(self)
@@ -64,7 +68,7 @@ class CountProgress(QFrame):
         top.addWidget(self.title, 1)
         top.addWidget(self.count)
         layout.addLayout(top)
-        self.bar = QProgressBar()
+        self.bar = AnimatedProgressBar(reveal_scope=reveal_scope, reveal_key=reveal_key)
         self.bar.setFixedHeight(7)
         self.bar.setTextVisible(False)
         layout.addWidget(self.bar)
@@ -439,6 +443,9 @@ class TaskDetailDialog(QDialog):
         self.children_offset, self.children_history, self.children_next = 0, [], None
         self.children_generation = 0
         self.completion_saving = False
+        self._completion_request = self._plan_request = None
+        self._completion_uncertain = self._plan_uncertain = False
+        self._completion_needs_reload = False
         self.completion_epoch, self.completion_revision = bridge.epoch, bridge.revision
         self.completion_date = business_date or QDate.currentDate().toString("yyyy-MM-dd")
         self.destroyed.connect(lambda *_: setattr(self, "closed", True))
@@ -465,7 +472,7 @@ class TaskDetailDialog(QDialog):
             hints.append(f"预计 {data['estimated_minutes']} 分钟")
         if hints:
             layout.addWidget(plain_label(" · ".join(hints), "Quiet"))
-        details = QWidget(); details_layout = QVBoxLayout(details); details_layout.setContentsMargins(0, 0, 6, 0); details_layout.setSpacing(12)
+        details = QWidget(); self.details_area = details; details_layout = QVBoxLayout(details); details_layout.setContentsMargins(0, 0, 6, 0); details_layout.setSpacing(12)
         detail_scroll = QScrollArea(); detail_scroll.setWidgetResizable(True); detail_scroll.setFrameShape(QFrame.Shape.NoFrame); detail_scroll.setWidget(details); layout.addWidget(detail_scroll, 1)
         for key, heading in [("completion_gate", "完成标准"), ("notes", "说明"), ("description", "说明"), ("content", "内容"), ("acceptance", "需要交付或达到的结果"), ("source_text", "来源与依据")]:
             if data.get(key):
@@ -596,14 +603,61 @@ class TaskDetailDialog(QDialog):
 
     def split_task(self):
         from .gui_task_batch import TaskBatchDialog, can_split_task
-        if self.closed or self.completion_saving or self.saving_plan or not can_split_task(self.entity): return
-        dialog = TaskBatchDialog(self.bridge, self, source=self.entity, on_saved=self.child_saved, on_open=self.open_child_id)
+        if self.closed or self._detail_write_locked() or not can_split_task(self.entity): return
+        dialog = TaskBatchDialog(self.bridge, self, source=self.entity, on_saved=self.child_saved, on_open=self.open_child_id,
+                                 on_saved_ids=self.show_split_results, on_plan=self.plan_split_results)
         self.dialogs.append(dialog)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.finished.connect(lambda *_:self.dialogs.remove(dialog) if dialog in self.dialogs else None)
         dialog.open()
 
+    def _split_host(self):
+        host = self.parentWidget()
+        while host is not None:
+            if hasattr(host, 'tasks_page') and callable(getattr(host, 'manual_plan', None)):
+                return host
+            host = host.parentWidget()
+        return None
+
+    def show_split_results(self, ids):
+        if self.closed: return
+        host = self._split_host()
+        if host is not None:
+            host.navigate('tasks')
+            host.tasks_page.show_batch_tasks(list(ids))
+            # Successful results may be several dialogs deep. Close only this
+            # saved result branch so the requested library is actually visible.
+            for child in self.dialogs[:]:
+                if getattr(child, 'saved', False): child.accept()
+            current = self
+            while isinstance(current, TaskDetailDialog):
+                parent = current.parentWidget(); current.accept(); current = parent
+            host.raise_(); host.activateWindow()
+        else:
+            self.children_offset, self.children_history = 0, []
+            self.load_children()
+
+    def plan_split_results(self, ids):
+        if self.closed: return
+        def loaded(result):
+            if self.closed: return
+            host = self._split_host()
+            if host is not None:
+                host.manual_plan(result['date'], task_ids=list(ids))
+                return
+            from .gui_workflows import PlanDialog
+            dialog = PlanDialog(self.bridge, self, self.child_saved,
+                                date=QDate.fromString(result['date'], 'yyyy-MM-dd'), task_ids=list(ids))
+            self.dialogs.append(dialog)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.finished.connect(lambda *_: self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+            dialog.open()
+        self.bridge.query('task_pool', loaded,
+                          lambda error: self.children_note.setText(error.get('message', str(error))) if not self.closed else None,
+                          limit=1)
+
     def open_dependencies(self):
+        if self._detail_write_locked():return
         def saved(receipt):
             if not self.closed:
                 self.completion_epoch = receipt.get('epoch', self.bridge.epoch)
@@ -613,23 +667,79 @@ class TaskDetailDialog(QDialog):
         dialog = TaskDependenciesDialog(self.bridge, self.entity, self, saved)
         self.dialogs.append(dialog); dialog.open()
 
+    def _detail_write_locked(self):
+        return self.completion_saving or self.saving_plan or self._completion_request is not None or self._plan_request is not None
+
+    def _write_controls(self):
+        locked = self._detail_write_locked()
+        self.details_area.setEnabled(not locked)
+        self.edit_button.setEnabled(not locked and self.on_edit is not None and not self.entity.get('archived'))
+        if hasattr(self, 'delete_button'):self.delete_button.setEnabled(not locked)
+        if hasattr(self, 'split_button'):
+            from .gui_task_batch import can_split_task
+            self.split_button.setEnabled(not locked and can_split_task(self.entity))
+        if hasattr(self, 'complete_button'):
+            self.complete_button.setEnabled(not self.completion_saving and not self.saving_plan and self._plan_request is None)
+            self.plan_date.setEnabled(not locked)
+            self.join_plan_button.setEnabled(not self.completion_saving and not self.saving_plan and self._completion_request is None and (self.plan_ready or self._plan_request is not None or self.join_plan_button.text()=='重新读取安排'))
+
+    @staticmethod
+    def _result_unknown(error, was_unknown):
+        return write_result_unknown(error, was_unknown)
+
+    def _allow_detail_close(self):
+        if not self._detail_write_locked():return True
+        message='请先等待保存结束或核对上次保存结果，再关闭。'
+        if self._completion_request is not None:self.completion_note.setText(message)
+        if self._plan_request is not None:self.plan_note.setText(message)
+        return False
+
+    def accept(self):
+        if self._allow_detail_close():super().accept()
+
+    def reject(self):
+        if self._allow_detail_close():super().reject()
+
+    def closeEvent(self,event):
+        event.ignore();self.reject()
+
     def mark_complete(self):
-        if self.closed or self.completion_saving: return
-        self.completion_saving = True; self.complete_button.setEnabled(False)
-        current = (self.entity.get("completion_state") == "done" if self.entity.get("completion_state") is not None else self.entity.get("status") == "done")
-        payload = {"target_id": self.entity["id"], "target_version": self.entity["version"], "business_date": self.completion_date, "result": "incomplete" if current else "done"}
+        if self.closed or self.completion_saving or self.saving_plan or self._plan_request is not None:return
+        if self._completion_needs_reload and self._completion_request is None:
+            self.completion_saving=True;self._write_controls()
+            def loaded(result):
+                if self.closed:return
+                self.completion_saving=False;self._completion_needs_reload=False
+                self.entity=result['entity'];self.completion_epoch=result.get('epoch',self.bridge.epoch);self.completion_revision=result.get('revision',self.bridge.revision)
+                current=self.entity.get('completion_state')=='done' if self.entity.get('completion_state') is not None else self.entity.get('status')=='done'
+                self.complete_button.setText('标记未完成' if current else '标记完成')
+                self.completion_note.setText('已读取最新实际结果，请核对后再选择是否修改。');self._write_controls()
+            def failed(error):
+                if self.closed:return
+                self.completion_saving=False;self.completion_note.setText(error.get('message',str(error)));self._write_controls()
+            self.bridge.query('get',loaded,failed,id=self.entity['id'],display=True);return
+        if self._completion_request is None:
+            current=self.entity.get('completion_state')=='done' if self.entity.get('completion_state') is not None else self.entity.get('status')=='done'
+            payload={'target_id':self.entity['id'],'target_version':self.entity['version'],'business_date':self.completion_date,'result':'incomplete' if current else 'done'}
+            self._completion_request=(payload,{'epoch':self.completion_epoch,'expected_revision':self.completion_revision,'request_id':str(uuid.uuid4())})
+        payload,options=self._completion_request
+        self.completion_saving=True;self.completion_note.setText('正在保存实际结果…');self._write_controls()
         def saved(receipt):
-            self.completion_saving = False
-            if self.on_saved: self.on_saved(receipt)
-            if not self.closed: self.accept()
+            self.completion_saving=self._completion_uncertain=False;self._completion_request=None
+            if self.on_saved:self.on_saved(receipt)
+            if not self.closed:self.accept()
         def failed(error):
-            self.completion_saving = False
-            if self.closed: return
-            self.complete_button.setEnabled(True); self.completion_note.setText(error.get("message", str(error)) + " 请关闭后重新读取这项任务。")
-        self.bridge.command("set_task_completion", payload, saved, failed, epoch=self.completion_epoch, expected_revision=self.completion_revision)
+            self.completion_saving=False
+            if self.closed:return
+            self._completion_uncertain=self._result_unknown(error,self._completion_uncertain)
+            if not self._completion_uncertain:self._completion_request=None;self._completion_needs_reload=True
+            self.complete_button.setText('核对上次保存结果' if self._completion_uncertain else '重新读取任务')
+            self.completion_note.setText(error.get('message',str(error))+(' 将核对同一次完成记录，不会重复新增。' if self._completion_uncertain else ' 输入仍保留，请重新读取任务后核对。'))
+            self._write_controls()
+        self.bridge.command('set_task_completion',copy.deepcopy(payload),saved,failed,**options)
 
     def delete_task(self):
-        if self.saving_plan or self.completion_saving:
+        if self._detail_write_locked():
             return
         dialog = DeleteTaskDialog(self.bridge, self.entity, self, self.on_saved)
         try:
@@ -642,37 +752,47 @@ class TaskDetailDialog(QDialog):
             dialog.deleteLater()
 
     def load_plan(self, *_):
+        if self.closed or self._plan_request is not None or self._completion_request is not None:return
         self.plan_generation += 1; generation = self.plan_generation
-        self.plan_ready = False; self.join_plan_button.setEnabled(False); self.join_plan_button.setText("加入这天计划")
-        day = self.plan_date.date().toString("yyyy-MM-dd")
+        self.plan_ready = False; self.join_plan_button.setEnabled(False); self.join_plan_button.setText('加入这天计划')
+        day = self.plan_date.date().toString('yyyy-MM-dd')
         def loaded(result):
-            if self.closed or generation != self.plan_generation: return
-            self.plan_snapshot = result.get("plan"); self.plan_ready = True
-            self.join_plan_button.setEnabled(not self.saving_plan)
-            self.plan_note.setText("加入后保留已有安排；重复加入不会新增一项。" if self.plan_snapshot else "这一天还没有计划。加入时会建立按先后顺序的计划，不推定具体时间。")
+            if self.closed or generation != self.plan_generation or self._plan_request is not None:return
+            self.plan_snapshot=result.get('plan');self.plan_ready=True
+            self.plan_epoch=result.get('epoch',self.bridge.epoch);self.plan_revision=result.get('revision',self.bridge.revision)
+            self.join_plan_button.setEnabled(not self.saving_plan and self._completion_request is None)
+            self.plan_note.setText('加入后保留已有安排；重复加入不会新增一项。' if self.plan_snapshot else '这一天还没有计划。加入时会建立按先后顺序的计划，不推定具体时间。')
         def failed(error):
             if not self.closed and generation == self.plan_generation:
-                self.plan_note.setText(error.get("message", str(error))); self.join_plan_button.setEnabled(True); self.join_plan_button.setText("重新读取安排")
-        self.bridge.query("daily_tasks", loaded, failed, date=day, limit=1)
+                self.plan_note.setText(error.get('message',str(error)));self.join_plan_button.setEnabled(True);self.join_plan_button.setText('重新读取安排')
+        self.bridge.query('daily_tasks',loaded,failed,date=day,limit=1)
 
     def join_plan(self):
-        if self.saving_plan: return
-        if not self.plan_ready: self.load_plan(); return
-        day = self.plan_date.date().toString("yyyy-MM-dd")
-        payload = {"date": day, "target_id": self.entity["id"], "plan_id": None, "plan_version": None}
-        if self.plan_snapshot: payload.update(plan_id=self.plan_snapshot["id"], plan_version=self.plan_snapshot["version"])
-        self.saving_plan = True; self.join_plan_button.setEnabled(False); self.plan_date.setEnabled(False)
+        if self.closed or self.saving_plan or self.completion_saving or self._completion_request is not None:return
+        if self._plan_request is None:
+            if not self.plan_ready:self.load_plan();return
+            day=self.plan_date.date().toString('yyyy-MM-dd')
+            if self.plan_snapshot and self.plan_snapshot.get('mode')=='rest':
+                self.plan_note.setText('这一天已设为休息日。请在今天页查看并调整当天安排后再加入任务。');self.join_plan_button.setEnabled(False);return
+            payload={'date':day,'target_id':self.entity['id'],'plan_id':None,'plan_version':None}
+            if self.plan_snapshot:payload.update(plan_id=self.plan_snapshot['id'],plan_version=self.plan_snapshot['version'])
+            self._plan_request=(payload,{'epoch':self.plan_epoch,'expected_revision':self.plan_revision,'request_id':str(uuid.uuid4())})
+        payload,options=self._plan_request;day=payload['date']
+        self.saving_plan=True;self.plan_note.setText('正在加入 '+day+' 的安排…');self._write_controls()
         def saved(receipt):
-            self.saving_plan = False
-            if self.on_saved: self.on_saved(receipt)
-            if self.closed: return
-            self.plan_date.setEnabled(True); self.load_plan(); self.plan_note.setText("已加入 " + day + " 的计划，可在当天复盘中确认完成情况。")
+            self.saving_plan=self._plan_uncertain=False;self._plan_request=None
+            if self.on_saved:self.on_saved(receipt)
+            if self.closed:return
+            self._write_controls();self.load_plan();self.plan_note.setText('已加入 '+day+' 的计划，可在当天复盘中确认完成情况。')
         def failed(error):
-            self.saving_plan = False
-            if self.closed: return
-            self.plan_date.setEnabled(True); self.plan_ready = False; self.join_plan_button.setEnabled(True); self.join_plan_button.setText("重新读取安排")
-            self.plan_note.setText(error.get("message", str(error)) + " 输入仍保留，请读取最新计划后再加入。")
-        self.bridge.command("add_to_plan", payload, saved, failed)
+            self.saving_plan=False
+            if self.closed:return
+            self._plan_uncertain=self._result_unknown(error,self._plan_uncertain)
+            if not self._plan_uncertain:self._plan_request=None;self.plan_ready=False
+            self.join_plan_button.setText('核对上次保存结果' if self._plan_uncertain else '重新读取安排')
+            self.plan_note.setText(error.get('message',str(error))+(' 日期和原请求保持锁定，将核对同一次加入操作。' if self._plan_uncertain else ' 输入仍保留，请读取最新计划后再加入。'))
+            self._write_controls()
+        self.bridge.command('add_to_plan',copy.deepcopy(payload),saved,failed,**options)
 
     def open_recurring(self):
         if not has_preparation_date(self.entity): return
@@ -883,7 +1003,7 @@ class WorkspacePage(QWidget):
                     row.addWidget(plain_label("、".join(str(item) for item in value) if isinstance(value, list) else str(value)), 1)
                     self.content_layout.addLayout(row)
         if result.get("summary", {}).get("total_tasks", 0) or entity["type"] in CONTAINERS:
-            progress = CountProgress()
+            progress = CountProgress(reveal_scope=self, reveal_key=('workspace', entity['id']))
             progress.set_counts(result.get("summary", {}))
             self.progress = progress
             self.content_layout.addWidget(progress)

@@ -11,13 +11,13 @@ def origin(core,c,job_id):
     return identifier,job['epoch']
 
 
-def facts(core,c,op,job_id,cursor=None):
-    from .context_service import _budget,_charge,size
-    target,epoch=origin(core,c,job_id);budget=_budget(op,None);items=[];following=None
+def facts(core,c,op,job_id,cursor=None,byte_limit=None):
+    from .context_service import _budget,_charge,_fit_page,size
+    target,epoch=origin(core,c,job_id);budget=_budget(op,byte_limit);items=[];following=None
     for row in c.execute("SELECT step_key,source_id,source_version,result,fingerprint FROM context_steps WHERE operation_id=? AND status='completed' AND step_key>? ORDER BY step_key LIMIT 81",(target,cursor or '')):
         value=dict(row);value['result']=json.loads(value['result'] or '{}')
         if len(items)>=80 or size({'items':items+[value]})>budget-900:
-            if not items:raise BusinessError('context_checkpoint_required','请保存当前操作检查点后继续读取历史。')
+            if not items:_fit_page(op,size({'items':[value]})+900,budget)
             following=items[-1]['step_key'];break
         items.append(value)
     return _charge(c,op,{'items':items,'next_cursor':following,'historical':True,'source_job_id':job_id,
@@ -25,7 +25,7 @@ def facts(core,c,op,job_id,cursor=None):
 
 
 def material(core,p):
-    from .context_service import _operation,_budget,_charge,size
+    from .context_service import _operation,_budget,_charge,_fit_page,_charge_image,size
     from .materials import verified_bytes
     with core.store.lock,core.store.connect() as c:
         c.execute('BEGIN IMMEDIATE');op=_operation(core,c,p['operation_id']);budget=_budget(op,None)
@@ -35,14 +35,13 @@ def material(core,p):
         if not row:raise BusinessError('material_history','当时的原件索引没有这个内容块；旧结果仍可通过 job 记录读取。')
         content={'kind':row['kind'],'locator':row['locator'],'sha256':row['sha256']}
         if row['kind']=='image':
-            if op['delivered_bytes']+12000>65536-8192:raise BusinessError('context_checkpoint_required','请保存检查点后继续看历史图像。')
             content['image_ref']=row['material_key']+':'+str(number)
-            c.execute('UPDATE context_operations SET delivered_bytes=delivered_bytes+12000 WHERE id=?',(op['id'],))
         else:content['text']=verified_bytes(core,row['sha256']).decode('utf-8')
         following=c.execute('SELECT 1 FROM material_chunks WHERE material_key=? AND seq=?',(row['material_key'],number+1)).fetchone()
         result={'source_id':p['source_id'],'source_version':row['source_version'],'chunk':number,'next_chunk':number+1 if following else None,
             'content':content,'historical':True,'from_job':p['from_job'],'source_epoch':epoch}
-        if size(result)>budget:raise BusinessError('context_checkpoint_required','请保存检查点后继续读取旧原文。')
+        _fit_page(op,size(result),budget)
+        if content['kind']=='image':_charge_image(c,op,result)
         result=_charge(c,op,result);c.commit();return result
 
 

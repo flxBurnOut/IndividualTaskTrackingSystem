@@ -109,7 +109,7 @@ def test_real_course_schedule_edit_preserves_owner_exceptions_and_source(app,tmp
         updated=core.query('get',id=event['id'])['entity'];assert updated['data']['start']=='11:00' and updated['data']['location']=='Room B'
         assert updated['data']['owner_id']==course['id'] and updated['data']['exceptions']==event['data']['exceptions']
         assert updated['data']['source_text']=='Initial notice' and updated['parent_id'] is None
-    finally:form.close()
+    finally:form._discard_close=True;form.saving=False;form._uncertain=False;form.close()
 
 
 def test_real_assessment_and_node_edit_keep_unshown_confirmed_fields(app,tmp_path):
@@ -128,7 +128,7 @@ def test_real_assessment_and_node_edit_keep_unshown_confirmed_fields(app,tmp_pat
             updated=core.query('get',id=original['id'])['entity'];assert updated['type']==original['type'] and updated['parent_id']==course['id']
             if original['type']=='assessment':assert updated['data']['score']==17 and updated['data']['maximum']==20 and updated['data']['weight']==35
             else:assert updated['data']['custom_fact']=='Retain' and updated['data']['due_date']=='2030-01-12'
-        finally:form.close()
+        finally:form._discard_close=True;form.saving=False;form._uncertain=False;form.close()
 
 
 def test_nested_note_discussion_follows_its_real_course_not_current_selection(app):
