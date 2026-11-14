@@ -9,7 +9,7 @@ import pytest
 from management.agent_connections import (apply_merge, configuration, launch_spec,
     preview_merge, server_name)
 from management.codex_workspace import WorkspaceError
-from management.data_space import BetaIsolationError
+from management.data_space import CHANNEL, BetaIsolationError
 
 
 def test_profiles_keep_absolute_beta_program_and_space_and_no_credentials(tmp_path):
@@ -30,7 +30,8 @@ def test_profiles_keep_absolute_beta_program_and_space_and_no_credentials(tmp_pa
 
 
 def test_formal_space_rejected_without_creating_any_files(tmp_path):
-    formal = Path(__file__).resolve().parents[1].with_name('个人管理系统软件化') / 'data'
+    workspace = Path(__file__).resolve().parents[1]
+    formal = workspace.parent / 'other-stable-data' if CHANNEL == 'beta' else workspace / '.beta-data' / 'foreign'
     with pytest.raises(BetaIsolationError):
         configuration(formal)
     assert not (tmp_path / 'mcp_config.json').exists()
@@ -84,7 +85,7 @@ def test_changed_connection_and_preview_conflicts_are_not_overwritten(tmp_path):
     with pytest.raises(WorkspaceError, match='预览后'):
         apply_merge(plan)
     assert json.loads(path.read_bytes()) == {'newUserSetting': True}
-    assert not path.with_name(path.name + '.personal-management-beta.bak').exists()
+    assert not path.with_name(path.name + '.personal-management-' + CHANNEL + '.bak').exists()
 
 
 def test_failed_atomic_replace_retains_original(tmp_path, monkeypatch):
@@ -138,3 +139,34 @@ def test_concurrent_config_merges_cannot_drop_another_connection(tmp_path):
     data = next(tmp_path / ('beta-' + str(i)) for i in range(2) if server_name(tmp_path / ('beta-' + str(i))) == missed.server)
     apply_merge(preview_merge(data, 'antigravity', path))
     assert len(json.loads(path.read_text('utf-8'))['mcpServers']) == 3
+
+
+
+def test_configuration_never_reads_runtime_credentials(tmp_path, monkeypatch):
+    root = tmp_path / 'space'
+    root.mkdir()
+    runtime = root / 'runtime.json'
+    runtime.write_text('{"token":"synthetic-private-value"}', encoding='utf-8')
+    original = Path.open
+    def guarded(path, *args, **kwargs):
+        if path.resolve() == runtime.resolve():
+            pytest.fail('Config generation must not read runtime credentials')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', guarded)
+    assert 'synthetic-private-value' not in configuration(root)
+    assert 'personal_management_' + CHANNEL + '_' in configuration(root)
+
+
+def test_frozen_agent_configuration_uses_service_executable_without_source_environment(tmp_path, monkeypatch):
+    import sys
+    gui = tmp_path / 'program' / 'PersonalManagement.exe'
+    service = gui.with_name('PersonalManagementService.exe')
+    gui.parent.mkdir()
+    gui.write_bytes(b'synthetic-gui')
+    service.write_bytes(b'synthetic-service')
+    monkeypatch.setattr(sys, 'executable', str(gui))
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    spec = launch_spec(tmp_path / 'data', 'antigravity')
+    assert spec['command'] == str(service)
+    assert spec['args'][0] == '--mcp' and '-m' not in spec['args']
+    assert 'PYTHONPATH' not in spec['env']

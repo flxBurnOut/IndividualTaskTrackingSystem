@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--mcp', action='store_true')
     parser.add_argument('--mcp-client', choices=['codex', 'antigravity', 'generic'], default='codex',
                         help='MCP 客户端配置；非 Codex 仅提供通用业务工具')
-    parser.add_argument('--mcp-config', choices=['codex', 'antigravity', 'generic'], help='输出所选 Beta 空间的 MCP 配置')
+    parser.add_argument('--mcp-config', choices=['codex', 'antigravity', 'generic'], help='输出当前数据空间的 MCP 配置')
     parser.add_argument('--check-mcp', choices=['codex', 'antigravity', 'generic'], help='自检 MCP 握手与业务读取，不修改业务记录')
     parser.add_argument('--mcp-discussion')
     parser.add_argument('--discussion-epoch')

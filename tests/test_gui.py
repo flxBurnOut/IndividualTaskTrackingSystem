@@ -627,7 +627,8 @@ def test_agent_connection_settings_merge_and_real_mcp_probe(app, window, tmp_pat
     dialog.show()
     page = dialog.agent_connections
     assert page.profile.currentData() == 'antigravity'
-    assert 'personal_management_beta_' in page.config_preview.toPlainText()
+    from management.data_space import CHANNEL
+    assert 'personal_management_' + CHANNEL + '_' in page.config_preview.toPlainText()
     assert '--mcp-client' in page.config_preview.toPlainText()
     assert '尚未检测' in page.status.text()
     target = tmp_path / 'client-config' / 'mcp_config.json'
@@ -659,5 +660,5 @@ def test_agent_connection_settings_merge_and_real_mcp_probe(app, window, tmp_pat
     assert Client(window.data_dir, autostart=False).state() == before
     page.profile.setCurrentIndex(page.profile.findData('codex'))
     assert not page.preview_button.isEnabled()
-    assert '[mcp_servers.personal_management_beta_' in page.config_preview.toPlainText()
+    assert '[mcp_servers.personal_management_' + CHANNEL + '_' in page.config_preview.toPlainText()
     dialog.reject()

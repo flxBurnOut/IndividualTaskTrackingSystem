@@ -1,6 +1,6 @@
 """Local MCP configuration and read-only self-checks for independent clients.
 
-Never reads business data files or service discovery credentials. JSON merge
+Configuration generation never reads business data or discovery credentials. JSON merge
 plans contain the original bytes only in memory and never execute a command
 read from an external client's configuration.
 """
@@ -16,15 +16,16 @@ import stat
 import tomllib
 
 from .codex_workspace import MAX_FILE_BYTES, WorkspaceError, _atomic_write, mcp_config
-from .data_space import require_beta_dir
+from .data_space import CHANNEL, require_channel_dir
 
 PROFILES = {'antigravity': 'Antigravity', 'generic': '通用 MCP', 'codex': 'Codex'}
+CHANNEL_LABEL = 'Beta' if CHANNEL == 'beta' else '正式版'
 
 
 def server_name(data_dir):
-    root = require_beta_dir(data_dir)
+    root = require_channel_dir(data_dir, inspect_runtime=False)
     digest = hashlib.sha256(os.path.normcase(str(root)).encode('utf-8')).hexdigest()[:12]
-    return 'personal_management_beta_' + digest
+    return 'personal_management_' + CHANNEL + '_' + digest
 
 
 def launch_spec(data_dir, profile='antigravity'):
@@ -109,7 +110,7 @@ def preview_merge(data_dir, profile, target):
     servers = document.setdefault('mcpServers', {})
     if name in servers:
         if servers[name] != desired:
-            raise WorkspaceError('已存在同名但内容不同的 Beta 连接，未覆盖。请核对原条目或手动合并。')
+            raise WorkspaceError('已存在同名但内容不同的连接，未覆盖。请核对原条目或手动合并。')
         return MergePlan(path, previous, previous, name, profile, False)
     servers[name] = desired
     content = (json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode('utf-8')
@@ -123,7 +124,7 @@ def apply_merge(plan):
     from .runtime import OwnerLock
     path = _plain_target(plan.path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(path.name + '.personal-management-beta.lock')
+    lock_path = path.with_name(path.name + '.personal-management.lock')
     if (lock_path.is_symlink() or lock_path.is_junction()
             or lock_path.exists() and (not lock_path.is_file() or lock_path.stat().st_nlink != 1)):
         raise WorkspaceError('配置锁路径不是独立普通文件，未保存配置。')
@@ -144,7 +145,7 @@ def _apply_merge_locked(plan):
     if not plan.added:
         return {'changed': False, 'path': str(path), 'server': plan.server}
     path.parent.mkdir(parents=True, exist_ok=True)
-    backup = path.with_name(path.name + '.personal-management-beta.bak')
+    backup = path.with_name(path.name + '.personal-management-' + CHANNEL + '.bak')
     if plan.previous is not None:
         if backup.is_symlink() or backup.is_junction():
             raise WorkspaceError('备份路径包含链接，未保存配置。')
@@ -164,13 +165,13 @@ async def probe_connection(data_dir, profile='antigravity', *, timeout=45):
     from mcp import Client as MCPClient, StdioServerParameters
     from .runtime import require_data_dir
     from .runtime_contract import matches_contract
-    root = require_beta_dir(data_dir)
+    root = require_channel_dir(data_dir)
     spec = launch_spec(root, profile)
     params = StdioServerParameters(command=spec['command'], args=spec['args'],
         env={**os.environ, **spec['env'], 'PERSONAL_MANAGEMENT_NO_TRAY': '1'})
 
     async def check():
-        # A stale Beta backend would otherwise make the stdio child exit before
+        # A stale backend would otherwise make the stdio child exit before
         # handshake, hiding the actionable version error behind an SDK EOF.
         from .client import Client
         await asyncio.to_thread(Client, root, entrance='mcp', mcp_client=profile)
@@ -190,7 +191,7 @@ async def probe_connection(data_dir, profile='antigravity', *, timeout=45):
                 raise WorkspaceError('业务状态响应格式不正确。')
             require_data_dir(state.get('data_dir'), root)
             if not matches_contract(state.get('service_contract')):
-                raise WorkspaceError('Beta MCP 与业务服务版本或能力不一致。')
+                raise WorkspaceError(CHANNEL_LABEL + ' MCP 与业务服务版本或能力不一致。')
             return {'ok': True, 'profile': profile, 'handshake': True, 'tools_listed': True,
                     'business_read': True, 'external_agent_verified': False,
                     'data_dir': str(root), 'service_contract': state['service_contract'],
@@ -198,4 +199,4 @@ async def probe_connection(data_dir, profile='antigravity', *, timeout=45):
     try:
         return await asyncio.wait_for(check(), timeout=timeout)
     except TimeoutError as error:
-        raise WorkspaceError('MCP 自检超时；未确认客户端连接成功，请检查 Beta 后台状态。') from error
+        raise WorkspaceError('MCP 自检超时；未确认客户端连接成功，请检查' + CHANNEL_LABEL + '后台状态。') from error

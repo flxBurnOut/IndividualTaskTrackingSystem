@@ -31,6 +31,11 @@ def require_packaged_channel():
     raise BetaIsolationError('Beta 安装与发布通道尚未实现；已阻止使用正式版打包或发布入口。')
 
 
+def require_channel_dir(data_dir, *, inspect_runtime=True):
+    """Shared entrance contract; this source distribution remains Beta-only."""
+    return require_beta_dir(data_dir)
+
+
 def require_beta_dir(data_dir):
     """Validate without creating anything, opening SQLite or contacting a port."""
     workspace = workspace_root()

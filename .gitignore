@@ -90,3 +90,4 @@ Thumbs.db
 # Per-client local MCP definitions and merge locks are never distribution inputs.
 mcp_config.json
 *.personal-management-beta.lock
+*.personal-management.lock

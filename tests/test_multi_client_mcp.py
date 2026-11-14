@@ -18,11 +18,11 @@ from mcp import Client as MCPClient, StdioServerParameters
 
 from management.agent_connections import launch_spec, probe_connection
 from management.client import Client, ClientError
-from management.data_space import require_beta_dir
+from management.data_space import CHANNEL, require_channel_dir
 
 
 def stop_test_service(root):
-    root = require_beta_dir(root)
+    root = require_channel_dir(root)
     assert root.is_relative_to(Path(__file__).resolve().parents[1] / '.build' / 'checks')
     path = root / 'runtime.json'
     if not path.exists():
@@ -160,7 +160,7 @@ def test_self_check_is_read_only_and_not_external_agent_verification(space, prof
     assert result['ok'] and result['handshake'] and result['tools_listed'] and result['business_read']
     assert result['external_agent_verified'] is False
     assert result['managed_discussions'] == (profile == 'codex')
-    assert result['service_contract']['channel'] == 'beta'
+    assert result['service_contract']['channel'] == CHANNEL
     assert client.state() == before
 
 
@@ -171,7 +171,7 @@ def test_antigravity_profile_accepts_standard_initialize_protocol(space):
             listing = await sdk.list_tools()
             assert {'query_business', 'recover_receipt'} <= {tool.name for tool in listing.tools}
             state = value(await sdk.call_tool('query_business', {'name': 'state'}))
-            assert state['service_contract']['channel'] == 'beta'
+            assert state['service_contract']['channel'] == CHANNEL
             bad = await sdk.call_tool('update_entity', {'id': 'missing-fields'})
             assert bad.is_error
             # Invalid tool arguments affect this call only; the transport survives.

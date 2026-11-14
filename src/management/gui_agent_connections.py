@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout
     QLabel, QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget)
 from shiboken6 import isValid
 
-from .agent_connections import PROFILES, apply_merge, configuration, launch_spec, preview_merge
+from .agent_connections import CHANNEL_LABEL, PROFILES, apply_merge, configuration, launch_spec, preview_merge
 from .gui_layout import ActionRow
 
 
@@ -21,7 +21,7 @@ class AgentConnectionsPage(QWidget):
         self._probe_process = None
         self.last_probe = None
         layout = QVBoxLayout(self)
-        note = QLabel('让外部助手读取和更新当前 Beta 数据空间。Antigravity 和通用连接支持业务工具；受管会话仍由原 Codex 协助入口管理。')
+        note = QLabel('让外部助手读取和更新当前' + CHANNEL_LABEL + '数据空间。Antigravity 和通用连接支持业务工具；受管会话仍由原 Codex 协助入口管理。')
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
@@ -31,7 +31,7 @@ class AgentConnectionsPage(QWidget):
         form.addRow('连接到', self.profile)
         space = QLabel(str(self.data_dir))
         space.setWordWrap(True)
-        form.addRow('Beta 数据空间', space)
+        form.addRow(CHANNEL_LABEL + '数据空间', space)
         layout.addLayout(form)
         self.config_preview = QPlainTextEdit()
         self.config_preview.setReadOnly(True)
@@ -65,7 +65,7 @@ class AgentConnectionsPage(QWidget):
         for button in (self.choose_button, self.preview_button, self.apply_button):
             row.addWidget(button)
         layout.addWidget(row)
-        self.merge_status = QLabel('只添加当前 Beta 连接，保留其他服务器和设置。已有同名不同内容时会停止。')
+        self.merge_status = QLabel('只添加当前' + CHANNEL_LABEL + '连接，保留其他服务器和设置。已有同名不同内容时会停止。')
         self.merge_status.setWordWrap(True)
         layout.addWidget(self.merge_status)
         self.status = QLabel('配置尚未检测。')
@@ -103,7 +103,7 @@ class AgentConnectionsPage(QWidget):
             if profile == 'antigravity' else
             '通用 JSON 是启动参数模板；请按所用客户端的字段要求添加。此处可合并 mcp_config.json。'
             if profile == 'generic' else
-            '这里提供独立 Beta 连接的 TOML。已有 Codex 事务助手项目请继续在“Codex 协助”页管理，不需要重复添加。')
+            '这里提供当前' + CHANNEL_LABEL + '连接的 TOML。已有 Codex 事务助手项目请继续在“Codex 协助”页管理，不需要重复添加。')
 
     def copy_configuration(self):
         QApplication.clipboard().setText(self.config_preview.toPlainText())
@@ -191,9 +191,9 @@ class AgentConnectionsPage(QWidget):
             if not isinstance(result, dict):
                 raise ValueError()
         except (ValueError, UnicodeError):
-            result = {'ok': False, 'message': '自检程序未返回有效结果，请检查 Beta 运行环境。'}
+            result = {'ok': False, 'message': '自检程序未返回有效结果，请检查' + CHANNEL_LABEL + '运行环境。'}
         self.last_probe = result
         if code == 0 and result.get('ok'):
             self.status.setText('MCP 自检通过：握手、工具列表和业务读取正常。尚未验证外部助手实际加载；请在助手中读取一次当前状态。')
         else:
-            self.status.setText('MCP 自检未通过：' + str(result.get('message', '请检查 Beta 后台状态。'))[:1500])
+            self.status.setText('MCP 自检未通过：' + str(result.get('message', '请检查' + CHANNEL_LABEL + '后台状态。'))[:1500])
