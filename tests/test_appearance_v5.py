@@ -628,6 +628,9 @@ def test_settings_all_sections_keep_text_height_at_actual_width(settings, app, t
         apply_appearance(app, {'theme': theme, 'font_size': font_size})
         dialog.show_codex_project({'status': 'ready', 'name': '演示项目',
                                   'workspace': 'C:\\Users\\Example\\' + 'long_profile_directory_' * 4}, enabled=True)
+        long_path = 'C:/Users/Example/' + 'long_profile_directory_' * 8 + '/mcp_config.json'
+        dialog.agent_connections.merge_status.setText('将添加连接：\n' + long_path)
+        dialog.agent_connections.status.setText('配置已保存：\n' + long_path)
         dialog.show()
         for width in (900, 560):
             dialog.resize(width, 610)
